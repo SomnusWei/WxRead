@@ -1,0 +1,55 @@
+1. 获取授权的 URL
+要获取用于鉴权的专属 API Key，你需要访问微信读书官方的 Skill 配置页面：
+🔗 https://weread.qq.com/r/weread-skills
+获取步骤：
+访问上述链接，在页面中点击“获取 API Key”或“登录微信读书”。
+使用微信完成扫码登录。
+登录成功后，系统会生成一串以 wrk- 开头的专属 API Key（格式如 wrk-xxxxxxxx）。
+点击复制该 Key，用于后续接口调用的 Header 鉴权（Authorization: Bearer {API Key}）。
+2. 各接口请求参数与返回字段说明文档
+所有接口均通过统一网关 POST https://i.weread.qq.com/api/agent/gateway 发起请求。请求体为 JSON 格式，必须包含 api_name 和 skill_version（当前固定为 1.0.3），业务参数直接置于顶层。
+以下是各核心接口的参数与返回字段说明：
+① 验证与能力列表接口
+api_name: /_list
+业务参数: 无
+返回字段: 验证 API Key 是否有效，并返回当前 Skill 支持的所有能力列表。
+② 阅读统计接口
+api_name: /readdata/detail
+业务参数:
+mode: 统计模式（例如 "overall" 表示总体统计）
+返回字段: 阅读时长、有效阅读天数、阅读偏好深度分析等量化阅读习惯数据。
+③ 书架同步接口
+api_name: /shelf/sync
+业务参数: 无
+返回字段: 书架全量数据，包含电子书、有声专辑、文章收藏条目，以及阅读状态（在读/已读/未开启）。
+④ 有笔记书籍列表接口
+api_name: /user/notebooks
+业务参数: 无
+返回字段: 返回用户在微信读书中留有笔记的书籍列表。
+⑤ 书籍详情接口
+api_name: /book/info
+业务参数: 书籍 ID（如 bookId）
+返回字段: 书名、作者、评分、分类、出版社、出版时间、ISBN、章节目录及当前阅读进度等。
+⑥ 书籍搜索接口
+api_name: /store/search
+业务参数:
+keyword: 搜索关键词（如 "三体"）
+count: 返回结果数量（如 10）
+scope: 搜索范围（如 10）
+返回字段: 匹配书籍的书名、作者、评分等关键信息。
+⑦ 章节信息接口
+api_name: /book/chapterinfo
+业务参数: 书籍 ID、章节 ID
+返回字段: 指定章节的详细信息。
+⑧ 书签列表接口
+api_name: /book/bookmarklist
+业务参数: 书籍 ID
+返回字段: 用户在指定书籍中添加的书签列表。
+⑨ 个人书评列表接口
+api_name: /review/list/mine
+业务参数: 书籍 ID 或分页参数
+返回字段: 用户自己发表的书评、章节点评及想法列表。
+⚠️ 开发注意事项：
+当前官方 Skill 为只读接口，不支持写入操作（如自动加入书架、同步笔记回平台等）。
+所有业务参数必须与 api_name 同级，不可嵌套在 params 对象中。
+获取到的 API Key 相当于用户的私人钥匙，切勿在客户端明文暴露或发布到不可信的地方。

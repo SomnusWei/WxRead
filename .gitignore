@@ -1,0 +1,59 @@
+# ===== 安全：含 GitHub Personal Access Token / 账号密码的本地备忘 =====
+# 绝对不能提交（GitHub 机器人会扫描并自动吊销，导致账号受损）
+github项目更新需要.txt
+*PAT*.txt
+*token*.txt
+*credential*.txt
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== PyInstaller 构建产物（超大二进制，重建即可）=====
+# dist/: 打包好的 EXE + 全部运行时（本项目约 580MB）
+dist/
+# build/: PyInstaller 中间缓存（PYZ/Toc/pkg，约 20MB）
+build/
+# .spec 在本项目是手写构建配置，保留
+
+# ===== 运行时日志（按项目机制：APPDATA 保留 14 天，项目根保留 3 天）=====
+app.log
+*.log.*.txt
+errorlog/
+logs/
+
+# ===== 临时 smoke / debug / 临时测试输出 =====
+*smoke*.log
+*smoke*_stderr.log
+*smoke*_stdout.log
+*_stderr.log
+*_stdout.log
+*_err.txt
+*_out.txt
+build_out.log
+build_err.log
+pyinstaller.log
+build_rc.txt
+*.bak
+*.tmp
+*.swp
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ===== 本地临时配置（config.json 存于 %APPDATA%，但如果有人误放根目录也不能提交）=====
+config.json
+settings.json
