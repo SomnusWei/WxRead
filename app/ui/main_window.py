@@ -26,11 +26,10 @@ from app.core.config import ConfigStore
 from app.core.notifier import WxPusherNotifier
 from app.core.scheduler import ReadingScheduler
 from app.core.weread_api import WeReadApi
-from app.core.weread_skills import WeReadSkills
 from app.ui.login_page import LoginPage
 from app.ui.settings_page import SettingsPage
 from app.ui.status_page import StatusPage
-from app.utils.logger import get_logger
+from app.utils.logger import get_logger, log_bus
 
 log = get_logger(__name__)
 
@@ -86,12 +85,20 @@ class MainWindow(QMainWindow):
         self._config = ConfigStore()
         self._api = WeReadApi(self._config)
         self._notifier = WxPusherNotifier(self._config)
-        self._skills = WeReadSkills(self._config)
-        self._scheduler = ReadingScheduler(self._api, self._config, self._notifier, self._skills)
+        self._scheduler = ReadingScheduler(self._api, self._config, self._notifier)
 
         self._build_ui()
         self._build_tray()
-        self.setWindowIcon(_make_app_icon())
+        # —— 需求5：加载 .ico 图标（EXE 图标与进程图标一致）——
+        # 开发模式：app/resources/app.ico（__file__ = app/ui/main_window.py → parent.parent = app/）
+        _icon_path = Path(__file__).parent.parent / "resources" / "app.ico"
+        if not _icon_path.exists():
+            # 打包模式：sys._MEIPASS = _internal/，app/resources/app.ico
+            _icon_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent)) / "app" / "resources" / "app.ico"
+        if _icon_path.exists():
+            self.setWindowIcon(QIcon(str(_icon_path)))
+        else:
+            self.setWindowIcon(_make_app_icon())  # fallback：运行时绘制
 
         # 登录态检测完成信号 → 状态页更新 + 兜底恢复"上次会话阅读本"
         #   （此时 Skill/书架同步可能已写入更权威的书 → 恢复函数内部会检测 current_book.url 非空就跳过）
@@ -123,8 +130,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, self.hide_to_tray)
         # 阶段 2：120ms → 后台异步检查登录态（走子线程，不卡 GUI）
         QTimer.singleShot(120, self._post_start)
-        # 阶段 3：220ms → 轻量预热：把 Skill 实例的 message/warning/error 桥接到状态页日志窗
-        #   （_build_ui 里已经做了，这里留空可扩展）
+        # 阶段 3：220ms → 轻量预热（保留位，可扩展）
 
     # ---------------- UI ----------------
     def _build_ui(self) -> None:
@@ -176,13 +182,18 @@ class MainWindow(QMainWindow):
 
         self._status_page = StatusPage(self._scheduler, self._api, self._config, self._tabs)
 
-        self._tabs.addTab(self._wrap_in_scroll(self._status_page), "🟢 状态")
-        # —— 占位 Tab：先放"正在加载…"空页，首次点击再实真初始化（扫码浏览器 WebEngine 非常重）
-        self._login_placeholder = self._make_placeholder_tab("🔐 扫码登录", "点击切换后将加载扫码内置浏览器，首次进入可能稍慢……")
+        # —— 需求1：状态页不再用 QScrollArea 包裹（内嵌浏览器有自己的尺寸管理）——
+        self._tabs.addTab(self._status_page, "🟢 状态")
+        # —— 需求1：删除扫码登录 Tab，LoginPage 直接嵌入状态页右边 30% ——
+        self._login_placeholder = None  # 不再需要占位 Tab
         self._settings_placeholder = self._make_placeholder_tab("⚙️ 设置", "点击切换后将加载设置面板。")
-        self._tabs.addTab(self._login_placeholder, "🔐 扫码登录")
         self._tabs.addTab(self._settings_placeholder, "⚙️ 设置")
         self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        # —— 把 LoginPage 创建后嵌入 status_page 右边容器 ——
+        #    延迟到首帧后（QTimer.singleShot 0），避免冷启动被 WebEngine 拖慢
+        from PySide6.QtCore import QTimer as _QTimer2
+        _QTimer2.singleShot(100, self._ensure_login_page_embedded)
 
         # —— 状态页请求"在扫码浏览器打开 / 恢复登录态"时，如果登录页还没懒加载，
         #    先触发 _ensure_login_page 再把 URL / restore 请求排队（否则会 AttributeError）。
@@ -190,16 +201,6 @@ class MainWindow(QMainWindow):
         self._status_page.request_restore_browser_session.connect(self._queue_restore_after_init)
         self._pending_navigate_url: str | None = None
         self._pending_restore = False
-
-        # —— 把 WeReadSkills 实例的 message/warning/error 全部桥接到状态页日志窗口，
-        #    让用户能实时看到 [Skill] → 请求 / ← 响应 / ✗ 超时 等过程（调试 Skill 网关必备）
-        try:
-            self._skills.message.connect(lambda m: self._status_page._append_log(m, "INFO"))
-            self._skills.warning.connect(lambda m: self._status_page._append_log(m, "WARN"))
-            self._skills.error.connect(lambda m: self._status_page._append_log(m, "ERROR"))
-        except Exception as _e:  # noqa: BLE001
-            from app.utils.logger import get_logger
-            get_logger(__name__).warning("连接 WeReadSkills 日志信号失败：%s", _e)
 
         root.addWidget(self._tabs, 1)
 
@@ -257,122 +258,98 @@ class MainWindow(QMainWindow):
         return w
 
     def _on_tab_changed(self, index: int) -> None:
-        """Tab 切换懒加载：登录页（index 1）/设置页（index 2）首次进入才构造。"""
-        # Tab 顺序约定：0=状态, 1=扫码登录, 2=设置（与 _build_ui 中 addTab 顺序一致）
-        if index == 1 and self._login_page is None:
-            self._ensure_login_page()
-        elif index == 2 and self._settings_page is None:
+        """Tab 切换懒加载：设置页（index 1）首次进入才构造。"""
+        # Tab 顺序约定：0=状态, 1=设置（扫码登录已删除，嵌入状态页右边）
+        if index == 1 and self._settings_page is None:
             self._ensure_settings_page()
 
-    def _ensure_login_page(self) -> None:
-        """首次进入扫码登录页才构造 LoginPage（最重的 WebEngine）。"""
-        from PySide6.QtCore import QTimer
-        self._sb_label.setText("正在加载扫码浏览器（首次进入会稍慢，正在初始化 QtWebEngine 内核...）")
-
-        # —— 先把占位 Tab 的文字改为"正在初始化…"，让用户看到变化而不是"卡住不动"
-        #    （经验 1975342：加载过程必须提供 UI 可观测性，否则用户会以为卡死）
+    def _ensure_login_page_embedded(self) -> None:
+        """需求1：创建 LoginPage 并嵌入 status_page 右边 30% 容器。"""
         try:
-            holder = self._tabs.widget(1)
-            if holder is not None:
-                # 占位 Tab 结构是 QVBoxLayout，里面有两个 QLabel：第一个是大标题，第二个是说明
-                for ci in range(holder.layout().count()):
-                    w = holder.layout().itemAt(ci).widget()
-                    if isinstance(w, QLabel):
-                        if "页面加载中" in w.text():
-                            w.setText("🛠️  扫码登录 · 内核初始化中…")
-                        elif "首次进入可能稍慢" in w.text():
-                            w.setText("QtWebEngine 正在加载 Chromium 渲染内核（仅首次进入需要 1~3 秒，随后切页零延迟）…")
-        except Exception:  # noqa: BLE001
-            pass
-
-        def _do_build():
-            try:
-                self._login_page = LoginPage(self._api, self._config, self._tabs)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("懒加载登录页失败：%s", exc)
-                self._sb_label.setText(f"登录页加载失败：{exc}")
-                # ===== v2 关键：把错误写到占位 Tab 上（用户直接看到，而不是纯卡）=====
-                try:
-                    holder = self._tabs.widget(1)
-                    if holder is not None:
-                        for ci in range(holder.layout().count()):
-                            w = holder.layout().itemAt(ci).widget()
-                            if isinstance(w, QLabel):
-                                if "内核初始化中" in w.text():
-                                    w.setText("❌ 扫码登录 · 初始化失败")
-                                elif "仅首次进入" in w.text() or "首次进入" in w.text():
-                                    w.setText(
-                                        f"错误信息：{exc}\n\n"
-                                        "临时解决方案：请关闭本程序，然后从命令行执行 "
-                                        "`pip install --upgrade PySide6 PySide6-Addons PySide6-Essentials` 后重试；"
-                                        "或查看右下角日志窗口/程序日志获取完整堆栈。"
-                                    )
-                                    w.setStyleSheet("color:#e25454;font-size:13px;line-height:1.6;")
-                except Exception:  # noqa: BLE001
-                    pass
-                return
-            # ===== 真实建立跨页信号连接（v2 修复：懒加载后才连，避免 None 崩溃）=====
+            self._login_page = LoginPage(self._api, self._config, self._tabs)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("嵌入 LoginPage 失败：%s", exc)
+            return
+        # 建立跨页信号连接
+        try:
             self._login_page.session_ready.connect(self._on_session_ready)
             self._login_page.reader_navigated.connect(self._on_reader_navigated)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._status_page.request_navigate_reader.connect(self._login_page.navigate)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._status_page.request_restore_browser_session.connect(
+                self._login_page.restore_session_from_config
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._login_page.chapters_refresh_requested.connect(self._on_request_refresh_all_chapters)
+        except Exception as _e:
+            log.debug("连 chapters_refresh_requested 失败：%s", _e)
+        try:
+            self._login_page.numeric_book_id_detected.connect(self._on_numeric_book_id_detected)
+        except Exception as _e:
+            log.debug("连 numeric_book_id_detected 失败：%s", _e)
+        # 把 LoginPage 设为 status_page 的 _login_page 属性（_on_start 需要访问浏览器 URL）
+        self._status_page._login_page = self._login_page
+        # 隐藏占位标签，把 LoginPage 嵌入 right_container
+        try:
+            if hasattr(self._status_page, "_lbl_browser_placeholder"):
+                self._status_page._lbl_browser_placeholder.hide()
+            self._status_page._right_layout.addWidget(self._login_page)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("嵌入 LoginPage 到 right_container 失败：%s", exc)
+        # 处理排队的 restore/navigate 请求
+        if self._pending_restore:
+            self._pending_restore = False
             try:
-                self._status_page.request_navigate_reader.connect(self._login_page.navigate)
-            except Exception:  # noqa: BLE001
-                pass
+                self._login_page.restore_session_from_config()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("嵌入登录页排队 restore_session 失败：%s", exc)
+        if self._pending_navigate_url:
+            url = self._pending_navigate_url
+            self._pending_navigate_url = None
             try:
-                self._status_page.request_restore_browser_session.connect(
-                    self._login_page.restore_session_from_config
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            # 把占位 Tab 替换成真实登录页 + ScrollArea
-            new_widget = self._wrap_in_scroll(self._login_page)
-            self._replace_tab(index=1, new_widget=new_widget)
-            self._sb_label.setText("🔐 扫码登录页已就绪（浏览器正在加载 weread 页面…）")
-            self._tabs.setCurrentIndex(1)
-            if self._pending_restore:
-                self._pending_restore = False
-                try:
-                    self._login_page.restore_session_from_config()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("登录页排队 restore_session 失败：%s", exc)
-            if self._pending_navigate_url:
-                url = self._pending_navigate_url
-                self._pending_navigate_url = None
-                try:
-                    self._login_page.navigate(url)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("登录页排队 navigate 失败：%s", exc)
+                self._login_page.navigate(url)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("嵌入登录页排队 navigate 失败：%s", exc)
 
-        # 把重构造拆到"下一个事件循环回合"：让 placeholder 先显示，避免"Tab 切过去卡住 1-2s"体感
-        QTimer.singleShot(0, _do_build)
+    def _ensure_login_page(self) -> None:
+        """兼容入口：扫码登录 Tab 已删除，LoginPage 嵌入状态页右边。"""
+        if self._login_page is None:
+            self._ensure_login_page_embedded()
 
     def _queue_navigate_after_init(self, url: str) -> None:
         """状态页请求"在扫码浏览器打开某本书"时触发。
-        登录页已经初始化 → 直接 navigate；否则先切到登录页并把 URL 排队。"""
+        登录页已经初始化 → 直接 navigate；否则先触发嵌入初始化并把 URL 排队。"""
         u = str(url or "").strip()
         if not u:
             return
+        self._tabs.setCurrentIndex(0)  # 切到状态页（LoginPage 嵌在右边）
         if self._login_page is not None:
             try:
-                self._tabs.setCurrentIndex(1)
                 self._login_page.navigate(u)
             except Exception as exc:  # noqa: BLE001
                 log.warning("直接导航到扫码浏览器失败：%s", exc)
             return
         self._pending_navigate_url = u
-        self._tabs.setCurrentIndex(1)  # 切过去会触发 _ensure_login_page，构建完成后再下发
+        self._ensure_login_page_embedded()
 
     def _queue_restore_after_init(self) -> None:
         """状态页点"恢复浏览器会话"时触发。"""
+        self._tabs.setCurrentIndex(0)  # 切到状态页
         if self._login_page is not None:
             try:
-                self._tabs.setCurrentIndex(1)
                 self._login_page.restore_session_from_config()
             except Exception as exc:  # noqa: BLE001
                 log.warning("直接恢复扫码浏览器会话失败：%s", exc)
             return
         self._pending_restore = True
-        self._tabs.setCurrentIndex(1)
+        self._ensure_login_page_embedded()
 
     def _ensure_settings_page(self) -> None:
         from PySide6.QtCore import QTimer
@@ -389,8 +366,8 @@ class MainWindow(QMainWindow):
             self._settings_page.settings_changed.connect(self._on_settings_changed)
             self._settings_page.verify_requested.connect(self._status_page._on_verify)
             new_widget = self._wrap_in_scroll(self._settings_page)
-            self._replace_tab(index=2, new_widget=new_widget)
-            self._tabs.setCurrentIndex(2)
+            self._replace_tab(index=1, new_widget=new_widget)
+            self._tabs.setCurrentIndex(1)
             self._sb_label.setText("⚙️ 设置页已就绪")
 
         QTimer.singleShot(0, _do_build)
@@ -653,10 +630,101 @@ class MainWindow(QMainWindow):
 
     def _on_settings_changed(self) -> None:
         self._sb_label.setText("设置已保存，下一轮阅读将使用新参数")
-        # Skill Key/阈值变更后：立刻刷新状态页的徽标，避免用户必须重启程序才能看到生效
+        # 设置变更后：刷新状态页的摘要状态徽标（用户保存后立刻可见最新提示）
         try:
             if hasattr(self, "_status_page") and self._status_page is not None:
                 from PySide6.QtCore import QTimer
-                QTimer.singleShot(0, self._status_page._tick_skill_status)
+                QTimer.singleShot(0, self._status_page._tick_summary_status)
         except Exception as exc:  # noqa: BLE001
-            log.debug("settings changed → 刷新 Skill 徽标失败：%s", exc)
+            log.debug("settings changed → 刷新摘要状态徽标失败：%s", exc)
+
+    def _on_request_refresh_all_chapters(self, book_id_hint: str = "") -> None:
+        """✅ 我已登录完成 后触发：拉章节池。
+        book_id_hint: 可选，拦截器捕获到的数字 bookId（优先使用）。
+        """
+        import threading
+        hint = str(book_id_hint or "").strip()
+        if hint and hint.isdigit():
+            log.debug("_on_request_refresh_all_chapters 使用拦截器捕获的数字 bookId=%s", hint)
+        def _task():
+            try:
+                book_id = None
+                # 方式 0：优先使用拦截器捕获的数字 bookId
+                if hint and hint.isdigit():
+                    book_id = hint
+                    # 同时：从当前 reader URL 提取 hex id，注册映射
+                    try:
+                        cur_url = ""
+                        if hasattr(self._login_page, "_web"):
+                            try:
+                                cur_url = self._login_page._web.url().toString()
+                            except Exception:
+                                pass
+                        if cur_url:
+                            import re as _re
+                            # 提取 /reader/<hex> 中的 hex id
+                            m_hex = _re.search(r"/reader/([A-Za-z0-9_]+)", cur_url)
+                            if m_hex:
+                                hex_id = m_hex.group(1)
+                                self._api.register_book_id_mapping(hex_id, hint)
+                                # 更新 current_book.book_id 为 numeric（覆盖 hex）
+                                cb = self._api.current_book() or {}
+                                if cb:
+                                    cb["book_id"] = hint
+                                    self._api.set_current_book(cb, source="interceptor_numeric")
+                                    log.info("已将 current_book.book_id 从 hex 更新为 numeric=%s", hint)
+                    except Exception as _ex:
+                        log.debug("注册 bookId 映射失败：%s", _ex)
+                # 方式 1：从 login_page 浏览器 URL 解析
+                if not book_id:
+                    try:
+                        cur_url = ""
+                        if hasattr(self._login_page, "_edit_current_url"):
+                            cur_url = self._login_page._edit_current_url.text().strip()
+                        if not cur_url and hasattr(self._login_page, "_web"):
+                            try:
+                                cur_url = self._login_page._web.url().toString()
+                            except Exception:
+                                cur_url = ""
+                        if cur_url:
+                            import re as _re
+                            m = _re.search(r"/(\d+)(?:\?|#|$)", cur_url)
+                            if not m:
+                                m2 = _re.search(r"bookDetail[=/](\d+)", cur_url)
+                                if m2:
+                                    book_id = m2.group(1)
+                            else:
+                                book_id = m.group(1)
+                    except Exception as _ex:
+                        log.debug("解析 book_id 失败：%s", _ex)
+                # 方式 2：config 里锁定的 book_id（兜底）
+                if not book_id:
+                    book_id = (self._config.get("reading.locked_book.book_id") or "").strip()
+                if not book_id:
+                    log_bus.emit_log("INFO", "暂未检测到已打开的书籍，章节池未拉取。可在状态页锁定书籍后自动刷新。")
+                    return
+                log_bus.emit_log("INFO", f"📖 尝试拉取书籍 {book_id} 的章节池（web/chapterInfos）...")
+                # 确保会话有效
+                ok = self._api.ensure_session()
+                if not ok:
+                    log_bus.emit_log("WARN", "登录态仍无效，跳过章节池拉取。")
+                    return
+                # 调用 weread_api.refresh_chapters_for_book（内部会 resolve hex→numeric）
+                refreshed = self._api.refresh_chapters_for_book(book_id)
+                if refreshed:
+                    bucket = self._api.scoped_chapters.get(book_id) or {}
+                    uids = bucket.get("uids") or []
+                    log_bus.emit_log("OK", f"书籍 {book_id} 章节池已加载（共 {len(uids)} 章）。")
+                else:
+                    log_bus.emit_log("WARN", f"书籍 {book_id} 章节拉取失败，开始阅读时会再次尝试。")
+            except Exception as exc:  # noqa: BLE001
+                log_bus.emit_log("ERROR", f"登录后拉章节池异常：{exc}")
+        threading.Thread(target=_task, daemon=True, name="ChaptersRefreshOnLogin").start()
+
+    def _on_numeric_book_id_detected(self, book_id: str) -> None:
+        """拦截器捕获到数字 bookId 时触发：直接用该 bookId 拉章节池。"""
+        bid = str(book_id or "").strip()
+        if not bid or not bid.isdigit():
+            return
+        log.info("拦截器传递数字 bookId=%s，触发章节池拉取", bid)
+        self._on_request_refresh_all_chapters(bid)

@@ -59,6 +59,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "daily_random_hour_start": 0,   # 每天随机开始小时（0-23），0=启用就跑/按计划跑
         "health_check_first_min": 3,    # 调度器启动后首次登录态巡检间隔（分钟）
         "health_check_min": 12,          # 之后每多少分钟一次登录态巡检
+        # 今日目标当天持久化：当天首次启动随机取值后写入，当天多次启动复用，次日重取
+        "daily_plan": {"date": "", "target_minutes": 0},
+        # ===== 自动化抓取工作流配置（方案 v7）=====
+        "capture_timeout_sec": 15,        # 单次抓取超时秒数
+        "workflow_retry_count": 2,       # 抓取失败重试次数
+        "santi_book_url": "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a",
+        "santi_chapter_url": "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2ak92c3210025c92cc22753209",
     },
     "push": {
         "wxpusher_spt": "",        # WxPusher 极简推送 SPT
@@ -71,11 +78,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "start_minimized": False,  # 启动直接进托盘
         "start_maximized": True,   # 启动后窗口默认最大化
     },
-    "weread_skills": {
-        "api_key": "",             # 官方 weread-skills 的 API Key（wrk-xxxx），为空则不启用
-        # 每成功完成 N 次 read_once 上报后，尝试用 Skill 拉阅读统计/书架/书籍详情
-        # 1 次 ≈ 30s，默认 N=10 → 每 5 分钟左右刷新一次，匹配"5 分钟内能看到"诉求
-        "refresh_every_n_reads": 10,
+    "skill": {
+        "api_key": "",                # WEREAD_API_KEY (wrk-xxxxxxxx)，申请：https://weread.qq.com/r/weread-skills
+        "version": "1.0.4",          # Skill 版本号
+        "summary_cache_ttl": 180,    # 阅读统计缓存秒数（默认 3 分钟）
     },
 }
 

@@ -357,19 +357,197 @@ class _SetCookieInterceptor(QWebEngineUrlRequestInterceptor):
         self._collector = collector
 
     def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:  # noqa: N802 (Qt 命名)
-        # 只对响应阶段有用：PySide6 的 QWebEngineUrlRequestInfo 是 REQUEST 期对象，
-        # 无法直接拿 response header，但能拿到 requestUrl 让我们知道"用户正在访问哪"；
-        # 真正的 Set-Cookie 响应通过 QWebEngineProfile.setUrlRequestInterceptor +
-        # connect(profile->cookieAdded) 配合，这个 class 的意义后面补充：
-        # 这里作为 request 级调试日志，把 request 命中路径打出来，供现场取证。
+        """拦截器：
+        1) 调试日志
+        2) 捕获 read 请求的 hex b/c + 完整 curl_bash（测试用）
+        3) 捕获数字 bookId
+        4) [测试模式] 记录所有 POST 请求的 URL 和 body
+        """
         try:
             method = bytes(info.requestMethod()).decode("ascii", "ignore") if hasattr(info, "requestMethod") else ""
-            url: QUrl = info.requestUrl()
-            u = url.toString() if isinstance(url, QUrl) else str(url)
-            if any(k in u for k in ("/web/login/", "/login", "weread.qq.com/web/reader", "open.weixin.qq.com")):
+            url_obj: QUrl = info.requestUrl()
+            u = url_obj.toString() if isinstance(url_obj, QUrl) else str(url_obj)
+
+            # 关键路径日志
+            if any(k in u for k in ("/web/login/", "/login", "weread.qq.com/web/reader", "open.weixin.qq.com", "/chapterInfos", "/book/read", "bookId=")):
                 log.debug("REQ %s %s", method, u[:200])
-        except Exception as exc:  # pragma: no cover - 调试函数异常不影响主链路
-            log.debug("interceptRequest 日志失败: %s", exc)
+
+            # === [测试模式] 记录所有 POST 请求 ===
+            if method.upper() == "POST" and "weread.qq.com" in u:
+                try:
+                    body_bytes = bytes(info.requestBody()) if hasattr(info, "requestBody") else b""
+                    if body_bytes:
+                        body_str = body_bytes.decode("utf-8", errors="ignore")
+                        # 只记录前 200 字符，避免刷屏
+                        preview = body_str[:200].replace("\n", "\\n")
+                        log.info("📤 POST %s  body_len=%d  preview=%s", u[:150], len(body_bytes), preview)
+                        # 尝试解析 JSON 并检查关键字段
+                        try:
+                            import json as _j
+                            p = _j.loads(body_str)
+                            b_val = p.get("b", "")
+                            c_val = p.get("c", "")
+                            if b_val or c_val:
+                                log.info("📤 检测到 b=%s c=%s", b_val, c_val)
+                        except Exception:
+                            pass
+                    else:
+                        log.info("📤 POST %s  body=(空)", u[:150])
+                except Exception as _e:
+                    log.debug("POST body 读取失败: %s", _e)
+
+            # === 捕获 read 请求的完整 curl_bash（只针对 /web/book/read）===
+            if "/web/book/read" in u and method.upper() == "POST":
+                try:
+                    body_bytes = bytes(info.requestBody()) if hasattr(info, "requestBody") else b""
+                    if body_bytes:
+                        body_str = body_bytes.decode("utf-8", errors="ignore")
+                        import json as _json2
+                        payload = _json2.loads(body_str)
+                        b_val = payload.get("b", "")
+                        c_val = payload.get("c", "")
+                        if b_val and c_val:
+                            log.info("🔖 拦截器捕获 read payload: b=%s c=%s", b_val, c_val)
+                            log.info("🔖 read payload 详情: b=%s c=%s ci=%s ct=%s ps=%s pc=%s s=%s sg=%s",
+                                     b_val, c_val,
+                                     payload.get("ci", ""),
+                                     payload.get("ct", ""),
+                                     payload.get("ps", ""),
+                                     payload.get("pc", ""),
+                                     payload.get("s", ""),
+                                     payload.get("sg", ""))
+
+                            # 格式化完整 curl_bash
+                            self._log_curl_bash(u, method, body_bytes)
+
+                            # 通知 collector
+                            if hasattr(self._collector, "on_read_payload_captured"):
+                                try:
+                                    self._collector.on_read_payload_captured(str(b_val), str(c_val))
+                                except Exception:
+                                    pass
+                except Exception as _e:
+                    log.debug("read payload 解析失败: %s", _e)
+
+            # === 捕获数字 bookId ===
+            captured_book_id = None
+
+            # 路径 1：chapterInfos POST → 读 body JSON 解析 bookIds
+            if "chapterInfos" in u and method.upper() == "POST":
+                try:
+                    body_bytes = bytes(info.requestBody()) if hasattr(info, "requestBody") else b""
+                    body_str = body_bytes.decode("utf-8", errors="ignore")
+                    import json as _json
+                    payload = _json.loads(body_str)
+                    book_ids = payload.get("bookIds") or []
+                    for bid in book_ids:
+                        if isinstance(bid, int):
+                            captured_book_id = str(bid)
+                            break
+                        elif isinstance(bid, str) and bid.isdigit():
+                            captured_book_id = bid
+                            break
+                except Exception as _e:
+                    log.debug("chapterInfos body 解析失败: %s", _e)
+
+            # 路径 2：info?bookId=XXX / getProgress?bookId=XXX GET → 从 URL query 解析
+            if captured_book_id is None and ("info" in u or "getProgress" in u):
+                try:
+                    query = url_obj.query() if isinstance(url_obj, QUrl) else ""
+                    import urllib.parse as _urlp
+                    params = _urlp.parse_qs(query)
+                    bid_list = params.get("bookId") or []
+                    if bid_list:
+                        candidate = bid_list[0]
+                        if candidate.isdigit():
+                            captured_book_id = candidate
+                except Exception:
+                    pass
+
+            # 路径 3：兜底——从 URL 本身找 bookId= 数字
+            if captured_book_id is None:
+                import re as _re
+                m = _re.search(r"[?&]bookId=(\d+)", u)
+                if m:
+                    captured_book_id = m.group(1)
+
+            if captured_book_id and hasattr(self._collector, "on_numeric_book_id_detected"):
+                self._collector.on_numeric_book_id_detected(captured_book_id)
+        except Exception as exc:  # pragma: no cover
+            log.debug("interceptRequest 异常: %s", exc)
+
+    def _log_curl_bash(self, url: str, method: str, body_bytes: bytes) -> None:
+        """将捕获的请求格式化为 curl_bash 并打印到日志。"""
+        try:
+            # 收集所有 headers
+            headers_list = []
+            try:
+                if hasattr(self, "requestHeaders"):
+                    pass  # Qt 可能不暴露
+            except Exception:
+                pass
+
+            # 从 info 直接尝试获取 headers
+            header_strs = []
+            try:
+                # QWebEngineUrlRequestInfo 没有直接的 headers getter，但可以构造
+                header_strs = [
+                    ('-H', '"Content-Type: application/json;charset=UTF-8"'),
+                    ('-H', '"Accept: application/json, text/plain, */*"'),
+                    ('-H', '"Origin: https://weread.qq.com"'),
+                    ('-H', '"Referer: https://weread.qq.com/"'),
+                ]
+            except Exception:
+                pass
+
+            # 构造 curl_bash
+            curl_parts = [f'curl -X {method.upper()} "{url}"']
+            for hk, hv in header_strs:
+                curl_parts.append(f'{hk} {hv}')
+            # body
+            if body_bytes:
+                body_str = body_bytes.decode("utf-8", errors="ignore")
+                escaped = body_str.replace('"', '\\"')
+                curl_parts.append(f'-d "{escaped}"')
+
+            curl_cmd = " ".join(curl_parts)
+            # 打印完整 curl
+            log.info("📋 ======== CAPTURED curl_bash ========")
+            log.info("📋 %s", curl_cmd)
+            log.info("📋 ======== END curl_bash ========")
+
+            # 同时打印 payload 各字段
+            import json as _j
+            try:
+                p = _j.loads(body_bytes.decode("utf-8", errors="ignore"))
+                log.info("📋 payload 字段:")
+                for k in sorted(p.keys()):
+                    v = p[k]
+                    val_str = str(v)
+                    if len(val_str) > 80:
+                        val_str = val_str[:77] + "..."
+                    log.info("📋   %s = %s", k, val_str)
+            except Exception:
+                pass
+
+            # 复制到剪贴板
+            try:
+                from PySide6.QtWidgets import QApplication
+                cb = QApplication.clipboard()
+                if cb:
+                    cb.setText(curl_cmd)
+                    log.info("📋 curl_bash 已复制到剪贴板 ✅")
+            except Exception:
+                pass
+
+            # 通知 collector
+            if hasattr(self._collector, "on_curl_captured"):
+                try:
+                    self._collector.on_curl_captured(curl_cmd)
+                except Exception:
+                    pass
+        except Exception as _e:
+            log.debug("curl_bash 格式化失败: %s", _e)
 
 
 class LoginPage(QWidget):
@@ -387,6 +565,8 @@ class LoginPage(QWidget):
     reader_navigated = Signal(dict)   # 内置浏览器打开了 reader 页：{url, book_reader_id, chapter_id, title, ...}
     browser_session_restored = Signal(bool, str)  # 恢复会话完成：(ok, message)
     session_restore_requested = Signal()  # 内部 UI 点击后请求：先跑 UI，再跑后台
+    chapters_refresh_requested = Signal()  # 通知上层：浏览器已登录，可尝试拉章节池
+    numeric_book_id_detected = Signal(str)  # 拦截器捕获到数字 bookId → 通知上层拉章节池
     # —— v3：后台线程 profile 清理完成 → GUI 线程安全推进 Stage 2（解决非 GUI 线程调 QTimer UB 问题）
     _bg_wipe_done = Signal()
 
@@ -418,9 +598,13 @@ class LoginPage(QWidget):
         self._sqlite_snapshot: list[dict[str, Any]] = []                 # 源 4: SQLite 直读
         self._sqlite_stats: dict[str, int] = {}                          # 诊断用：SQLite 读多少总行/多少白名单
         self._collect_worker_stop = threading.Event()                    # 二次启动时中止旧后台线程
-        self._tick_timer = QTimer(self)                                  # 采集阶段每秒动一下状态文案，避免“看起来卡死”
+        self._tick_timer = QTimer(self)                                  # 采集阶段每秒动一下状态文案，避免"看起来卡死"
         self._tick_timer.timeout.connect(self._on_collect_tick_timeout)
         self._tick_sec = 0
+        # —— 拦截器捕获数字 bookId 的节流（同 bookId 30s 内只触发 1 次章节池拉取）——
+        self._last_book_id_seen: dict[str, float] = {}  # {bookId: last_seen_ts}
+        self._last_book_id_emit: dict[str, float] = {}  # {bookId: last_emit_ts}
+        self._book_id_detect_min_interval = 30.0  # 同 bookId 最小触发间隔（秒）
         # —— verify 阶段防"卡死感知"：独立秒针 + 进度条 + 互斥锁（禁止重复触发）——
         self._verify_timer = QTimer(self)
         self._verify_timer.timeout.connect(self._on_verify_tick_timeout)
@@ -477,64 +661,100 @@ class LoginPage(QWidget):
 
     # ----------- UI -----------
     def _build_ui(self) -> None:
-        """按用户要求重排布局：
-        ┌───────────────────────────────────────┐
-        │  1) WebEngine（内置浏览器）            │  权重最大 撑满主空间
-        ├───────────────────────────────────────┤
-        │  2) 标题「📖 登录微信读书」+ 提示说明  │
-        ├───────────────────────────────────────┤
-        │  3) 进度条 + 进度状态文本             │  ← 新增：verify/collect 实时可视化
-        ├───────────────────────────────────────┤
-        │         [🔄 刷新页面] [✅ 我已登录完成] │  ← 状态栏上方
-        ├───────────────────────────────────────┤
-        │  4) 状态栏（等待登录…/采集/验证秒针）  │
-        └───────────────────────────────────────┘
+        """按用户要求重排布局（浏览器 + 右侧按钮垂直列）：
+        root VBox:
+        ├── level_1 HBox:
+        │   ├── browser_area VBox (stretch=8): self._web
+        │   └── btn_col VBox (stretch=1, width≈180): 三按钮垂直 + 弹簧
+        ├── url_frame   (maxH=56)
+        ├── prog_frame  (maxH=70)
+        └── status label(maxH=22)
         """
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
-        # ====== 第 1 层：内置浏览器（最大权重，用户的扫码主战场）======
+        # ====== 第 1 层：level_1 HBox —— 浏览器 + 右侧按钮列 ======
+        level_1 = QHBoxLayout()
+        level_1.setSpacing(10)
+
+        # —— 浏览器区 VBox (stretch=8) ——
+        browser_area = QVBoxLayout()
+        browser_area.setSpacing(0)
         self._web = QWebEngineView(self)
-        # —— 小窗口不挤压：外层 MainWindow 已把整页包进 QScrollArea，
-        #    所以这里用合理的"最小 520×320"，让窗口缩到 860×580 下限后用户滚动即可，
-        #    不会像 540 旧值那样把下方 提示 / 进度条 / 按钮直接挤出可视区。
-        self._web.setMinimumSize(520, 320)
+        # —— 宽度收窄到 380，与右侧按钮列(≈180)合计约 560，彻底避免横向滑块
+        self._web.setMinimumSize(380, 300)
         self._web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._web.setStyleSheet(
             "QWebEngineView{background:#fff;border:1px solid #e5eaf2;border-radius:10px;}"
         )
-        root.addWidget(self._web, 5)
+        browser_area.addWidget(self._web, 1)
+        level_1.addLayout(browser_area, 8)
 
-        # ====== 第 2 层：标题 + 说明 ======
-        title_row = QHBoxLayout()
-        title_row.setSpacing(10)
-        title = QLabel("📖 登录微信读书")
-        title.setStyleSheet("font-size:17px;font-weight:600;color:#2f3b52;")
-        title_row.addWidget(title)
-        title_row.addStretch(1)
-        root.addLayout(title_row)
+        # —— 按钮列 VBox (stretch=1, 固定宽约 180) ——
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(10)
+        btn_col.addStretch(1)
 
-        tip = QLabel(
-            "1. 使用手机微信扫一扫完成登录（扫码授权过程请完整等待网页自动跳回书架）\n"
-            "2. 登录成功后请在上方页面中点击任意一本已加入书架的书，确认可以正常进入阅读页\n"
-            "3. 在阅读页再停留 10 秒以上，让阅读页的 wr_skey/wr_rt 更新完全；\n"
-            "   然后点击下方【我已登录完成】按钮，程序会通过 4 路并行采集提取登录 Cookie。\n"
-            "📌 想直接设定『读哪本书』？在上方浏览器打开阅读页 → 点【📋 复制当前页链接】，\n"
-            "   再切换到「🟢 状态」→「📖 正在读的书」粘贴 URL → 点「更新到阅读状态」即可。"
-        )
-        tip.setStyleSheet(
-            "color:#5f6c85; background:#f4f7fc; padding:10px 12px;"
-            "border-radius:8px; font-size:12px; line-height:1.6;"
-        )
-        tip.setWordWrap(True)
-        root.addWidget(tip)
+        self._btn_restore = QPushButton("🛡️ 恢复浏览器登录态")
+        self._btn_restore.setStyleSheet(self._btn_style("#fff3d6", "#8a5a00", hover="#ffe9ad"))
+        self._btn_restore.clicked.connect(self._on_request_restore_session)
+        self._btn_restore.setMinimumWidth(168)
+        self._btn_restore.setMaximumWidth(168)
+        self._btn_restore.setMinimumHeight(40)
+        self._btn_restore.setMaximumHeight(40)
+        try:
+            self._btn_restore.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        except Exception:  # noqa: BLE001
+            pass
+        btn_col.addWidget(self._btn_restore)
+        btn_col.addSpacing(10)
 
-        # ====== 地址栏：浏览器当前 URL 实时显示 + 一键复制 / 跳转 ======
+        self._btn_reload = QPushButton("🔄 刷新页面")
+        self._btn_reload.setStyleSheet(self._btn_style("#eef2f8", "#2f3b52"))
+        self._btn_reload.clicked.connect(self._web.reload)
+        self._btn_reload.setMinimumWidth(168)
+        self._btn_reload.setMaximumWidth(168)
+        self._btn_reload.setMinimumHeight(40)
+        self._btn_reload.setMaximumHeight(40)
+        try:
+            self._btn_reload.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        except Exception:  # noqa: BLE001
+            pass
+        btn_col.addWidget(self._btn_reload)
+        btn_col.addSpacing(10)
+
+        self._btn_done = QPushButton("✅ 我已登录完成")
+        self._btn_done.setStyleSheet(self._btn_style("#2d6cdf", "#ffffff", hover="#265bc0"))
+        self._btn_done.clicked.connect(self._on_done_clicked)
+        self._btn_done.setMinimumWidth(168)
+        self._btn_done.setMaximumWidth(168)
+        self._btn_done.setMinimumHeight(40)
+        self._btn_done.setMaximumHeight(40)
+        try:
+            self._btn_done.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        except Exception:  # noqa: BLE001
+            pass
+        btn_col.addWidget(self._btn_done)
+        btn_col.addSpacing(10)
+
+        btn_col.addStretch(3)
+
+        # 用外层 QWidget 包裹按钮列：固定列宽约 180
+        btn_col_wrap = QWidget()
+        btn_col_wrap.setMinimumWidth(180)
+        btn_col_wrap.setMaximumWidth(180)
+        btn_col_wrap.setLayout(btn_col)
+        level_1.addWidget(btn_col_wrap, 1)
+
+        root.addLayout(level_1, 1)
+
+        # ====== 第 2 层：地址栏：浏览器当前 URL 实时显示 + 一键复制 / 跳转 ======
         url_frame = QFrame()
         url_frame.setStyleSheet(
             "QFrame{background:#ffffff;border:1px solid #e5eaf2;border-radius:10px;}"
         )
+        url_frame.setMaximumHeight(56)
         url_layout = QHBoxLayout(url_frame)
         url_layout.setContentsMargins(12, 10, 12, 10)
         url_layout.setSpacing(10)
@@ -577,6 +797,7 @@ class LoginPage(QWidget):
         prog_frame.setStyleSheet(
             "QFrame{background:#f9fbff;border:1px solid #e5eaf2;border-radius:8px;}"
         )
+        prog_frame.setMaximumHeight(70)
         prog_layout = QVBoxLayout(prog_frame)
         prog_layout.setContentsMargins(12, 10, 12, 10)
         prog_layout.setSpacing(8)
@@ -602,43 +823,10 @@ class LoginPage(QWidget):
 
         root.addWidget(prog_frame)
 
-        # ====== 第 4 层：操作按钮（进度条/进度文本 下面，状态栏上面）======
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-
-        self._btn_restore = QPushButton("🛡️ 恢复浏览器登录态")  # 精简文字：原 14 字 → 10 字
-        self._btn_restore.setStyleSheet(self._btn_style("#fff3d6", "#8a5a00", hover="#ffe9ad"))
-        self._btn_restore.clicked.connect(self._on_request_restore_session)
-        btn_row.addWidget(self._btn_restore)
-
-        self._btn_reload = QPushButton("🔄 刷新页面")
-        self._btn_reload.setStyleSheet(self._btn_style("#eef2f8", "#2f3b52"))
-        self._btn_reload.clicked.connect(self._web.reload)
-        btn_row.addWidget(self._btn_reload)
-
-        self._btn_done = QPushButton("✅ 我已登录完成")
-        self._btn_done.setStyleSheet(self._btn_style("#2d6cdf", "#ffffff", hover="#265bc0"))
-        self._btn_done.clicked.connect(self._on_done_clicked)
-        btn_row.addWidget(self._btn_done)
-
-        # ===== v2 小窗口保护：三个按钮都设为不可压缩 + 明确最小宽度 =====
-        for b_login in (self._btn_restore, self._btn_reload, self._btn_done):
-            b_login.setMinimumHeight(36)  # 比地址栏高一点：主按钮更好点击
-            b_login.setMaximumHeight(36)
-            try:
-                b_login.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            except Exception:  # noqa: BLE001
-                pass
-        self._btn_restore.setMinimumWidth(170)
-        self._btn_reload.setMinimumWidth(110)
-        self._btn_done.setMinimumWidth(150)
-        btn_row.addStretch(1)
-
-        root.addLayout(btn_row)
-
-        # ====== 第 5 层：最下状态栏（等待登录…/验证秒针）======
+        # ====== 第 4 层：最下状态栏（等待登录…/验证秒针）======
         self._status = QLabel("等待登录...")
         self._status.setStyleSheet("color:#8a95a8;font-size:12px;")
+        self._status.setMaximumHeight(22)
         root.addWidget(self._status)
 
     @staticmethod
@@ -828,6 +1016,52 @@ class LoginPage(QWidget):
         chosen_root = alt_root if alt_root.parent.exists() else profile_root
         chosen_root.mkdir(parents=True, exist_ok=True)
         return chosen_root
+
+    def on_numeric_book_id_detected(self, book_id: str) -> None:
+        """拦截器捕获到数字 bookId 时调用（可能在任意线程）。
+
+        立即做两件事：
+        1) 注册 hex→numeric 映射（从当前 reader URL 提取 hex id）
+        2) 直接更新 current_book.book_id 为 numeric（覆盖 hex）
+        然后 emit 信号通知 main_window 拉章节池。
+        """
+        if not book_id or not str(book_id).isdigit():
+            return
+        import time as _time
+        import re as _re
+        bid = str(book_id)
+        self._last_book_id_seen[bid] = now = _time.time()
+        last_emit = self._last_book_id_emit.get(bid, 0)
+        if now - last_emit < self._book_id_detect_min_interval:
+            return  # 节流：同 bookId 短时间内不重复触发
+
+        # ★ 立即注册映射 + 更新 current_book
+        try:
+            web = getattr(self, "_web", None)
+            if web is not None:
+                cur_url = web.url().toString()
+                if cur_url:
+                    m_hex = _re.search(r"/reader/([A-Za-z0-9_]+)", cur_url)
+                    if m_hex:
+                        hex_id = m_hex.group(1)
+                        # 注册映射
+                        if hasattr(self, "_api") and self._api:
+                            self._api.register_book_id_mapping(hex_id, bid)
+                            # 更新 current_book.book_id
+                            cb = self._api.current_book() or {}
+                            if cb:
+                                cb["book_id"] = bid
+                                self._api.set_current_book(cb, source="interceptor_numeric")
+                                log.info("拦截器已更新 current_book.book_id: %s (hex=%s...)", bid, hex_id[:16])
+        except Exception as _e:
+            log.debug("on_numeric_book_id_detected 映射注册失败: %s", _e)
+
+        self._last_book_id_emit[bid] = now
+        log.info("拦截器捕获到数字 bookId=%s，触发章节池拉取通知", bid)
+        try:
+            self.numeric_book_id_detected.emit(bid)
+        except Exception as _e:
+            log.debug("emit numeric_book_id_detected 失败: %s", _e)
 
     def _on_request_restore_session(self) -> None:
         """UI 按钮：用户希望把"config 里已存在的登录态"回灌到浏览器，再刷新到书架。"""
@@ -1125,7 +1359,15 @@ class LoginPage(QWidget):
             log.warning("打开系统浏览器异常：%s", exc, exc_info=True)
 
     def _on_web_load_finished(self, ok: bool) -> None:  # noqa: FBT001
-        """页面加载完成后：从 <title>/JS 取书名，再补 reader_navigated 的 title 字段。"""
+        """页面加载完成后：注入请求劫持 JS + 取书名。"""
+        # 注入 JS 劫持（捕获所有 POST 请求）
+        if ok:
+            self._inject_request_hook()
+            # 延迟注入 iframe（iframe 可能在主页面之后加载）
+            QTimer.singleShot(1000, self._inject_request_hook)
+            QTimer.singleShot(3000, self._inject_request_hook)
+
+        # 取当前页标题
         try:
             url_str = self._web.url().toString()
         except Exception:  # noqa: BLE001
@@ -1159,6 +1401,229 @@ class LoginPage(QWidget):
             self._page.runJavaScript(title_js, 0, self._on_reader_js_done)
         except Exception as exc:  # noqa: BLE001
             log.debug("reader runJavaScript title 提取失败：%s", exc)
+
+    def _inject_request_hook(self) -> None:
+        """注入 JS 代码，劫持 fetch 和 XMLHttpRequest，捕获所有 POST 请求（含响应体、含 iframe）。"""
+        hook_js = r"""
+        (function() {
+            // 注入到主窗口和所有 iframe
+            function injectHook(win) {
+                try {
+                    if (win.__wxread_hooked__) return;
+                    win.__wxread_hooked__ = true;
+                    win.__wxread_captured__ = win.__wxread_captured__ || [];
+                    win.__wxread_frame_id__ = win.__wxread_frame_id__ || ('f' + Math.random().toString(36).substr(2,5));
+
+                    // === 劫持 fetch ===
+                    if (win.fetch && !win.__wxread_fetch_hooked__) {
+                        win.__wxread_fetch_orig__ = win.fetch;
+                        win.fetch = function() {
+                            var args = arguments;
+                            var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+                            var options = args[1] || {};
+                            var method = (options.method || 'GET').toUpperCase();
+
+                            if (method === 'POST') {
+                                var body = options.body || '';
+                                if (body && typeof body === 'string') {
+                                    var entry = {
+                                        url: url.substring(0, 200),
+                                        method: method,
+                                        body: body.substring(0, 500),
+                                        frame: win.__wxread_frame_id__,
+                                        timestamp: Date.now()
+                                    };
+                                    try { entry.payload = JSON.parse(body); } catch(e) {}
+                                    win.__wxread_captured__.push(entry);
+                                    if (win.__wxread_captured__.length > 200) {
+                                        win.__wxread_captured__ = win.__wxread_captured__.slice(-100);
+                                    }
+                                }
+                            }
+                            var fetchPromise = win.__wxread_fetch_orig__.apply(win, args);
+                            // 包装 fetch 以获取响应体
+                            try {
+                                fetchPromise.then(function(resp) {
+                                    try {
+                                        var clone = resp.clone();
+                                        clone.text().then(function(text) {
+                                            try { entry.responsePayload = JSON.parse(text); }
+                                            catch(e) { entry.response = text.substring(0, 500); }
+                                            entry.status = resp.status;
+                                        }).catch(function(){});
+                                    } catch(e) {}
+                                    return resp;
+                                }).catch(function(){});
+                            } catch(e) {}
+                            return fetchPromise;
+                        };
+                        win.__wxread_fetch_hooked__ = true;
+                    }
+
+                    // === 劫持 XMLHttpRequest ===
+                    if (win.XMLHttpRequest && !win.__wxread_xhr_hooked__) {
+                        var origOpen = win.XMLHttpRequest.prototype.open;
+                        var origSend = win.XMLHttpRequest.prototype.send;
+
+                        win.XMLHttpRequest.prototype.open = function(method, url) {
+                            this.__wxread_url = url;
+                            this.__wxread_method = (method || 'GET').toUpperCase();
+                            return origOpen.apply(this, arguments);
+                        };
+
+                        win.XMLHttpRequest.prototype.send = function(body) {
+                            if (this.__wxread_method === 'POST') {
+                                var bodyStr = '';
+                                if (body) {
+                                    try { bodyStr = new TextDecoder().decode(body); }
+                                    catch(e) { try { bodyStr = String(body); } catch(e2) {} }
+                                }
+                                if (bodyStr) {
+                                    var entry = {
+                                        url: (this.__wxread_url || '').substring(0, 200),
+                                        method: this.__wxread_method,
+                                        body: bodyStr.substring(0, 500),
+                                        frame: win.__wxread_frame_id__,
+                                        timestamp: Date.now()
+                                    };
+                                    try { entry.payload = JSON.parse(bodyStr); } catch(e) {}
+                                    win.__wxread_captured__.push(entry);
+                                    if (win.__wxread_captured__.length > 200) {
+                                        win.__wxread_captured__ = win.__wxread_captured__.slice(-100);
+                                    }
+                                    // 监听 loadend 获取响应体
+                                    this.addEventListener('loadend', function() {
+                                        try {
+                                            var text = this.responseText || '';
+                                            entry.status = this.status;
+                                            if (text) {
+                                                try { entry.responsePayload = JSON.parse(text); }
+                                                catch(e) { entry.response = text.substring(0, 500); }
+                                            }
+                                        } catch(e) {}
+                                    });
+                                }
+                            }
+                            return origSend.apply(this, arguments);
+                        };
+                        win.__wxread_xhr_hooked__ = true;
+                    }
+
+                    // 递归注入到子 iframe
+                    try {
+                        var frames = win.frames;
+                        if (frames && frames.length) {
+                            for (var i = 0; i < frames.length; i++) {
+                                try { injectHook(frames[i]); } catch(e) {}
+                            }
+                        }
+                    } catch(e) {}
+                } catch(e) {}
+            }
+
+            injectHook(window);
+            // 标记主窗口
+            window.__wxread_hook_injected__ = true;
+            // 统计：主窗口已 hook + 子 frame 数量
+            return 'main_hooked=1 sub_frames=' + window.frames.length;
+        })();
+        """
+        try:
+            self._page.runJavaScript(hook_js, 0, self._on_hook_injected)
+            log.info("🧪 JS 请求劫持代码已注入（含响应体捕获 + iframe 支持）")
+        except Exception as exc:
+            log.debug("JS 注入失败：%s", exc)
+
+    def _on_hook_injected(self, result: Any) -> None:
+        """JS 注入完成回调。"""
+        log.info("🧪 JS 请求劫持已激活：%s", str(result)[:120] if result else "ok")
+
+    def _poll_captured_requests(self) -> None:
+        """轮询获取 JS 捕获的请求（从所有 iframe 收集）。"""
+        poll_js = r"""
+        (function() {
+            var all = [];
+            function collect(win) {
+                try {
+                    if (win.__wxread_captured__ && win.__wxread_captured__.length) {
+                        var items = win.__wxread_captured__;
+                        // 清空
+                        win.__wxread_captured__ = [];
+                        for (var i = 0; i < items.length; i++) {
+                            all.push(items[i]);
+                        }
+                    }
+                    // 递归子 frame
+                    try {
+                        var frames = win.frames;
+                        if (frames && frames.length) {
+                            for (var j = 0; j < frames.length; j++) {
+                                try { collect(frames[j]); } catch(e) {}
+                            }
+                        }
+                    } catch(e) {}
+                } catch(e) {}
+            }
+            collect(window);
+            return JSON.stringify(all);
+        })();
+        """
+        try:
+            if self._page is None:
+                return
+            self._page.runJavaScript(poll_js, 0, self._on_poll_result)
+        except Exception as exc:
+            log.debug("轮询失败：%s", exc)
+
+    def _on_poll_result(self, result: Any) -> None:
+        """处理轮询结果。"""
+        self._poll_count = getattr(self, '_poll_count', 0) + 1
+        if not isinstance(result, str):
+            return
+        try:
+            import json
+            captured = json.loads(result)
+            if captured and len(captured) > 0:
+                log.info("🧪 轮询 #%d: JS 捕获到 %d 个 POST 请求", self._poll_count, len(captured))
+                for req in captured:
+                    url = req.get("url", "")[:120]
+                    body = req.get("body", "")[:200]
+                    frame = req.get("frame", "?")
+                    payload = req.get("payload", {}) or {}
+                    resp_payload = req.get("responsePayload")
+                    resp_preview = req.get("response", "") or ""
+                    if resp_preview:
+                        resp_preview = str(resp_preview)[:200]
+                    log.info("🧪   [%s] POST %s (status=%s)", frame, url, req.get("status", "?"))
+                    log.info("🧪   body: %s", body)
+                    if resp_preview:
+                        log.info("🧪   response: %s", resp_preview)
+                    if payload.get("b") or payload.get("c"):
+                        log.info("🧪   >>> 检测到 b=%s c=%s", payload.get("b"), payload.get("c"))
+                        log.info("🧪   >>> 完整 payload: %s", json.dumps(payload, ensure_ascii=False)[:500])
+                    # 把响应体（若有）合并到 payload，再传给 API 处理
+                    final_payload = dict(payload) if isinstance(payload, dict) else {}
+                    if isinstance(resp_payload, dict):
+                        # 对于 chapterInfos 等，响应体是主要数据源
+                        final_payload["_response"] = resp_payload
+                        # 若响应里有 data 字段，直接放顶层便于识别
+                        if "data" in resp_payload and "bookIds" not in final_payload:
+                            final_payload["data"] = resp_payload.get("data")
+                            # 同时带上 bookIds（若响应里有 bookId 也一并加进去）
+                            if not final_payload.get("bookIds"):
+                                book_ids_from_resp = []
+                                for item in (resp_payload.get("data") or []):
+                                    if isinstance(item, dict) and item.get("bookId"):
+                                        book_ids_from_resp.append(str(item.get("bookId")))
+                                if book_ids_from_resp:
+                                    final_payload["bookIds"] = book_ids_from_resp
+                    if hasattr(self, '_api') and self._api and isinstance(final_payload, dict):
+                        self._api.on_js_captured_request(url, final_payload)
+            else:
+                if self._poll_count % 3 == 0:  # 每 3 次打一次
+                    log.info("🧪 轮询 #%d: 暂无捕获（等待翻页）", self._poll_count)
+        except Exception as exc:
+            log.info("🧪 轮询 #%d: 解析失败：%s (raw=%s)", self._poll_count, exc, str(result)[:200])
 
     def _on_reader_js_done(self, result: Any) -> None:
         if not isinstance(result, str):
@@ -1257,6 +1722,119 @@ class LoginPage(QWidget):
             log.debug("cookieAdded 镜像失败：%s", exc)
 
     # ---------------- button handler ----------------
+    # ===== 自动化抓取工作流（方案 v7）=====
+    def start_auto_capture_workflow(self, target_chapter_url: str) -> None:
+        """对外接口：启动自动抓取工作流（注入 JS + 轮询 + 跳转目标章节 URL）。
+
+        调用顺序：
+        1. 调用方先确保浏览器已 load 完三体书 URL（用于种 cookie）
+        2. 再调用本方法 → 注入 JS 劫持 + 启动 2s 轮询定时器
+        3. 本方法会延迟 1s 后跳转 target_chapter_url（确保 JS 注入完成）
+        """
+        log.info("🎯 自动抓取工作流启动：注入 JS 劫持 + 启动轮询 + 跳转目标章节")
+        # 1. 立即注入 JS 劫持（不等待页面 load，多次注入会被 __wxread_hooked__ 标记去重）
+        self._inject_request_hook()
+        # 再延迟 1s 注入一次（应对 iframe 延迟加载的情况）
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(1000, self._inject_request_hook)
+
+        # 2. 启动轮询定时器
+        if not hasattr(self, "_poll_timer") or self._poll_timer is None:
+            self._poll_timer = QTimer(self)
+            self._poll_timer.timeout.connect(self._poll_captured_requests)
+        self._poll_timer.start(2000)  # 2 秒间隔
+        self._poll_count = 0
+        log.info("🎯 工作流轮询定时器已启动（2 秒间隔）")
+
+        # 3. 延迟 1.5s 后跳转目标章节 URL（确保 JS 注入完成）
+        def _do_navigate():
+            try:
+                from PySide6.QtCore import QUrl
+                log.info("🎯 工作流跳转目标章节：%s", target_chapter_url[:120])
+                self._web.load(QUrl(target_chapter_url))
+                # 跳转完成后再注入一次（新页面需要重新劫持）
+                QTimer.singleShot(2500, self._inject_request_hook)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("🎯 工作流跳转失败：%s", exc)
+        QTimer.singleShot(1500, _do_navigate)
+
+    def stop_auto_capture_workflow(self) -> dict:
+        """停止抓取+轮询，返回捕获到的数据快照。"""
+        log.info("🎯 自动抓取工作流停止")
+        try:
+            if hasattr(self, "_poll_timer") and self._poll_timer is not None:
+                self._poll_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        result: dict[str, Any] = {"template": None, "chapters": {}}
+        try:
+            if hasattr(self, "_api") and self._api:
+                tpl = self._api.get_captured_read_template()
+                result["template"] = tpl
+                if tpl and tpl.get("b"):
+                    book_hex = str(tpl.get("b", ""))
+                    result["chapters"] = {
+                        book_hex: self._api.get_captured_chapter_ids(book_hex)
+                    }
+        except Exception as exc:  # noqa: BLE001
+            log.warning("🎯 停止工作流时读取捕获数据失败：%s", exc)
+        return result
+
+    def is_capture_satisfied(self) -> bool:
+        """检查抓取数据是否满足开始阅读条件。
+
+        条件：
+        1. _last_captured_read 非空，包含完整字段（appId/b/c/ci/co/sm/pr/ps/pc）
+        2. 该 book 的捕获章节数 >= 3
+        """
+        try:
+            if not hasattr(self, "_api") or not self._api:
+                return False
+            tpl = self._api.get_captured_read_template()
+            if not tpl or not isinstance(tpl, dict):
+                return False
+            required_keys = ["appId", "b", "c", "ci", "co", "sm", "pr", "ps", "pc"]
+            for k in required_keys:
+                v = tpl.get(k)
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    return False
+            book_hex = str(tpl.get("b", "")).strip()
+            if not book_hex:
+                return False
+            chapters = self._api.get_captured_chapter_ids(book_hex)
+            if len(chapters) < 1:
+                return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_resume_workflow_after_login(self) -> None:
+        """用户点击"我已登录完成"按钮后调用：
+        如果 status_page 当前处于 NEED_LOGIN 状态（等待扫码），
+        则自动触发工作流重启：跳三体书 → 抓取 → 跳章节 → 校验 → 启动阅读。
+
+        本方法在 session_ready.emit() 之后调用，所以 cookie 已保存到 config。
+        """
+        try:
+            main_window = self.window()
+            status_page = getattr(main_window, "_status_page", None)
+            if status_page is None:
+                return
+            state = getattr(status_page, "_workflow_state", "")
+            if state != "NEED_LOGIN":
+                return
+            log.info("🎯 检测到 status_page 处于 NEED_LOGIN 状态，自动恢复工作流")
+            # 切到状态页让用户看到流程
+            try:
+                main_window._tabs.setCurrentWidget(status_page)
+            except Exception:  # noqa: BLE001
+                pass
+            # 用 singleShot 异步触发，避免在 session_ready 信号链中重入
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(500, status_page._workflow_resume_after_login)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("🎯 _maybe_resume_workflow_after_login 异常：%s", exc)
+
     def _on_done_clicked(self) -> None:
         self._status.setText(
             "正在抽取登录态（信号 + 拦截器 + SQLite + JS 四路并行）请稍候..."
@@ -1299,6 +1877,7 @@ class LoginPage(QWidget):
         self._status.setText(
             "四路并行采集中：cookie store / SQLite Cookies DB / document.cookie / storage..."
         )
+        self.chapters_refresh_requested.emit()
 
     # -------- tick（状态行秒针，UI 不卡死的最基本体感反馈）--------
     def _on_collect_tick_timeout(self) -> None:
@@ -2406,6 +2985,7 @@ class LoginPage(QWidget):
             self._status.setText("✅ 登录态验证通过，可以开始自动阅读啦！")
             QMessageBox.information(self, "登录成功", "登录态已保存并验证通过！前往「状态」页开启自动阅读。")
             self.session_ready.emit()
+            self._maybe_resume_workflow_after_login()
             return
 
         # 第一轮失败：走 renewal fallback（仍然在 verify 秒针/进度条下跑，UI 不闪）
@@ -2472,4 +3052,6 @@ class LoginPage(QWidget):
         )
         # 仍然通知主窗口刷新状态页（用户可随时重新扫码 / 切到状态页查看）
         self.session_ready.emit()
+        # 即使登录失败，也尝试恢复工作流（如果是 NEED_LOGIN 状态）—— 内部会再做一次 check_session
+        self._maybe_resume_workflow_after_login()
 

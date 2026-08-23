@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from PySide6.QtCore import QTimer, Qt, Signal, QUrl, QElapsedTimer
+from PySide6.QtCore import QTimer, Qt, Signal, QUrl, QElapsedTimer, Slot, QMetaObject, Q_ARG
 from PySide6.QtGui import QTextCharFormat, QColor, QFont, QTextCursor, QDesktopServices
 from PySide6.QtWidgets import (
     QFrame,
@@ -65,9 +65,6 @@ class StatusPage(QWidget):
         self._summary_worker_running = False
         # —— 健康检查互斥：UI 发起 + 定时触发都不能并发
         self._health_worker_running = False
-        # —— Skill 请求"主线程本地看门狗"：不依赖 scheduler 线程，22s 内一定强制解锁按钮。
-        #    （scheduler 内部线程、信号链、ThreadPoolExecutor 全部失效时，这里是最后一道防线）
-        self._skill_local_watchdog: QTimer | None = None
 
         self._verify_result.connect(self._update_cookie_status)
         self._verify_finished.connect(self._finish_verify)
@@ -104,6 +101,14 @@ class StatusPage(QWidget):
         header = QLabel("📊 阅读状态")
         header.setStyleSheet("font-size:18px;font-weight:600;color:#2f3b52;")
         root.addWidget(header)
+
+        # ====== 需求1：上下布局 → 上方左右布局 ======
+        top_hbox = QHBoxLayout()
+        top_hbox.setSpacing(12)
+
+        # ----- 左 70%：阅读状态卡 + 阅读统计卡 -----
+        left_vbox = QVBoxLayout()
+        left_vbox.setSpacing(12)
 
         # ----- 进度卡片 -----
         card = QFrame()
@@ -177,135 +182,23 @@ class StatusPage(QWidget):
         btn_row.addWidget(self._btn_verify)
         cv.addLayout(btn_row)
 
-        root.addWidget(card)
+        left_vbox.addWidget(card)
 
-        # ----- 当前阅读本卡片（书名 / URL / 进度 / 手动设置 / 去浏览器打开 / 复制链接）-----
-        card_book = QFrame()
-        card_book.setStyleSheet(_card_style())
-        cbv = QVBoxLayout(card_book)
-        cbv.setContentsMargins(20, 16, 20, 16)
-        cbv.setSpacing(10)
-
-        head_b = QHBoxLayout()
-        head_b.setSpacing(8)  # 明确控件间距，避免小窗口时被压成负值
-        title_b = QLabel("📖 正在读的书")
-        title_b.setStyleSheet("font-size:14px;font-weight:600;color:#2f3b52;")
-        # title 不需要伸缩：它文本短，作为锚点
-        title_b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-        self._lbl_book_source = QLabel("尚未选择书籍")
-        self._lbl_book_source.setStyleSheet("color:#93a0b8;font-size:12px;")
-        # —— 关键修复（小窗口挤压 v2）——
-        #   1) 最小宽度降低到 100（不是 180），让它能先收缩；
-        #   2) stretch >0，把"多余空间先让给标签 + 不足时先压缩标签"；
-        #   3) 文字省略号（ElideRight）：窄于文本宽度时显示"扫码浏…"不换行不挤控件；
-        #   4) 最大宽度上限：不要吃掉按钮的空间（按钮是必须完整显示的）。
-        self._lbl_book_source.setMinimumWidth(100)
-        self._lbl_book_source.setMaximumWidth(360)
-        self._lbl_book_source.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._lbl_book_source.setWordWrap(False)
-        try:
-            self._lbl_book_source.setTextElideMode(Qt.TextElideMode.ElideRight)
-        except Exception:  # noqa: BLE001
-            pass  # 老 PySide 可能没这个 API，但 setWordWrap(False) 已经能避免换行
-
-        # ====== 策略一：锁状态标签（上锁/未锁一眼可见）======
-        self._lbl_book_lock = QLabel("🔓 未锁定（自动同步可覆盖）")
-        self._lbl_book_lock.setStyleSheet(
-            "color:#93a0b8;font-size:12px;background:#f1f5fb;"
-            "padding:3px 10px;border-radius:10px;"
-        )
-        # —— 同 source 标签：最小宽度降低 + 允许收缩（最大 240）
-        self._lbl_book_lock.setMinimumWidth(150)
-        self._lbl_book_lock.setMaximumWidth(240)
-        self._lbl_book_lock.setWordWrap(False)
-        try:
-            self._lbl_book_lock.setTextElideMode(Qt.TextElideMode.ElideRight)
-        except Exception:  # noqa: BLE001
-            pass
-
-        btn_pick_b = QPushButton("从书架挑选")
-        btn_open_reader = QPushButton("扫码浏览器打开")  # 精简文字，避免按钮本身过宽
-        btn_copy_url = QPushButton("复制链接")
-        btn_clear_b = QPushButton("清除")
-        btn_pick_b.setStyleSheet(self._secondary_btn())
-        btn_open_reader.setStyleSheet(self._secondary_btn())
-        btn_copy_url.setStyleSheet(self._secondary_btn())
-        btn_clear_b.setStyleSheet(self._secondary_btn())
-        for b in (btn_pick_b, btn_open_reader, btn_copy_url, btn_clear_b):
-            # —— 按钮最小高度 30，固定不可压缩（按钮是"必须完整点击"的控件）
-            b.setMinimumHeight(30)
-            b.setMaximumHeight(30)
-            b.setMinimumWidth(80)
-            # —— 关键：按钮 SizePolicy 改成 Fixed，小窗口不会被压成"窄条"
-            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        btn_open_reader.setMinimumWidth(130)  # 精简文字后按钮可以更窄
-        btn_pick_b.clicked.connect(self._on_pick_book_from_shelf)
-        btn_open_reader.clicked.connect(self._on_open_book_in_browser)
-        btn_copy_url.clicked.connect(self._on_copy_book_url)
-        btn_clear_b.clicked.connect(self._on_clear_current_book)
-
-        head_b.addWidget(title_b)
-        # source 标签 + 锁标签：给 stretch=1（优先伸缩它们，保护按钮不被压）
-        head_b.addWidget(self._lbl_book_source, 1)
-        head_b.addWidget(self._lbl_book_lock, 0)
-        head_b.addStretch(1)
-        head_b.addWidget(btn_pick_b)
-        head_b.addWidget(btn_open_reader)
-        head_b.addWidget(btn_copy_url)
-        head_b.addWidget(btn_clear_b)
-        cbv.addLayout(head_b)
-
-        # 书名 + 作者
-        self._lbl_book_title = QLabel("未选择书籍：先登录 → 从扫码登录页打开一本书 → 系统会自动同步；\n或在下方粘贴微信读书「书本阅读页」URL，再点「更新到阅读状态」。")
-        self._lbl_book_title.setStyleSheet(
-            "font-size:15px;font-weight:600;color:#2f3b52;background:#f8fafc;"
-            "border-radius:10px;padding:12px 14px;"
-        )
-        self._lbl_book_title.setWordWrap(True)
-        cbv.addWidget(self._lbl_book_title)
-
-        # 书的 URL + 提交按钮
-        row_url = QHBoxLayout()
-        row_url.setSpacing(10)
+        # ====== "正在读的书"卡 — 需求1：已删除可视部分，保留隐藏占位控件避免 AttributeError ======
+        self._lbl_book_source = QLabel("（已移除）")
+        self._lbl_book_source.hide()
+        self._lbl_book_lock = QLabel("（已移除）")
+        self._lbl_book_lock.hide()
+        self._lbl_book_title = QLabel("（已移除）")
+        self._lbl_book_title.hide()
         self._edit_book_url = QLineEdit()
-        self._edit_book_url.setPlaceholderText(
-            "粘贴书本阅读页链接，例如：https://weread.qq.com/web/reader/wb36d322f07186022636daa5e?kecc32f3013eccbc87e4b62e  "
-            "（在扫码登录浏览器里打开一本书 → 复制地址栏到这里）"
-        )
-        self._edit_book_url.setMinimumHeight(34)
-        self._edit_book_url.setStyleSheet(self._lineedit_qss())
-        btn_apply_url = QPushButton("更新到阅读状态")
-        btn_apply_url.setStyleSheet(self._primary_btn())
-        btn_apply_url.setMinimumWidth(130)
-        btn_apply_url.setMinimumHeight(34)
-        btn_apply_url.clicked.connect(self._on_apply_book_url)
-        row_url.addWidget(self._edit_book_url, 1)
-        row_url.addWidget(btn_apply_url)
-        cbv.addLayout(row_url)
-
-        # 进度条（0 ~ 100%，对应官方书架 readingProgress/10000）
-        prog_row = QHBoxLayout()
-        prog_lbl = QLabel("书籍阅读进度：")
-        prog_lbl.setStyleSheet("color:#5f6c85;font-size:12px;")
+        self._edit_book_url.hide()
         self._book_progress = QProgressBar()
         self._book_progress.setRange(0, 10000)
-        self._book_progress.setValue(0)
-        self._book_progress.setFormat("—")
-        self._book_progress.setTextVisible(True)
-        self._book_progress.setMinimumHeight(26)
-        self._book_progress.setMinimumWidth(240)
-        prog_row.addWidget(prog_lbl)
-        prog_row.addWidget(self._book_progress, 1)
-        cbv.addLayout(prog_row)
-
-        # 最近一次上报时间
-        self._lbl_last_report = QLabel("最近一次上报：尚未开始")
-        self._lbl_last_report.setStyleSheet("color:#93a0b8;font-size:12px;")
-        cbv.addWidget(self._lbl_last_report)
-
+        self._book_progress.hide()
+        self._lbl_last_report = QLabel("（已移除）")
+        self._lbl_last_report.hide()
         self._current_book_cache: dict | None = None
-        root.addWidget(card_book)
 
         # ----- 官方今日阅读时长卡（新增：定期返回微信读书官方信息）-----
         card2 = QFrame()
@@ -339,7 +232,7 @@ class StatusPage(QWidget):
             self._lbl_skill_status.setTextElideMode(Qt.TextElideMode.ElideRight)
         except Exception:  # noqa: BLE001
             pass
-        self._btn_refresh_summary = QPushButton("🔄 立即刷新（Skill 优先）")
+        self._btn_refresh_summary = QPushButton("🔄 立即刷新")
         self._btn_refresh_summary.setStyleSheet(self._secondary_btn())
         self._btn_refresh_summary.clicked.connect(lambda: self._refresh_reading_summary(force=True))
         self._btn_refresh_summary.setMinimumHeight(30)
@@ -353,24 +246,22 @@ class StatusPage(QWidget):
         head2.addWidget(self._btn_refresh_summary)
         c2v.addLayout(head2)
 
-        # 4 个方块：今日 / 本周 / 本月 / 累计
+        # 4 个方块：今日 / 本周 / 本月 / 累计 —— 需求：改为 2×2 布局
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        # ===== v2：4 列均分 + 每列最小宽度 120 =====
-        #   不设 stretch 的话，Qt 在小窗口会按"内容自然宽度"分配（"累计"字少→被压得很窄），
-        #   导致 4 格宽度参差不齐；setColumnStretch(全部 =1) 让它们严格 1:1:1:1。
-        for col_i in range(4):
+        # ===== 2×2：每行 2 列，stretch=1 均分 =====
+        for col_i in range(2):
             grid.setColumnStretch(col_i, 1)
-            grid.setColumnMinimumWidth(col_i, 110)
+            grid.setColumnMinimumWidth(col_i, 140)
         self._sum_today_val = QLabel("—")
         self._sum_today_key = QLabel("今日已读")
         self._sum_week_val = QLabel("—")
-        self._sum_week_key = QLabel("本周")
+        self._sum_week_key = QLabel("本周累计")
         self._sum_month_val = QLabel("—")
-        self._sum_month_key = QLabel("本月")
+        self._sum_month_key = QLabel("本月累计")
         self._sum_total_val = QLabel("—")
-        self._sum_total_key = QLabel("累计")
+        self._sum_total_key = QLabel("总累计")
         for val in (
             self._sum_today_val, self._sum_week_val,
             self._sum_month_val, self._sum_total_val,
@@ -387,13 +278,13 @@ class StatusPage(QWidget):
             key.setStyleSheet("color:#7a879f;font-size:12px;")
             key.setAlignment(Qt.AlignmentFlag.AlignCenter)
         grid.addWidget(self._sum_today_val, 0, 0)
-        grid.addWidget(self._sum_week_val, 0, 1)
-        grid.addWidget(self._sum_month_val, 0, 2)
-        grid.addWidget(self._sum_total_val, 0, 3)
         grid.addWidget(self._sum_today_key, 1, 0)
+        grid.addWidget(self._sum_week_val, 0, 1)
         grid.addWidget(self._sum_week_key, 1, 1)
-        grid.addWidget(self._sum_month_key, 1, 2)
-        grid.addWidget(self._sum_total_key, 1, 3)
+        grid.addWidget(self._sum_month_val, 2, 0)
+        grid.addWidget(self._sum_month_key, 3, 0)
+        grid.addWidget(self._sum_total_val, 2, 1)
+        grid.addWidget(self._sum_total_key, 3, 1)
         c2v.addLayout(grid)
 
         self._lbl_summary_tip = QLabel("登录后自动同步；每 3 分钟刷新一次。点击「立即刷新」可强制获取。")
@@ -401,7 +292,29 @@ class StatusPage(QWidget):
         self._lbl_summary_tip.setWordWrap(True)
         c2v.addWidget(self._lbl_summary_tip)
 
-        root.addWidget(card2)
+        left_vbox.addWidget(card2)
+
+        top_hbox.addLayout(left_vbox, 11)  # 左 55% (11/20)
+
+        # ====== 右 45%：内置浏览器容器（main_window 会把 LoginPage 塞进来）======
+        self._right_container = QFrame()
+        self._right_container.setStyleSheet(
+            "QFrame{background:#f4f7fc;border:1px solid #e3e8f1;border-radius:10px;}"
+        )
+        self._right_layout = QVBoxLayout(self._right_container)
+        self._right_layout.setContentsMargins(8, 8, 8, 8)
+        self._right_layout.setSpacing(6)
+        # 浏览器占位标签（需求：删掉使用说明，只保留简短"浏览器加载中"）
+        self._lbl_browser_placeholder = QLabel("🔐 内置浏览器加载中…")
+        self._lbl_browser_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_browser_placeholder.setStyleSheet(
+            "color:#7a879f;font-size:13px;background:#ffffff;"
+            "border-radius:8px;padding:20px;"
+        )
+        self._right_layout.addWidget(self._lbl_browser_placeholder, 1)
+        top_hbox.addWidget(self._right_container, 9)  # 右 45% (9/20)
+
+        root.addLayout(top_hbox, 7)  # 上方占主体
 
         # ----- 日志 -----
         log_header = QLabel("📝 运行日志")
@@ -416,13 +329,13 @@ class StatusPage(QWidget):
         self._log_view.setUndoRedoEnabled(False)
         self._log_view.setWordWrapMode(self._log_view.wordWrapMode())  # 保持默认（不 wrap 更快）
         self._log_view.document().setDocumentMargin(6)
-        self._log_view.setMinimumHeight(180)
+        self._log_view.setMinimumHeight(120)
         self._log_view.setStyleSheet(
             "QPlainTextEdit{background:#ffffff;"
             "border:1px solid #e5eaf2;border-radius:10px;"
             "padding:6px 10px;color:#2f3b52;font-size:12.5px;}"
         )
-        root.addWidget(self._log_view, 1)
+        root.addWidget(self._log_view, 3)  # 下方日志占 30%
 
         # 启动时刷新时间
         self._tick_date()
@@ -462,8 +375,6 @@ class StatusPage(QWidget):
         self._scheduler.cookie_broken.connect(self._on_cookie_broken)
         self._scheduler.task_completed.connect(self._on_task_completed)
         self._scheduler.cookie_fail_reported.connect(self._on_cookie_broken)
-        # —— Skill 同步结果（每 N 次成功读 或 手动刷新 Skill）
-        self._scheduler.skill_sync_completed.connect(self._apply_skill_sync)
 
         self._api.message.connect(lambda m: self._append_log(m, "INFO"))
         self._api.warning.connect(lambda m: self._append_log(m, "WARN"))
@@ -614,16 +525,26 @@ class StatusPage(QWidget):
 
     def _on_progress(self, info: dict) -> None:
         target = int(info.get("target_minutes", 0) or 0)
-        done = int(info.get("started_minutes", 0) or 0)
+        # —— 优先使用 Skill 混合方案的完成度，兼容旧字段 ——
+        done = int(info.get("completed_minutes") or info.get("started_minutes", 0) or 0)
+        target = int(info.get("target_minutes", 0) or 0)
+        skill_baseline = int(info.get("skill_baseline_sec", 0) or 0)
+        skill_ok = bool(info.get("skill_available", False))
         if target <= 0:
             self._progress.setRange(0, 100)
             self._progress.setValue(0)
         else:
             self._progress.setRange(0, target)
             self._progress.setValue(min(done, target))
+        # 今日目标显示：Skill 基线信息加入
+        skill_tag = ""
+        if skill_ok and skill_baseline > 0:
+            skill_tag = f"  (Skill 已读 {skill_baseline}s)"
+        elif not skill_ok:
+            skill_tag = "  (本地估算)"
         self._lbl_target.setText(
             f"今日目标：{target // 60}h{target % 60:02d}m  "
-            f"/  已完成：{done // 60}h{done % 60:02d}m"
+            f"/  已完成：{done // 60}h{done % 60:02d}m{skill_tag}"
         )
         interval = info.get("current_interval", "-")
         # 更新倒计时基准（时间戳）
@@ -748,8 +669,8 @@ class StatusPage(QWidget):
             "login_browser_nav": "扫码浏览器导航",
             "login_page_storage": "扫码页storage",
             "shelf_pick_manual": "书架手动挑选",
-            "skill_book_info": "Skill同步",
-            "skill_sync": "Skill同步",
+            "auto_sync_book": "官方同步",
+            "auto_sync_summary": "官方同步",
             "cookie_shelf_progress": "Cookie书架进度",
             "clear": "手动清除",
         }
@@ -789,13 +710,6 @@ class StatusPage(QWidget):
                 self._lbl_book_source.setText(current + " " + suffix)
             else:
                 self._lbl_book_source.setText(current[: 62 - len(suffix) - 1] + "… " + suffix)
-        # bookId / chapterId / readerId 写入日志（仅一次变更可见）
-        prog_txt = f"{progress_pct:.2%}" if progress_pct is not None else "—"
-        self._append_log(
-            f"📚 当前书籍同步：source={source} title={title[:30]} bid={book_id[:12]}… "
-            f"reader={reader_id[:14]}… chapter={chapter_id[:12]}… progress={prog_txt}",
-            "INFO",
-        )
 
     def _on_apply_book_url(self) -> None:
         url = self._edit_book_url.text().strip()
@@ -939,25 +853,299 @@ class StatusPage(QWidget):
 
     # ---------------- Buttons ----------------
     def _on_start(self) -> None:
-        if not self._api.check_session():
-            # 先尝试恢复一次
-            self._append_log("启动前检查登录态，发现无效，正在尝试自动刷新 Cookie...", "WARN")
-            if not self._api.ensure_session():
-                self._update_cookie_status(False)
-                return
-        self._update_cookie_status(True)
-        if not self._scheduler.isRunning():
-            self._scheduler.start()
-            self._append_log("阅读任务已启动", "OK")
-        else:
+        """▶ 开始阅读：启动自动化抓取工作流（状态机版本）。
+
+        工作流阶段：
+        1. CHECKING_SESSION - 异步自检登录态
+        2. LOADING_BOOK_LOGIN - 未登录则跳三体书 + 触发"我已登录完成"逻辑
+        3. CAPTURING - 登录态有效则注入 JS + 轮询 + 跳目标章节
+        4. VALIDATING - 校验抓取数据，满足则启动 scheduler
+        5. NEED_LOGIN - 失败则弹窗 + 禁用按钮 + 等用户扫码
+        """
+        # 防重入：如果工作流正在跑，提示并返回
+        state = getattr(self, "_workflow_state", "IDLE")
+        if state not in ("IDLE", "READING", ""):
+            self._append_log(f"工作流进行中（{state}），请稍候...", "WARN")
+            return
+        # 重置状态机
+        self._workflow_state = "CHECKING_SESSION"
+        self._capture_retry_count = 0
+        # 清理可能的旧定时器
+        for attr in ("_satisfaction_timer", "_capture_timeout_timer"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(self, attr, None)
+        # 启动 scheduler 已运行 → 直接 resume
+        if self._scheduler.isRunning():
             self._scheduler.resume()
             self._append_log("阅读任务已恢复", "OK")
-        # 启动即立刻尝试一次"官方阅读时长"（强制用缓存也行）
+            self._workflow_state = "READING"
+            return
+        self._append_log("🚀 启动自动化抓取工作流", "INFO")
+        self._workflow_step1_check_session()
+
+    # ===== 工作流状态机 =====
+    def _workflow_step1_check_session(self) -> None:
+        """阶段1: 异步自检登录态"""
+        self._workflow_state = "CHECKING_SESSION"
+        self._append_log("阶段1: 自检登录态...", "INFO")
+
+        def _task():
+            try:
+                ok = bool(self._api.check_session())
+            except Exception as exc:  # noqa: BLE001
+                log.warning("工作流 check_session 异常：%s", exc)
+                ok = False
+            # 回到 UI 线程
+            try:
+                QMetaObject.invokeMethod(
+                    self, "_on_session_check_done", Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(bool, ok)
+                )
+            except Exception:  # noqa: BLE001
+                # fallback：用 singleShot
+                QTimer.singleShot(0, lambda: self._on_session_check_done(ok))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    @Slot(bool)
+    def _on_session_check_done(self, ok: bool) -> None:
+        """阶段1 完成：根据登录态决定下一步"""
+        if ok:
+            self._update_cookie_status(True)
+            self._append_log("✅ 登录态有效，进入抓取阶段", "OK")
+            self._workflow_step3_start_capture()
+        else:
+            self._update_cookie_status(False)
+            self._append_log("⚠️ 登录态无效，跳三体书种 cookie", "WARN")
+            self._workflow_step2_load_book_for_login()
+
+    def _workflow_step2_load_book_for_login(self) -> None:
+        """阶段2: 跳三体书 URL + 触发"我已登录完成"按钮逻辑（cookie 同步）"""
+        self._workflow_state = "LOADING_BOOK_LOGIN"
+        login_pg = self._login_page
+        if login_pg is None:
+            self._append_log("无法访问登录页，工作流中止", "ERROR")
+            self._workflow_state = "IDLE"
+            return
+
+        # 读三体书 URL
+        santi_book_url = str(self._cfg.get("reading.santi_book_url") or "").strip()
+        if not santi_book_url:
+            santi_book_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a"
+
+        # 1. 跳转三体书 URL
+        try:
+            from PySide6.QtCore import QUrl, QTimer
+            web = getattr(login_pg, "_web", None)
+            if web is not None:
+                self._append_log(f"浏览器跳转：{santi_book_url[:80]}...", "INFO")
+                web.load(QUrl(santi_book_url))
+            else:
+                self._append_log("浏览器控件不可用，工作流中止", "ERROR")
+                self._workflow_state = "IDLE"
+                return
+            # 2. 等 4s 页面加载完后，触发"我已登录完成"按钮的完整逻辑（cookie 采集 + 保存到 config）
+            QTimer.singleShot(4000, self._workflow_step2_trigger_done_button)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"阶段2跳转失败：{exc}", "ERROR")
+            self._workflow_step4_need_login()
+
+    def _workflow_step2_trigger_done_button(self) -> None:
+        """阶段2.5: 调用 _on_done_clicked 完整逻辑（触发 cookie 采集 + 保存 + session_ready 信号）"""
+        login_pg = self._login_page
+        if login_pg is None:
+            self._workflow_step4_need_login()
+            return
+        try:
+            self._append_log("触发 cookie 采集（_on_done_clicked）...", "INFO")
+            login_pg._on_done_clicked()
+            # session_ready 信号会触发 _maybe_resume_workflow_after_login
+            # 但此处我们走的是 LOADING_BOOK_LOGIN 路径，不会进入恢复分支
+            # 所以需要自己接续：8s 后再次自检
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(8000, self._workflow_step2_recheck_session)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"cookie 采集失败：{exc}", "ERROR")
+            self._workflow_step4_need_login()
+
+    def _workflow_step2_recheck_session(self) -> None:
+        """阶段2.6: cookie 采集完成后再自检一次"""
+        self._append_log("阶段2: 重新自检登录态...", "INFO")
+        # 复用阶段1的 check_session 流程
+        self._workflow_step1_check_session()
+
+    def _workflow_step3_start_capture(self) -> None:
+        """阶段3: 注入 JS 劫持 + 启动轮询 + 跳目标章节"""
+        self._workflow_state = "CAPTURING"
+        login_pg = self._login_page
+        if login_pg is None:
+            self._append_log("无法访问登录页，工作流中止", "ERROR")
+            self._workflow_state = "IDLE"
+            return
+
+        # 读配置
+        santi_book_url = str(self._cfg.get("reading.santi_book_url") or "").strip()
+        santi_chapter_url = str(self._cfg.get("reading.santi_chapter_url") or "").strip()
+        if not santi_book_url:
+            santi_book_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a"
+        if not santi_chapter_url:
+            santi_chapter_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2ak92c3210025c92cc22753209"
+
+        # 0. 先确保浏览器在三体书页（防止用户离开过）
+        try:
+            from PySide6.QtCore import QUrl, QTimer
+            web = getattr(login_pg, "_web", None)
+            if web is not None:
+                current_url = web.url().toString().strip()
+                if santi_book_url not in current_url:
+                    self._append_log(f"先加载三体书页：{santi_book_url[:80]}...", "INFO")
+                    web.load(QUrl(santi_book_url))
+                    # 等 3s 加载完再启动抓取
+                    QTimer.singleShot(3000, lambda: login_pg.start_auto_capture_workflow(santi_chapter_url))
+                else:
+                    login_pg.start_auto_capture_workflow(santi_chapter_url)
+            else:
+                self._append_log("浏览器控件不可用，工作流中止", "ERROR")
+                self._workflow_state = "IDLE"
+                return
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"阶段3启动失败：{exc}", "ERROR")
+            self._workflow_step4_need_login()
+            return
+
+        # 启动超时定时器
+        timeout_sec = int(self._cfg.get("reading.capture_timeout_sec") or 15)
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(2500, lambda: self._refresh_reading_summary(force=False))
-        # 启动也先刷新一次"Skill 启用状态"徽标（UI 立刻知道用户有没有配 Key）
-        self._tick_skill_status()
-        self._on_state_changed(self._lbl_state.text() or "阅读中")
+        self._capture_timeout_timer = QTimer(self)
+        self._capture_timeout_timer.setSingleShot(True)
+        self._capture_timeout_timer.timeout.connect(self._workflow_step4_validate)
+        self._capture_timeout_timer.start(timeout_sec * 1000)
+
+        # 启动满意度轮询（每 1s 检查 is_capture_satisfied）
+        self._satisfaction_timer = QTimer(self)
+        self._satisfaction_timer.timeout.connect(self._check_capture_satisfaction)
+        self._satisfaction_timer.start(1000)
+        self._append_log(f"阶段3: 已启动抓取+轮询，超时 {timeout_sec}s", "INFO")
+
+    def _check_capture_satisfaction(self) -> None:
+        """每秒检查一次抓取数据是否满足条件"""
+        try:
+            if self._login_page.is_capture_satisfied():
+                self._satisfaction_timer.stop()
+                self._append_log("✅ 抓取数据已满足阅读条件", "OK")
+                self._workflow_step4_validate()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("工作流满意度检查异常：%s", exc)
+
+    def _workflow_step4_validate(self) -> None:
+        """阶段5: 校验抓取数据"""
+        # 停止定时器
+        for attr in ("_satisfaction_timer", "_capture_timeout_timer"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if self._login_page.is_capture_satisfied():
+            # 满足 → 关闭抓取，启动阅读
+            self._login_page.stop_auto_capture_workflow()
+            self._workflow_step5_start_reading()
+        else:
+            # 不满足 → 重试
+            self._capture_retry_count += 1
+            max_retry = int(self._cfg.get("reading.workflow_retry_count") or 2)
+            if self._capture_retry_count <= max_retry:
+                self._append_log(
+                    f"抓取数据不完整，重试第 {self._capture_retry_count}/{max_retry} 次",
+                    "WARN"
+                )
+                # 停止当前抓取再重启
+                self._login_page.stop_auto_capture_workflow()
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(1000, self._workflow_step3_start_capture)
+            else:
+                # 重试耗尽 → 需要扫码登录
+                self._append_log(f"重试 {max_retry} 次仍失败，进入需要登录流程", "WARN")
+                self._workflow_step4_need_login()
+
+    def _workflow_step4_need_login(self) -> None:
+        """阶段4: 失败时跳转 weread.qq.com 让用户扫码 + 禁用按钮"""
+        self._workflow_state = "NEED_LOGIN"
+        # 停止抓取
+        try:
+            self._login_page.stop_auto_capture_workflow()
+        except Exception:  # noqa: BLE001
+            pass
+        # 跳转微信读书首页让用户扫码
+        try:
+            from PySide6.QtCore import QUrl
+            web = getattr(self._login_page, "_web", None)
+            if web is not None:
+                web.load(QUrl("https://weread.qq.com/"))
+        except Exception:  # noqa: BLE001
+            pass
+        # 弹窗提示
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self, "需要重新登录",
+            "登录态失效，已自动跳转微信读书首页。\n\n"
+            "请扫码登录后，点击右侧「✅ 我已登录完成」按钮，\n"
+            "系统将自动恢复抓取工作流并启动阅读。"
+        )
+        # 禁用开始按钮
+        try:
+            self._btn_start.setEnabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        self._append_log("工作流暂停：等待用户扫码登录", "WARN")
+
+    def _workflow_resume_after_login(self) -> None:
+        """用户扫码后点击"我已登录完成"按钮触发的恢复入口。
+
+        重新走 阶段2 → 阶段1 → 阶段3 流程。
+        """
+        # 恢复按钮可点击
+        try:
+            self._btn_start.setEnabled(True)
+        except Exception:  # noqa: BLE001
+            pass
+        self._capture_retry_count = 0
+        self._workflow_state = "LOADING_BOOK_LOGIN"
+        self._append_log("🎯 用户登录完成，恢复工作流：跳三体书种 cookie", "INFO")
+        self._workflow_step2_load_book_for_login()
+
+    def _workflow_step5_start_reading(self) -> None:
+        """阶段6: 启动 scheduler 执行阅读循环"""
+        self._workflow_state = "READING"
+        # 复用旧 _do_normal_start 的核心启动逻辑
+        try:
+            if not self._api.check_session():
+                if not self._api.ensure_session():
+                    self._update_cookie_status(False)
+                    self._workflow_step4_need_login()
+                    return
+            self._update_cookie_status(True)
+            if not self._scheduler.isRunning():
+                self._scheduler.start()
+                self._append_log("阅读任务已启动（走抓取数据路径）", "OK")
+            else:
+                self._scheduler.resume()
+                self._append_log("阅读任务已恢复", "OK")
+            # 启动后 2.5s 刷新一次摘要
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(2500, lambda: self._refresh_reading_summary(force=False))
+            self._tick_summary_status()
+            self._on_state_changed(self._lbl_state.text() or "阅读中")
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"启动 scheduler 失败：{exc}", "ERROR")
+            self._workflow_state = "IDLE"
 
     def _on_pause(self) -> None:
         self._scheduler.pause()
@@ -995,92 +1183,36 @@ class StatusPage(QWidget):
         self._btn_verify.setText("🔍 检测登录态")
 
     # ---------------- 官方阅读时长 ----------------
-    def _tick_skill_status(self) -> None:
-        """顶栏"Skill 状态"徽标：告诉用户是否已配置 + 刷新阈值。"""
+    def _tick_summary_status(self) -> None:
+        """顶栏"摘要状态"徽标：统一提示官方数据自动拉取规则。"""
         if not hasattr(self, "_lbl_skill_status"):
             return
-        skills_cfg = self._cfg.get("weread_skills", {}) or {}
-        key = str(skills_cfg.get("api_key") or "").strip()
-        n = max(1, min(500, int(skills_cfg.get("refresh_every_n_reads") or 10)))
-        if not key:
-            self._lbl_skill_status.setText(
-                "未配置 Skill Key：前往「⚙️ 设置」→「微信读书官方 Skill」粘贴 wrk-* 后，"
-                "书名/进度/时长才会优先用官方 Skill 返回。"
-            )
-            self._lbl_skill_status.setStyleSheet("color:#93a0b8;font-size:12px;")
-        else:
-            self._lbl_skill_status.setText(
-                f"✅ Skill 已启用：每成功阅读 {n} 次同步一次官方阅读数据与当前书籍（约 {n * 30 // 60}~{n * 45 // 60} 分钟）"
-            )
-            self._lbl_skill_status.setStyleSheet("color:#2eae5d;font-size:12px;")
+        self._lbl_skill_status.setText("官方数据同步：登录后自动拉取；每 3 分钟刷新")
+        self._lbl_skill_status.setStyleSheet("color:#93a0b8;font-size:12px;")
 
     def _refresh_reading_summary(self, *, force: bool) -> None:  # noqa: FBT001
-        """触发一次阅读时长抓取；优先 weread-skills，没配 Key 时降级原 web 接口。
+        """触发一次官方阅读时长抓取（单路径：fetch_daily_reading_summary）。
 
-        缓存策略：
-          * Skill 启用：缓存 2 分钟；force=True 或缓存超时都走 scheduler.trigger_skills_sync_nowait()
-          * Skill 未启用：保留原来的 fetch_daily_reading_summary + 3 分钟缓存
+        缓存策略：TTL 3 分钟；force=True 强制跳过缓存。
         """
-        # 每次进来都刷新一下"Skill 徽标"（用户刚在设置页保存的变化立刻可见）
-        self._tick_skill_status()
-
-        skills_cfg = self._cfg.get("weread_skills", {}) or {}
-        key = str(skills_cfg.get("api_key") or "").strip()
+        self._tick_summary_status()
         now = time.time()
-        skill_enabled = bool(key)
-
-        if skill_enabled:
-            ttl = 2 * 60  # Skill 结果缓存 2 分钟（避免把官方网关打爆）
-            cached_ok = (
-                self._summary_cache is not None
-                and (now - self._summary_cache_ts) < ttl
-                and (self._summary_cache.get("source") or "").startswith("skill_")
-            )
-            if cached_ok and not force:
-                self._apply_reading_summary(self._summary_cache)
-                return
-            # 有 Skill → 直接跑一次官方 Skill 网关：/readdata/detail overall + /shelf/sync + /book/info
-            # ⚠️ 三重超时保证（从里到外）：
-            #    ① weread_skills.call 单次 requests 分离 (connect=5s, read=≤15s)
-            #    ② weread_skills.fetch_all 外层 ThreadPoolExecutor 总 20s 硬中断
-            #    ③ status_page 本地主线程 QTimer(22s) 看门狗：绝对保证按钮解锁（不依赖子线程/信号链）
-            if not getattr(self._scheduler, "_skills_worker_running", False):
-                self._btn_refresh_summary.setEnabled(False)
-            self._lbl_summary_tip.setText(
-                "正在请求微信读书官方 Skill（无需安装 npx skills add；内部直连 POST i.weread.qq.com/api/agent/gateway）"
-                "，请稍候...22 秒内未返回将自动解锁按钮，详情请查看下方日志窗口。"
-            )
-            # —— 启动本地看门狗（必开，不管 scheduler 内部 timer 是否 tick）——
-            try:
-                if self._skill_local_watchdog is None:
-                    self._skill_local_watchdog = QTimer(self)
-                    self._skill_local_watchdog.setSingleShot(True)
-                    self._skill_local_watchdog.timeout.connect(self._on_skill_local_watchdog_timeout)
-                self._skill_local_watchdog.stop()
-                self._skill_local_watchdog.setInterval(22 * 1000)
-                self._skill_local_watchdog.start()
-            except Exception as _wd_exc:  # noqa: BLE001
-                log.warning("启动 Skill 本地看门狗失败：%s", _wd_exc)
-            self._scheduler.trigger_skills_sync_nowait()
-            return
-
-        # —— Skill 未启用：保留旧的 9 路接口兜底 ——
         ttl = 3 * 60
         cached_ok = (
             self._summary_cache is not None
             and (now - self._summary_cache_ts) < ttl
         )
         if cached_ok and not force:
-            # 已有缓存 & 没过期 & 不是强制刷新 → 只用缓存更新 UI，不打接口
             self._apply_reading_summary(self._summary_cache)
             return
         if getattr(self, "_summary_worker_running", False):
             if force:
-                self._lbl_summary_tip.setText("正在请求微信读书官方数据，请稍候...")
+                self._lbl_summary_tip.setText("正在请求微信读书官方数据...")
             return
         self._summary_worker_running = True
         self._btn_refresh_summary.setEnabled(False)
-        self._lbl_summary_tip.setText("正在向微信读书官方请求今日阅读数据，请稍候...")
+        self._btn_refresh_summary.setText("🔄 立即刷新")
+        self._lbl_summary_tip.setText("正在请求微信读书官方数据...")
 
         def _worker() -> None:
             try:
@@ -1091,7 +1223,6 @@ class StatusPage(QWidget):
                     self._summary_cache = res
             except Exception as exc:  # noqa: BLE001
                 res = {"error": f"exception: {exc}"}
-            # —— 无论成功失败，都确保按钮可再次点击（Signal 可能没订阅/走了异常路径也不怕）——
             try:
                 from PySide6.QtCore import QMetaObject, Qt as _Qt
                 QMetaObject.invokeMethod(
@@ -1103,96 +1234,20 @@ class StatusPage(QWidget):
             self._reading_summary_ready.emit(res if isinstance(res, dict) else {"error": "empty"})
         threading.Thread(target=_worker, daemon=True, name="ReadingSummary").start()
 
-    def _on_skill_local_watchdog_timeout(self) -> None:
-        """status_page 本地主线程 22s 看门狗到期：100% 解锁按钮 + 更新 tip。
-
-        注意：理论上 scheduler 的 18s watchdog + fetch_all 20s ThreadPoolExecutor
-        应该先触发，但万一线程/信号链出问题（比如信号没连上、QThread 事件循环异常），
-        这里是 UI 侧最后一道防线。到期后直接认为 Skill 同步"超时失败"，构造
-        兼容 payload 走一遍 apply 流程，确保 UI 状态一致。
-        """
-        self._append_log("⏱️  Skill 看门狗（本地 22s）触发：请求未在预期时间返回，已强制解锁按钮。", "WARN")
-        try:
-            self._lbl_summary_tip.setText(
-                "⚠️ weread-skills 网关 22 秒内未返回（可能是网络到 i.weread.qq.com 不通或 Key 失效）。"
-                "按钮已自动解锁，请：① 在设置页点击「验证 Key 有效性」再确认一次；"
-                "② 检查本机是否能访问 i.weread.qq.com（通常需要国内网络）。"
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        self._unlock_summary_controls()
-
     def _unlock_summary_controls(self) -> None:
-        """所有"结束出口"最后统一调一次：保证按钮一定能再点（看门狗兜底的最后一道防线）。"""
+        """所有"结束出口"最后统一调一次：保证按钮一定能再点。"""
         self._summary_worker_running = False
-        # 把 scheduler 的 Skill 跑位标志也清一下（极端场景看门狗 fire 了但 worker 还没 finally 执行的双保险）
-        try:
-            setattr(self._scheduler, "_skills_worker_running", False)
-        except Exception:  # noqa: BLE001
-            pass
         try:
             if self._btn_refresh_summary is not None:
                 self._btn_refresh_summary.setEnabled(True)
         except Exception:  # noqa: BLE001
             pass
 
-    def _apply_skill_sync(self, payload: dict) -> None:
-        """Skill 同步结果：同时更新 官方阅读时长卡 + （如有）当前书籍卡。"""
-        # Skill 同步信号到了 → 先把本地看门狗停掉（否则 22s 到期会错判成超时）
-        try:
-            if getattr(self, "_skill_local_watchdog", None) is not None:
-                self._skill_local_watchdog.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        if not isinstance(payload, dict):
-            return
-        # 写入缓存 & 更新官方阅读时长卡
-        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-        # 把 Skill 结果包装成"reading_summary payload 兼容结构"再复用 apply 逻辑
-        # fetch_all 的 source 前缀 skill_*，apply_reading_summary 里根据 source 做文案分支
-        merged: dict[str, Any] = dict(summary)
-        merged.setdefault("source", "skill_readdata_detail_overall")
-        err = payload.get("error")
-        if err:
-            merged.setdefault("error", "all_failed")
-        merged.setdefault("fetched_at", int(payload.get("fetched_at") or time.time()))
-        # 原始键名给调试
-        merged.setdefault(
-            "raw_keys",
-            (
-                list((payload.get("readdata") or {}).get("raw_keys") or [])
-                + [str((payload.get("readdata") or {}).get("source") or "")]
-            ),
-        )
-        self._summary_cache_ts = time.time()
-        self._summary_cache = merged
-        self._apply_reading_summary(merged)
-        # Skill 同步返回的 current_book：如果有 title/progress 直接用它（优先级最高，
-        # 因为它来自官方 /book/info 或 /shelf/sync，字段完整度远高于之前 shelf/booklist）
-        cb = payload.get("current_book")
-        if isinstance(cb, dict) and (cb.get("title") or cb.get("progress") is not None or cb.get("book_id")):
-            # 如果当前页面没在展示"手动保存的书"，就把 Skill 拉出来的同步上去
-            cur_cache = self._current_book_cache if isinstance(self._current_book_cache, dict) else {}
-            old_progress = cur_cache.get("progress")
-            new_progress = cb.get("progress")
-            new_title = str(cb.get("title") or "").strip()
-            cur_title = str(cur_cache.get("title") or "").strip()
-            # 只要 Skill 解析出了进度或 title 有值就刷新（用户截图就是进度+标题缺）
-            update_cond = (
-                (new_title and new_title not in ("未命名书籍", "未选择书籍")
-                 and ("未选择" in cur_title or "未命名" in cur_title or not cur_title))
-                or (new_progress is not None and old_progress is None)
-            )
-            if update_cond:
-                # 直接调用统一渲染入口（它会写缓存 + 更新输入框 + 进度条 + 日志）
-                self._apply_current_book(cb)
-        # —— Skill 同步结束，必须解锁按钮（看门狗 + 正常完成 + 异常出口全都最后走一次）——
-        self._unlock_summary_controls()
-
     def _apply_reading_summary(self, payload: dict) -> None:
         """UI 线程：把 reading_summary 数据灌进"官方阅读时长卡"。"""
         self._summary_worker_running = False
         self._btn_refresh_summary.setEnabled(True)
+        self._btn_refresh_summary.setText("🔄 立即刷新")
 
         err = payload.get("error") if isinstance(payload, dict) else None
         source = payload.get("source") if isinstance(payload, dict) else None
@@ -1208,48 +1263,27 @@ class StatusPage(QWidget):
             self._sum_today_val.setText("—")
         if isinstance(week_hm, str):
             self._sum_week_val.setText(week_hm)
+        else:
+            self._sum_week_val.setText("—")
         if isinstance(month_hm, str):
             self._sum_month_val.setText(month_hm)
+        else:
+            self._sum_month_val.setText("—")
         if isinstance(total_hm, str):
             self._sum_total_val.setText(total_hm)
+        else:
+            self._sum_total_val.setText("—")
 
-        # 小提示：告诉用户结果来源 / 失败原因
-        is_skill_source = isinstance(source, str) and (
-            source.startswith("skill_") or source == "skill_disabled"
-        )
         if err == "no_cookies":
             self._lbl_summary_tip.setText(
                 "⚠️ 尚未检测到登录态；请先前往「扫码登录」完成登录后再刷新。"
             )
             if self._summary_cache_ts <= 0:
                 self._lbl_summary_refresh.setText("暂无数据")
-        elif err == "disabled: no wrk- API Key":
-            self._lbl_summary_tip.setText(
-                "ℹ️ 未配置 Skill Key，已自动切换为微信读书 web 端接口兜底。"
-                " 前往「⚙️ 设置」→「微信读书官方 Skill」填入 wrk-* Key 可获得更稳定的统计数据。"
-            )
-        elif err == "all_failed" and is_skill_source:
-            self._lbl_summary_tip.setText(
-                "⚠️ weread-skills 网关暂时都没返回字段（返回结构/字段名可能变更）。"
-                " 已按「⚙️ 设置」的阈值自动重试，也可点击「立即刷新（Skill 优先）」重试。"
-            )
-        elif err == "all_failed":
-            self._lbl_summary_tip.setText(
-                "⚠️ 所有官方接口暂时都没返回今日时长（可能需要等今天有第一次阅读上报）。"
-                " 会自动重试，或点击「立即刷新（Skill 优先）」重试。"
-            )
-        elif isinstance(source, str) and isinstance(today_sec, int) and is_skill_source:
-            # 10 次约 5 分钟；显示用户自己配的阈值
-            skills_cfg = self._cfg.get("weread_skills", {}) or {}
-            n = max(1, min(500, int(skills_cfg.get("refresh_every_n_reads") or 10)))
-            self._lbl_summary_tip.setText(
-                f"✅ 数据来源：微信读书官方 Skill（{source}）。每成功阅读 {n} 次同步一次；"
-                f"数值与微信读书 App「我 → 统计」保持一致。"
-            )
         elif isinstance(source, str) and isinstance(today_sec, int):
             self._lbl_summary_tip.setText(
-                f"数据来源：微信读书官方接口（{source}）。每 3 分钟自动刷新；"
-                f"数值与微信读书 App「我 → 统计」保持一致。"
+                f"✅ 数据来源：微信读书官方接口（{source}）。每 3 分钟自动刷新；"
+                f"数值与微信读书 App「我 → 统计」一致。"
             )
         elif isinstance(source, str):
             self._lbl_summary_tip.setText(
@@ -1257,7 +1291,7 @@ class StatusPage(QWidget):
             )
         else:
             self._lbl_summary_tip.setText(
-                "登录后自动同步；每 3 分钟刷新一次。点击「立即刷新（Skill 优先）」可强制获取。"
+                "⚠️ 暂时未获取到阅读统计（首次需登录后等 1-2 分钟，或点立即刷新）。"
             )
         # 更新"更新于 xxx 前"
         if isinstance(self._summary_cache_ts, (int, float)) and self._summary_cache_ts > 0:

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, Slot, QMetaObject, Q_ARG
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,7 +27,6 @@ from PySide6.QtWidgets import (
 
 from app.core.config import ConfigStore
 from app.core.weread_api import WeReadApi
-from app.core.weread_skills import WeReadSkills
 from app.utils.autostart import is_autostart_enabled, set_autostart
 from app.utils.logger import get_logger
 
@@ -99,7 +99,6 @@ class SettingsPage(QWidget):
     settings_changed = Signal()
     verify_requested = Signal()  # 让主窗口发起"立即检测登录态"
     _test_push_done = Signal(bool)
-    _append_verify_skill_result = Signal(bool, str)
 
     def __init__(
         self,
@@ -112,13 +111,12 @@ class SettingsPage(QWidget):
         self._cfg = config or ConfigStore()
         self._dirty = False
         self._test_push_done.connect(self._handle_test_push_result)
-        self._append_verify_skill_result.connect(self._handle_verify_skill_result)
         self._build_ui()
         self._load_from_config()
 
     # ----------------- UI -----------------
     def _build_ui(self) -> None:
-        # —— 把内容整体包进 QScrollArea：即使 DPI=125%/150% + 新增 Skill 区块后也能滚动，
+        # —— 把内容整体包进 QScrollArea：即使 DPI=125%/150% 也能滚动，
         #    不会把 SpinBox/CheckBox/按钮硬压缩到尺寸下限导致文字裁切（经验 816112/100017565）
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -285,7 +283,56 @@ class SettingsPage(QWidget):
         form_read.addRow("首次巡检延迟：", self._health_first_min)
         form_read.addRow("之后每隔：", self._health_min)
 
+        # 自动化抓取工作流（方案 v7）
+        tip_workflow = QLabel(
+            "开始阅读会自动跳转三体书 → 注入 JS 抓取真实请求 → 跳目标章节捕获完整 payload。"
+            "超时秒数内若未抓到足够数据则自动重试（次数可配置）。"
+        )
+        tip_workflow.setStyleSheet("color:#7a879f;font-size:12px;padding:0 0 4px;")
+        tip_workflow.setWordWrap(True)
+        form_read.addRow(self._make_form_spacer(), tip_workflow)
+        self._capture_timeout = _form_spin(5, 120, 15, suffix=" 秒")
+        self._workflow_retry = _form_spin(0, 5, 2, suffix=" 次")
+        form_read.addRow("抓取超时秒数：", self._capture_timeout)
+        form_read.addRow("抓取失败重试：", self._workflow_retry)
+
         root.addWidget(grp_read)
+
+        # 微信读书 Skill（官方阅读统计）-----------------------------------------
+        grp_skill = QGroupBox("微信读书 Skill（官方阅读统计）")
+        grp_skill.setStyleSheet(groupbox_qss)
+        form_skill = QFormLayout(grp_skill)
+        form_skill.setContentsMargins(24, 30, 24, 24)
+        form_skill.setHorizontalSpacing(14)
+        form_skill.setVerticalSpacing(22)
+        form_skill.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form_skill.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        tip_skill = QLabel(
+            "API Key 用于调官方 readdata 接口获取真实阅读时长统计（今日/本周/本月/总累计）。\n"
+            "未填写或验证失败时，状态页阅读统计卡将显示 \"—\"。\n"
+            "申请地址：https://weread.qq.com/r/weread-skills"
+        )
+        tip_skill.setStyleSheet("color:#7a879f;font-size:12px;padding:0 0 4px;")
+        tip_skill.setWordWrap(True)
+        form_skill.addRow(self._make_form_spacer(), tip_skill)
+
+        # API Key 输入框 + 验证按钮
+        self._skill_api_key = QLineEdit()
+        self._skill_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._skill_api_key.setPlaceholderText("wrk-xxxxxxxx")
+        skill_key_row = QHBoxLayout()
+        skill_key_row.addWidget(self._skill_api_key, 1)
+        self._btn_verify_skill = QPushButton("🔍 验证")
+        self._btn_verify_skill.clicked.connect(self._on_verify_skill_key)
+        skill_key_row.addWidget(self._btn_verify_skill)
+        form_skill.addRow("API Key：", skill_key_row)
+
+        # 缓存 TTL
+        self._skill_ttl = _form_spin(60, 1800, 180, suffix=" 秒")
+        form_skill.addRow("缓存有效时长：", self._skill_ttl)
+
+        root.addWidget(grp_skill)
 
         # 推送 -----------------------------------------------------------------
         grp_push = QGroupBox("消息推送（WxPusher）")
@@ -336,65 +383,6 @@ class SettingsPage(QWidget):
         form_push.addRow(self._make_form_spacer(), self._btn_test_push)
 
         root.addWidget(grp_push)
-
-        # 微信读书 Skill（weread-skills） -----------------------------------------
-        grp_skills = QGroupBox("微信读书官方 Skill（获取阅读时长/书名/进度）")
-        grp_skills.setStyleSheet(groupbox_qss)
-        form_skills = QFormLayout(grp_skills)
-        form_skills.setContentsMargins(24, 30, 24, 24)
-        form_skills.setHorizontalSpacing(14)
-        form_skills.setVerticalSpacing(22)
-        form_skills.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form_skills.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        tip_skill = QLabel(
-            "使用方法：访问 🔗 weread.qq.com/r/weread-skills 扫码获取以 wrk- 开头的专属 API Key，"
-            "粘贴到下方并保存即可。系统在阅读过程中，每成功阅读 N 次就会通过官方 Skill 接口"
-            "（POST i.weread.qq.com/api/agent/gateway，内置直连，**完全不需要** 执行 "
-            "`npx skills add Tencent/WeChatReading -g` 或任何安装命令）同步今日时长、"
-            "书名、作者和书籍进度，保证数据和微信读书 App 一致。"
-        )
-        tip_skill.setStyleSheet("color:#7a879f;font-size:12px;padding:2px 0 2px;")
-        tip_skill.setWordWrap(True)
-        form_skills.addRow(self._make_form_spacer(), tip_skill)
-
-        self._skill_api_key = QLineEdit()
-        self._skill_api_key.setPlaceholderText("请输入以 wrk- 开头的 Skill API Key（留空则不启用）")
-        self._skill_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._skill_api_key.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self._skill_api_key.setTextMargins(12, 3, 12, 3)
-        self._skill_api_key.setMinimumHeight(40)
-        self._skill_api_key.setMaximumHeight(40)
-
-        row_key = QHBoxLayout()
-        row_key.setSpacing(10)
-        self._btn_skill_toggle = QPushButton("显示")
-        self._btn_skill_toggle.setStyleSheet(self._btn_secondary())
-        self._btn_skill_toggle.setMinimumWidth(68)
-        self._btn_skill_toggle.setMinimumHeight(38)
-        self._btn_skill_toggle.setMaximumHeight(38)
-        self._btn_skill_toggle.clicked.connect(self._on_toggle_skill_key_visible)
-        self._btn_skill_verify = QPushButton("验证 Key 有效性")
-        self._btn_skill_verify.setStyleSheet(self._btn_secondary())
-        self._btn_skill_verify.setMinimumWidth(130)
-        self._btn_skill_verify.setMinimumHeight(38)
-        self._btn_skill_verify.setMaximumHeight(38)
-        self._btn_skill_verify.clicked.connect(self._on_verify_skill_key)
-        row_key.addWidget(self._skill_api_key, 1)
-        row_key.addWidget(self._btn_skill_toggle)
-        row_key.addWidget(self._btn_skill_verify)
-        form_skills.addRow("Skill API Key：", row_key)
-
-        self._skill_refresh_n = _form_spin(1, 500, 10, suffix=" 次成功阅读")
-        tip_refresh = QLabel("1 次约等于 30 秒；默认 10 次 ≈ 每 5 分钟同步一次。")
-        tip_refresh.setStyleSheet("color:#93a0b8;font-size:12px;padding:2px 0 2px;")
-        tip_refresh.setWordWrap(True)
-        form_skills.addRow("每：", self._skill_refresh_n)
-        form_skills.addRow(self._make_form_spacer(), tip_refresh)
-
-        root.addWidget(grp_skills)
 
         # 应用 -----------------------------------------------------------------
         grp_app = QGroupBox("应用")
@@ -506,6 +494,51 @@ class SettingsPage(QWidget):
             else:
                 self._interval_min.setValue(hi)
 
+    # ----------------- Skill API Key 验证 -----------------
+    def _on_verify_skill_key(self) -> None:
+        """验证 Skill API Key 是否有效（异步，避免 UI 卡死）。"""
+        api_key = self._skill_api_key.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "验证失败", "请先填入 API Key")
+            return
+        if not api_key.startswith("wrk-"):
+            QMessageBox.warning(self, "格式错误", "API Key 应以 wrk- 开头")
+            return
+        # 临时禁用按钮防止重复点击
+        self._btn_verify_skill.setEnabled(False)
+        self._btn_verify_skill.setText("验证中...")
+
+        def _task():
+            try:
+                main_window = self.window()
+                api = getattr(main_window, "_api", None)
+                if api is None:
+                    # fallback：从 status_page 取
+                    status_page = getattr(main_window, "_status_page", None)
+                    api = getattr(status_page, "_api", None) if status_page else None
+                if api is None:
+                    ok, msg = False, "无法访问 WeReadApi 实例"
+                else:
+                    ok, msg = api.verify_skill_api_key(api_key)
+            except Exception as exc:  # noqa: BLE001
+                ok, msg = False, f"验证异常：{exc}"
+            # 回到 UI 线程显示结果
+            QMetaObject.invokeMethod(
+                self, "_on_verify_skill_done", Qt.ConnectionType.QueuedConnection,
+                Q_ARG(bool, ok), Q_ARG(str, msg)
+            )
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    @Slot(bool, str)
+    def _on_verify_skill_done(self, ok: bool, msg: str) -> None:
+        self._btn_verify_skill.setEnabled(True)
+        self._btn_verify_skill.setText("🔍 验证")
+        if ok:
+            QMessageBox.information(self, "验证成功", msg)
+        else:
+            QMessageBox.warning(self, "验证失败", msg)
+
     # ----------------- Load / Save -----------------
     def _load_from_config(self) -> None:
         reading = self._cfg.get("reading", {}) or {}
@@ -515,11 +548,17 @@ class SettingsPage(QWidget):
         self._interval_max.setValue(int(reading.get("max_interval_sec", 45)))
         self._health_first_min.setValue(int(reading.get("health_check_first_min", 3)))
         self._health_min.setValue(int(reading.get("health_check_min", 12)))
+        self._capture_timeout.setValue(int(reading.get("capture_timeout_sec", 15)))
+        self._workflow_retry.setValue(int(reading.get("workflow_retry_count", 2)))
 
         push = self._cfg.get("push", {}) or {}
         self._wxpusher_spt.setText(str(push.get("wxpusher_spt", "") or ""))
         self._chk_cookie_fail.setChecked(bool(push.get("notify_cookie_fail", True)))
         self._chk_daily.setChecked(bool(push.get("notify_daily_done", True)))
+
+        skill = self._cfg.get("skill", {}) or {}
+        self._skill_api_key.setText(str(skill.get("api_key", "") or ""))
+        self._skill_ttl.setValue(int(skill.get("summary_cache_ttl", 180)))
 
         app = self._cfg.get("app", {}) or {}
         # 开机自启优先取注册表真实状态
@@ -527,83 +566,6 @@ class SettingsPage(QWidget):
         self._chk_tray.setChecked(bool(app.get("minimize_to_tray", True)))
         self._chk_start_min.setChecked(bool(app.get("start_minimized", False)))
         self._chk_start_max.setChecked(bool(app.get("start_maximized", True)))
-
-        skills = self._cfg.get("weread_skills", {}) or {}
-        self._skill_api_key.setText(str(skills.get("api_key") or ""))
-        self._skill_refresh_n.setValue(max(1, min(500, int(skills.get("refresh_every_n_reads") or 10))))
-
-    def _on_toggle_skill_key_visible(self) -> None:
-        cur = self._skill_api_key.echoMode()
-        if cur == QLineEdit.EchoMode.Password:
-            self._skill_api_key.setEchoMode(QLineEdit.EchoMode.Normal)
-            self._btn_skill_toggle.setText("隐藏")
-        else:
-            self._skill_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-            self._btn_skill_toggle.setText("显示")
-
-    def _on_verify_skill_key(self) -> None:
-        """调 Skill /_list：验证 API Key 有效性，顺便打印可支持的能力。"""
-        key = self._skill_api_key.text().strip()
-        if not key:
-            QMessageBox.information(self, "缺少 Key", "请先粘贴 Skill API Key 再验证。")
-            return
-        if not key.startswith("wrk-"):
-            ok = QMessageBox.question(
-                self, "格式提示",
-                f"当前 Key 不以 wrk- 开头，仍要尝试验证吗？\n前缀：{key[:16]}…"
-            )
-            if ok != QMessageBox.StandardButton.Yes:
-                return
-        # 先保存（避免用户填了新 Key 但未保存，验证用的是旧配置）
-        self._cfg.set("weread_skills.api_key", key)
-        self._btn_skill_verify.setEnabled(False)
-        self._btn_skill_verify.setText("验证中...")
-
-        import threading as _t
-
-        def _task() -> None:
-            try:
-                skills = WeReadSkills(self._cfg)
-                res = skills.list_capabilities()
-                ok = bool(res.get("ok"))
-                err = res.get("error")
-                http = res.get("http")
-                data = res.get("data")
-                caps: list[str] = []
-                if isinstance(data, dict):
-                    # 常见字段：capabilities / api_names / list
-                    for bucket in ("capabilities", "api_names", "apis", "list"):
-                        v = data.get(bucket)
-                        if isinstance(v, list):
-                            caps = [str(x) for x in v if x is not None]
-                            break
-                    if not caps and isinstance(data.get("apis"), dict):
-                        caps = [f"{k}" for k in list(data.get("apis").keys())[:20]]  # type: ignore[union-attr]
-                    if not caps and isinstance(data.get("capabilities"), dict):
-                        caps = [f"{k}" for k in list(data.get("capabilities").keys())[:20]]  # type: ignore[union-attr]
-                caps_text = "、".join(caps[:12]) + ("…" if len(caps) > 12 else "") if caps else "(未返回能力列表)"
-                if ok:
-                    self._append_verify_skill_result.emit(
-                        True,
-                        f"✅ Key 有效（HTTP={http}）。当前 Skill 支持能力：{caps_text}",
-                    )
-                else:
-                    self._append_verify_skill_result.emit(
-                        False,
-                        f"❌ Key 无效：{err or f'HTTP={http}'}。请重新到 weread.qq.com/r/weread-skills 获取。",
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self._append_verify_skill_result.emit(False, f"❌ 验证异常：{exc}")
-
-        _t.Thread(target=_task, daemon=True).start()
-
-    def _handle_verify_skill_result(self, ok: bool, msg: str) -> None:  # noqa: FBT001
-        self._btn_skill_verify.setEnabled(True)
-        self._btn_skill_verify.setText("验证 Key 有效性")
-        if ok:
-            QMessageBox.information(self, "Skill Key 有效", msg)
-        else:
-            QMessageBox.warning(self, "Skill Key 无效", msg)
 
     def _on_save(self) -> None:
         # 校验
@@ -623,6 +585,8 @@ class SettingsPage(QWidget):
                 "max_interval_sec": self._interval_max.value(),
                 "health_check_first_min": int(self._health_first_min.value()),
                 "health_check_min": int(self._health_min.value()),
+                "capture_timeout_sec": int(self._capture_timeout.value()),
+                "workflow_retry_count": int(self._workflow_retry.value()),
             },
         )
         self._cfg.update_dict(
@@ -631,6 +595,13 @@ class SettingsPage(QWidget):
                 "wxpusher_spt": self._wxpusher_spt.text().strip(),
                 "notify_cookie_fail": self._chk_cookie_fail.isChecked(),
                 "notify_daily_done": self._chk_daily.isChecked(),
+            },
+        )
+        self._cfg.update_dict(
+            "skill",
+            {
+                "api_key": self._skill_api_key.text().strip(),
+                "summary_cache_ttl": int(self._skill_ttl.value()),
             },
         )
         # 开机自启
@@ -645,13 +616,6 @@ class SettingsPage(QWidget):
                 "minimize_to_tray": self._chk_tray.isChecked(),
                 "start_minimized": self._chk_start_min.isChecked(),
                 "start_maximized": self._chk_start_max.isChecked(),
-            },
-        )
-        self._cfg.update_dict(
-            "weread_skills",
-            {
-                "api_key": self._skill_api_key.text().strip(),
-                "refresh_every_n_reads": max(1, min(500, int(self._skill_refresh_n.value()))),
             },
         )
         self.settings_changed.emit()

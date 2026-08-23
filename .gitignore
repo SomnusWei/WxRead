@@ -51,6 +51,7 @@ build_rc.txt
 # ===== IDE =====
 .vscode/
 .idea/
+.trae/
 *.DS_Store
 Thumbs.db
 
