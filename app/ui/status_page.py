@@ -514,6 +514,9 @@ class StatusPage(QWidget):
             self._btn_start.setEnabled(True)
             self._btn_pause.setEnabled(False)
             self._btn_stop.setEnabled(False)
+            # 🔧 阅读结束（完成/停止/空闲）：恢复 JS 拦截器
+            if hasattr(self, "_login_page") and self._login_page:
+                self._login_page.set_reader_active(False)
         elif "登录态失效" in state:
             self._lbl_state.setStyleSheet(
                 "color:#fff;background:#e25454;border-radius:999px;"
@@ -1132,9 +1135,12 @@ class StatusPage(QWidget):
                     self._workflow_step4_need_login()
                     return
             self._update_cookie_status(True)
+            # 🔧 阅读中：关闭 JS 拦截器（避免干扰）
+            if hasattr(self, "_login_page") and self._login_page:
+                self._login_page.set_reader_active(True)
             if not self._scheduler.isRunning():
                 self._scheduler.start()
-                self._append_log("阅读任务已启动（走抓取数据路径）", "OK")
+                self._append_log("阅读任务已启动（拦截器已关闭）", "OK")
             else:
                 self._scheduler.resume()
                 self._append_log("阅读任务已恢复", "OK")
@@ -1153,7 +1159,10 @@ class StatusPage(QWidget):
 
     def _on_stop(self) -> None:
         self._scheduler.stop()
-        self._append_log("阅读任务已停止", "WARN")
+        # 🔧 停止阅读：重新开启 JS 拦截器
+        if hasattr(self, "_login_page") and self._login_page:
+            self._login_page.set_reader_active(False)
+        self._append_log("阅读任务已停止（拦截器已恢复）", "WARN")
         self._on_state_changed("已停止")
         self._next_run_at = None
 

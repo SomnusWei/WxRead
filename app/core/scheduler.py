@@ -148,16 +148,38 @@ class ReadingScheduler(QThread):
             self._maybe_run_health_check()
             plan = self._ensure_daily_plan()
             # —— 检查完成度：使用 Skill 混合方案 ——
-            if plan.completed_minutes >= plan.target_minutes:
+            completed_sec = plan.completed_sec
+            completed_min = plan.completed_minutes
+            remaining_min = plan.remaining_minutes
+            if completed_min >= plan.target_minutes:
+                log.info(
+                    "🎯 完成度检查：%d/%d 分钟（已达标）Skill基线=%ds 本地累加=%ds 本地估算=%dmin",
+                    completed_min, plan.target_minutes,
+                    plan.skill_baseline_sec, plan.session_accum_sec,
+                    plan.started_minutes,
+                )
                 self._set_state("今日任务已完成，空闲中")
                 self.log.emit(
-                    f"🎯 今日任务已完成！已读 {plan.completed_minutes}/{plan.target_minutes} 分钟"
+                    f"🎯 今日任务已完成！已读 {completed_min}/{plan.target_minutes} 分钟"
                     f"（Skill 基线 {plan.skill_baseline_sec}s + 本次累加 {plan.session_accum_sec}s）"
                 )
-                self._notify_daily_done(plan.completed_minutes)
+                self._notify_daily_done(completed_min)
                 if not self._sleep_till_next_minute(plan.date):
                     return
                 continue
+            else:
+                # 每 30 次成功打印一次详细完成度日志
+                if plan.success_count > 0 and plan.success_count % 30 == 0:
+                    log.info(
+                        "📊 完成度详情：%d/%d 分钟 (%d%%) | "
+                        "Skill基线=%ds 本次累加=%ds 本地估算=%dmin | "
+                        "剩余≈%dmin | 成功=%d 失败=%d",
+                        completed_min, plan.target_minutes,
+                        completed_min * 100 // max(1, plan.target_minutes),
+                        plan.skill_baseline_sec, plan.session_accum_sec,
+                        plan.started_minutes, remaining_min,
+                        plan.success_count, plan.fail_count,
+                    )
             # —— 周期性刷新 Skill 基线 ——
             self._maybe_refresh_skill_baseline(plan)
             self._set_state("阅读中")
@@ -167,21 +189,41 @@ class ReadingScheduler(QThread):
             cfg = self._cfg.get("reading", {}) or {}
             mn = max(5, int(cfg.get("min_interval_sec", 25)))
             mx = max(mn, int(cfg.get("max_interval_sec", 45)))
-            cur_interval = random.uniform(mn, mx)
+            base_interval = random.uniform(mn, mx)
             # 每完成 ~20 次加一段较长休息（模拟疲劳停顿）
+            is_break = False
+            break_extra = 0.0
             if plan.success_count > 0 and plan.success_count % 20 == 0:
-                cur_interval += random.uniform(60, 180)
-            # ±15% 抖动
-            cur_interval = cur_interval * random.uniform(0.85, 1.15)
+                is_break = True
+                break_extra = random.uniform(60, 180)
+            jitter = random.uniform(0.85, 1.15)
+            cur_interval = base_interval * jitter
+            if is_break:
+                cur_interval += break_extra
             if not ok:
                 # 失败时"加 30~60s 额外冷却"，而不是硬下限 60s
-                #   否则失败后永远是 60s，用户看起来就是"固定 60 秒一次"
-                extra = random.uniform(30, 60)
-                cur_interval += extra
+                fail_extra = random.uniform(30, 60)
+                cur_interval += fail_extra
+
+            # —— 详细日志：间隔随机化过程 ——
+            parts = [
+                f"间隔={mn}~{mx}s",
+                f"基础={base_interval:.1f}s",
+                f"抖动×{jitter:.2f}",
+            ]
+            if is_break:
+                parts.append(f"休息+{break_extra:.0f}s")
+            if not ok:
+                parts.append(f"失败冷却+{fail_extra:.0f}s")
+            parts.append(f"→ 最终={cur_interval:.1f}s")
+            log.info("📏 阅读间隔：%s", " | ".join(parts))
+            if is_break:
                 self.log.emit(
-                    "⚠️ 本次阅读失败，额外冷却 {}s（下一轮 ≈ {}s 后）".format(
-                        round(extra, 0), round(cur_interval, 1),
-                    )
+                    f"☕ 每 20 次长休息：+{break_extra:.0f}s（下一轮 ≈ {cur_interval:.1f}s）"
+                )
+            if not ok:
+                self.log.emit(
+                    f"⚠️ 本次阅读失败，额外冷却 {fail_extra:.0f}s（下一轮 ≈ {cur_interval:.1f}s）"
                 )
 
             # 用绝对时间戳驱动 UI 倒计时（UI 只需要 tick 1s + max(0,next_run_at-now)）
@@ -391,12 +433,28 @@ class ReadingScheduler(QThread):
 
         如果 Skill 不可用，降级为本地估算并记录警告。
         """
+        log.info(
+            "🔄 _fetch_skill_baseline 开始：当前 Skill 基线=%ds 本次累加=%ds 本地估算=%dmin",
+            plan.skill_baseline_sec, plan.session_accum_sec, plan.started_minutes,
+        )
         try:
             summary = self._api.fetch_daily_reading_summary()
             today_sec = summary.get("today_seconds")
+            log.info(
+                "🔄 _fetch_skill_baseline 返回：today_seconds=%s source=%s",
+                today_sec, summary.get("source"),
+            )
             if today_sec is not None and isinstance(today_sec, (int, float)) and today_sec >= 0:
                 plan.skill_baseline_sec = int(today_sec)
                 self._last_skill_refresh_ts = time.time()
+                # 额外打印 4 项数据
+                log.info(
+                    "✅ Skill 统计完整：今日=%ds 本周=%ds 本月=%ds 总累计=%ds",
+                    today_sec,
+                    summary.get("week_seconds"),
+                    summary.get("month_seconds"),
+                    summary.get("total_seconds"),
+                )
                 if self._skill_fallback_used:
                     self.log.emit(f"✅ Skill 基线已恢复：今日 {plan.skill_baseline_sec}s")
                     self._skill_fallback_used = False
@@ -405,30 +463,51 @@ class ReadingScheduler(QThread):
             else:
                 self._log_skill_fallback("Skill 返回今日时长为 None")
         except Exception as exc:  # noqa: BLE001
+            log.warning("_fetch_skill_baseline 异常：%s", exc)
             self._log_skill_fallback(f"Skill 基线获取异常：{exc}")
 
     def _maybe_refresh_skill_baseline(self, plan: DailyPlan) -> None:
         """周期性刷新 Skill 基线（每 5 分钟或每 N 次成功阅读）。"""
         now = time.time()
-        time_elapsed = (now - self._last_skill_refresh_ts) >= self._skill_refresh_interval_sec
+        elapsed = now - self._last_skill_refresh_ts
+        time_elapsed = elapsed >= self._skill_refresh_interval_sec
         count_elapsed = (plan.success_count > 0 and plan.success_count % self._skill_success_refresh_count == 0)
         if not (time_elapsed or count_elapsed):
             return
+        reason = []
+        if time_elapsed:
+            reason.append(f"时间到（{elapsed:.0f}s ≥ {self._skill_refresh_interval_sec}s）")
+        if count_elapsed:
+            reason.append(f"成功次数到（{plan.success_count}）")
+        log.info("🔄 Skill 基线刷新触发：%s", " + ".join(reason))
         try:
             summary = self._api.fetch_daily_reading_summary()
             today_sec = summary.get("today_seconds")
+            log.info(
+                "🔄 Skill 刷新返回：today=%ds source=%s 旧基线=%ds",
+                today_sec if today_sec else "None",
+                summary.get("source"), plan.skill_baseline_sec,
+            )
             if today_sec is not None and isinstance(today_sec, (int, float)) and today_sec >= 0:
+                old_baseline = plan.skill_baseline_sec
                 plan.skill_baseline_sec = int(today_sec)
                 plan.session_accum_sec = 0  # 刷新后归零，从新基线开始累加
                 self._last_skill_refresh_ts = now
+                log.info(
+                    "📊 Skill 基线刷新完成：%ds → %ds（Δ=%+d），本次累加归零",
+                    old_baseline, plan.skill_baseline_sec,
+                    plan.skill_baseline_sec - old_baseline,
+                )
                 self.log.emit(
                     f"📊 Skill 基线刷新：今日 {plan.skill_baseline_sec}s"
                     f"（{plan.completed_minutes}/{plan.target_minutes} 分钟）"
                 )
                 self._skill_fallback_used = False
             else:
+                log.warning("Skill 刷新返回 None，保持旧基线 %ds", plan.skill_baseline_sec)
                 self._log_skill_fallback("Skill 刷新返回 None")
         except Exception as exc:  # noqa: BLE001
+            log.warning("Skill 刷新异常：%s", exc)
             self._log_skill_fallback(f"Skill 刷新异常：{exc}")
 
     def _log_skill_fallback(self, reason: str) -> None:

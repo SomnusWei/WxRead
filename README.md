@@ -9,12 +9,15 @@
 | 功能 | 说明 |
 |------|------|
 | **扫码登录** | 内嵌浏览器扫码登录，自动提取 Cookie 与 Headers 持久化保存 |
-| **智能阅读** | 每日目标随机生成（如 9h47m），阅读间隔 25-45s 随机 ±15% 抖动 |
+| **JS 请求劫持** | 注入 `fetch`/`XMLHttpRequest` 捕获真实 `b`/`c` 字段，构造合法阅读请求 |
+| **拦截器智能开关** | 阅读中静默 JS 轮询与注入，避免干扰；空闲时自动恢复捕获 |
+| **每日目标持久化** | 当日首次启动随机取值（如 9h47m），写入 `config.json`，次日自动重取 |
 | **章节池** | 内置 `chapter_cache.json`，按 Cookie 指纹分桶存储，Cookie 失效自动重建 |
 | **Skill 统计** | 对接微信读书 Skill 1.0.4 网关，获取今日/本周/本月/总累计 4 项权威时长 |
-| **混合完成度** | Skill 基线 + 本地估算双保险，准确判断今日目标完成状态 |
+| **混合完成度检测** | Skill 基线（每 5 分钟/10 次成功刷新）+ 本地累加双保险，精准判断达标 |
 | **自动续期** | `wr_skey` 过期自动调用 `/web/login/renewal` 续命 |
 | **风控规避** | 随机书籍/章节切换、±15% 间隔抖动、每 20 次插入长休息（60-180s） |
+| **详细调试日志** | 3 大验证节点（间隔随机化/完成度检测/章节池持久化）全链路可追踪 |
 
 ### 📊 阅读统计 4 项
 
@@ -172,12 +175,36 @@ pyinstaller --noconfirm WxReadAssistant.spec
 ### 完成度计算
 
 ```
-completed_minutes = max(
-    skill_baseline_sec + session_accum_sec,  # Skill 混合方案
-    started_minutes  # 本地估算（降级）
-)
+# Skill 混合方案（主路径）
+completed_sec = skill_baseline_sec + session_accum_sec
 
-当 completed_minutes >= target_minutes → 停止阅读
+# 本地估算（降级：Skill 不可用时）
+fallback_sec = started_minutes * 60
+
+# 最终完成度
+completed_minutes = max(completed_sec, fallback_sec) // 60
+
+当 completed_minutes >= target_minutes → 停止阅读 + WxPusher 推送完成通知
+```
+
+**刷新周期**：
+- 启动时立即拉取 Skill 网关基线（今日已读权威秒数）
+- 每 5 分钟 或 每 10 次成功阅读 → 刷新 Skill 基线，`session_accum_sec` 归零（从新基线继续累加）
+- Skill 不可用时降级为本地估算模式，日志标记清晰，不影响运行
+
+**每日目标持久化**：
+```
+config.json.reading.daily_plan = {
+    "date": "2026-08-23",        # 日期键
+    "target_minutes": 580,        # 当日随机目标（分钟）
+    "locked": false               # 用户是否手动锁定（锁定不重取）
+}
+
+规则：
+  • 首次启动（config 无 daily_plan 或 date ≠ 今日）→ 重取目标 → 写入 → 复用
+  • 当日多次启动 → 命中 date = 今日 → 直接复用，不再随机
+  • 次日启动 → date 不匹配 → 重新随机取值 → 覆盖写入
+  • locked = true → 任何情况不重取，用户锁定的目标值绝对保留
 ```
 
 ### 签名算法
@@ -185,6 +212,51 @@ completed_minutes = max(
 ```
 sg = SHA256(ts + rn + KEY)    # KEY = "3c5c8717f3daf09iop3423zafeqoi"
 s  = cal_hash(encode_data(payload))  # FNV-1a 变体哈希
+```
+
+---
+
+## 🔍 调试与日志
+
+运行时日志位于 `%APPDATA%\WxReadAssistant\logs\app.log`，3 大核心验证节点全链路打印：
+
+### 📏 验证节点 1：阅读间隔随机化
+
+```
+📏 阅读间隔：间隔=25~45s | 基础=32.4s | 抖动×0.93 | 失败冷却+47s → 最终=77.1s
+☕ 每 20 次长休息：+112s（下一轮 ≈ 145.3s）
+```
+
+包含字段：范围、基础值、抖动系数、失败冷却/长休息额外值、最终等待秒数。
+
+### 📊 验证节点 2：Skill 混合完成度检测
+
+```
+🔄 _fetch_skill_baseline 返回：today_seconds=20072 source=skill_gateway
+✅ Skill 统计完整：今日=20072s 本周=35640s 本月=86400s 总累计=1209600s
+📊 Skill 基线刷新完成：20072s → 20160s（Δ=+88），本次累加归零
+📊 完成度详情：35/502 分钟 (6%) | Skill基线=20160s 本次累加=1500s 本地估算=17min
+🎯 完成度检查：502/502 分钟（已达标）Skill基线=21600s 本地累加=2400s
+```
+
+包含字段：基线获取结果、4 项统计值、刷新前后差值（Δ）、完成度明细百分比、停止时最终报告。
+
+### 📂 验证节点 3：章节池持久化
+
+```
+🔑 章节池指纹计算：fp=06e499e6...（from_session_cookies=11 keys）
+🔍 指纹比对：disk_fingerprint=06e499... new_fingerprint=06e499... match=True | 磁盘桶数=3
+✅ 章节缓存载入成功：指纹匹配（fp=06e499e6 前8位），共 3 本书 / 156 章节
+💾 章节缓存写盘成功：book_id=842609 books=3 chapters=156 size=2304B
+```
+
+包含字段：Cookie 指纹来源和长度、磁盘/内存指纹匹配结果、书数和章节数、写盘字节大小。
+
+### ✅ read_once 成功/失败日志
+
+```
+✅ read_once 成功：succ=1 synckey=abc123 b=677321c0... c=k92c3210... rt=30
+⚠️ read_once 最终空 body：HTTP=200 payload(b=677321c0... c=k92c3210...) body_keys=[]
 ```
 
 ---

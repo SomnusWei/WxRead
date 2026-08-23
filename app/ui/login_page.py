@@ -581,6 +581,7 @@ class LoginPage(QWidget):
         super().__init__(parent)
         self._api = api
         self._cfg = config or ConfigStore()
+        self._reader_active = False  # 初始空闲状态：拦截器活跃
         self._verify_done.connect(self._on_verify_done)
         self._js_cookies_ready.connect(self._on_js_cookies_ready)
         self._js_storage_ready.connect(self._on_js_storage_ready)
@@ -1358,14 +1359,43 @@ class LoginPage(QWidget):
         except Exception as exc:  # noqa: BLE001
             log.warning("打开系统浏览器异常：%s", exc, exc_info=True)
 
+    def set_reader_active(self, active: bool) -> None:
+        """阅读进行时/停止时调用。阅读中停掉 JS 轮询和自动注入，减少干扰。
+
+        active=True  → 阅读中：停 poll timer，阻止新的 JS 注入
+        active=False → 空闲中：启动 poll timer，恢复页面加载时的 JS 注入
+        """
+        log.info("🔧 set_reader_active(active=%s)：%s 模式",
+                 active, "阅读中（拦截器静默）" if active else "空闲中（拦截器活跃）")
+        self._reader_active = active
+        if active:
+            # 阅读中：停掉轮询（避免持续 2s 一次的 JS 执行）
+            if hasattr(self, "_poll_timer") and self._poll_timer is not None:
+                self._poll_timer.stop()
+                log.info("⏸️ 阅读中：停止 JS 轮询定时器")
+        else:
+            # 空闲中：重新启动轮询
+            if not hasattr(self, "_poll_timer") or self._poll_timer is None:
+                self._poll_timer = QTimer(self)
+                self._poll_timer.timeout.connect(self._poll_captured_requests)
+            if not self._poll_timer.isActive():
+                self._poll_timer.start(2000)
+                log.info("▶️ 空闲中：启动 JS 轮询定时器（2s 间隔）")
+
     def _on_web_load_finished(self, ok: bool) -> None:  # noqa: FBT001
-        """页面加载完成后：注入请求劫持 JS + 取书名。"""
+        """页面加载完成后：注入请求劫持 JS + 取书名。
+
+        阅读中不注入新 JS（避免覆盖已有 hook），空闲时正常注入。
+        """
         # 注入 JS 劫持（捕获所有 POST 请求）
         if ok:
-            self._inject_request_hook()
-            # 延迟注入 iframe（iframe 可能在主页面之后加载）
-            QTimer.singleShot(1000, self._inject_request_hook)
-            QTimer.singleShot(3000, self._inject_request_hook)
+            if getattr(self, "_reader_active", False):
+                log.debug("⏸️ 阅读中：跳过 JS 自动注入（页面加载完成但无需劫持）")
+            else:
+                self._inject_request_hook()
+                # 延迟注入 iframe（iframe 可能在主页面之后加载）
+                QTimer.singleShot(1000, self._inject_request_hook)
+                QTimer.singleShot(3000, self._inject_request_hook)
 
         # 取当前页标题
         try:

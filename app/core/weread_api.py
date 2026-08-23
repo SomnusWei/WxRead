@@ -461,6 +461,11 @@ class WeReadApi(QObject):
         任何读取异常 → log.warning 后继续（视为空），绝不抛错。"""
         # 1) 算新指纹
         new_fp = self.calc_cookie_fingerprint()
+        log.info(
+            "🔑 章节池指纹计算：fp=%s（from_session_cookies=%d keys）",
+            new_fp[:16],
+            len(list(getattr(self._session, "cookies", []) or [])),
+        )
         # 2) 读盘
         raw: dict[str, Any] = {}
         try:
@@ -469,14 +474,18 @@ class WeReadApi(QObject):
                 else _resolve_appdata_dir() / _CHAPTER_CACHE_NAME
             )
             if path_val.exists():
+                log.info("📂 章节池文件存在：%s (%d bytes)", path_val, path_val.stat().st_size)
                 try:
                     with open(path_val, "r", encoding="utf-8") as f:
                         raw = json.load(f)
                     if not isinstance(raw, dict):
+                        log.warning("⚠️ 章节池文件格式异常，视为空（root type=%s）", type(raw).__name__)
                         raw = {}
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-                    log.warning("章节缓存 JSON 读取失败，视为空缓存：%s (%s)", path_val.name, exc)
+                    log.warning("⚠️ 章节缓存 JSON 读取失败，视为空缓存：%s (%s)", path_val.name, exc)
                     raw = {}
+            else:
+                log.info("📂 章节池文件不存在：%s", path_val)
         except Exception as exc:  # noqa: BLE001
             log.warning("章节缓存载入异常（忽略，继续）：%s", exc)
             raw = {}
@@ -485,6 +494,14 @@ class WeReadApi(QObject):
         buckets = raw.get("chapter_buckets")
         if not isinstance(buckets, dict):
             buckets = {}
+        log.info(
+            "🔍 指纹比对：disk_fingerprint=%s new_fingerprint=%s match=%s | "
+            "磁盘桶数=%d",
+            disk_fp[:16] if disk_fp else "(空)",
+            new_fp[:16],
+            disk_fp == new_fp and bool(disk_fp),
+            len(buckets),
+        )
         if disk_fp and disk_fp == new_fp:
             # 指纹一致 → 载入内存（兼容老 list 结构）
             new_buckets: dict[str, dict] = {}
@@ -517,24 +534,25 @@ class WeReadApi(QObject):
                                 if u is not None and str(u).strip():
                                     uids_dyn.append(str(u).strip())
                         v["uids"] = uids_dyn
-                        v["count"] = len(uids_dyn)
+                        log.info("📂 章节池：book %s 从 chapters 动态拼 %d 个 uid", bid_n[:16], len(uids_dyn))
                     if not isinstance(v.get("count"), int):
                         v["count"] = len(v.get("uids") or [])
                     new_buckets[bid_n] = v
             with self._book_lock:
                 self.scoped_chapters = new_buckets
+            total_chapters = sum(int(b.get("count", 0) or 0) for b in new_buckets.values() if isinstance(b, dict))
             log.info(
-                "章节缓存载入成功：指纹匹配（fp=%s 前8位），共 %d 本书",
-                new_fp[:8], len(new_buckets),
+                "✅ 章节缓存载入成功：指纹匹配（fp=%s 前8位），共 %d 本书 / %d 章节",
+                new_fp[:8], len(new_buckets), total_chapters,
             )
         else:
             if disk_fp:
                 log.info(
-                    "Cookie 指纹变化，章节缓存整份丢弃（disk=%s new=%s），等待后续重拉",
+                    "🔄 Cookie 指纹变化，章节缓存整份丢弃（disk=%s new=%s），等待后续重拉",
                     (disk_fp or "")[:8], new_fp[:8],
                 )
             else:
-                log.info("章节缓存为空或首次运行（fp=%s 前8位），等待锁书时拉取", new_fp[:8])
+                log.info("📂 章节缓存为空或首次运行（fp=%s 前8位），等待锁书时拉取", new_fp[:8])
             with self._book_lock:
                 self.scoped_chapters = {}
         # 4) 保存当前指纹，供 save 时用
@@ -587,9 +605,11 @@ class WeReadApi(QObject):
                         tmp_path.unlink()
                 except Exception:
                     pass
-            log.debug(
-                "章节缓存写盘成功：book_id=%s books=%d size=%s",
-                book_id, len(data_out["chapter_buckets"]),
+            log.info(
+                "💾 章节缓存写盘成功：book_id=%s books=%d chapters=%d size=%s",
+                book_id,
+                len(data_out["chapter_buckets"]),
+                sum(int(b.get("count", 0) or 0) for b in data_out["chapter_buckets"].values() if isinstance(b, dict)),
                 f"{out_path.stat().st_size}B" if out_path.exists() else "-",
             )
         except Exception as exc:  # noqa: BLE001
@@ -1904,8 +1924,9 @@ class WeReadApi(QObject):
 
         if captured_template and template_book_id and len(captured_chapters) >= 1:
             log.info(
-                "_build_payload: 走 JS 捕获路径（book=%s, %d 章）",
-                template_book_id[:20], len(captured_chapters)
+                "_build_payload: 走 JS 捕获路径（book=%s, %d 章, last_captured_c=%s）",
+                template_book_id[:20], len(captured_chapters),
+                str(captured_template.get("c", ""))[:20],
             )
             last_c = str(captured_template.get("c", "")).strip()
             available = [c for c in captured_chapters if c != last_c]
@@ -2084,9 +2105,22 @@ class WeReadApi(QObject):
         # 在返回之前：设置 _last_read_empty_body（反映最终结果）
         if _is_empty(status, body, txt):
             self._last_read_empty_body = True
+            log.warning(
+                "⚠️ read_once 最终空 body：HTTP=%d payload(b=%s c=%s) body_keys=%s",
+                status,
+                str(payload.get("b"))[:40],
+                str(payload.get("c"))[:40],
+                list(body.keys()) if isinstance(body, dict) else str(body)[:100],
+            )
 
         if isinstance(body, dict) and body.get("succ") == 1 and "synckey" in body:
-            log.info("read 成功：succ=1 synckey=%s...", str(body.get("synckey"))[:16])
+            log.info(
+                "✅ read_once 成功：succ=1 synckey=%s b=%s c=%s rt=%d",
+                str(body.get("synckey"))[:16],
+                str(payload.get("b"))[:20],
+                str(payload.get("c"))[:20],
+                int(payload.get("rt", 0) or 0),
+            )
             # ★ 本地累计：每次成功 read 累加阅读时长（默认 1 次 ≈ 45 秒）
             self.add_read_seconds(45)
             return True
@@ -2374,7 +2408,14 @@ class WeReadApi(QObject):
         }
         for attempt in range(2):
             try:
+                log.info("🔄 Skill /readdata/detail 请求：mode=%s attempt=%d", mode, attempt + 1)
+                t0 = time.time()
                 r = self._session.post(SKILL_GATEWAY_URL, headers=headers, json=payload, timeout=timeout)
+                elapsed = (time.time() - t0) * 1000
+                log.info(
+                    "🔄 Skill /readdata/detail 响应：mode=%s HTTP=%d time=%.0fms",
+                    mode, r.status_code, elapsed,
+                )
                 if r.status_code == 499 and attempt == 0:
                     log.warning("Skill %s 触发 499 限流，800ms 后重试 1 次", mode)
                     time.sleep(0.8)
@@ -2390,6 +2431,11 @@ class WeReadApi(QObject):
                     log.warning("⚠️ Skill 有新版：%s", data.get("upgrade_info"))
                 # 注意：/readdata/detail 接口直接返回数据，不是 {"data": {...}} 格式
                 # 即 data 本身就是 {readTimes, readDays, readLongest}
+                if isinstance(data, dict) and "readTimes" in data:
+                    log.info(
+                        "✅ Skill /readdata/detail mode=%s 返回：readTimes 桶数=%d readDays=%s",
+                        mode, len(data.get("readTimes") or {}), data.get("readDays"),
+                    )
                 return data if isinstance(data, dict) else {}
             except Exception as exc:  # noqa: BLE001
                 log.warning("Skill %s 请求异常（attempt=%d）：%s", mode, attempt, exc)
