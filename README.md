@@ -16,6 +16,8 @@
 | **Skill 统计** | 对接微信读书 Skill 1.0.4 网关，获取今日/本周/本月/总累计 4 项权威时长 |
 | **混合完成度检测** | Skill 基线（每 5 分钟/10 次成功刷新）+ 本地累加双保险，精准判断达标 |
 | **自动续期** | `wr_skey` 过期自动调用 `/web/login/renewal` 续命 |
+| **Cookie 失效分级判定** | 3 级判定（HARD/SOFT/OK）：RK/ptcz 缺失 / errCode=-2012 / 302→登录页 → HARD 硬停止+弹窗+禁用按钮；5xx/超时 → SOFT 仅告警继续重试 |
+| **一键清除 Cookie** | 设置页「🗑️ 清除 Cookie」按钮：清除 config/浏览器 profile/章节缓存/Skill 缓存，被占用时标记 `pending_clear` 下次启动彻底清除 |
 | **风控规避** | 随机书籍/章节切换、±15% 间隔抖动、每 20 次插入长休息（60-180s） |
 | **详细调试日志** | 3 大验证节点（间隔随机化/完成度检测/章节池持久化）全链路可追踪 |
 
@@ -30,8 +32,8 @@
 
 ### 🔔 推送通知
 
-- **WxPusher** 推送：每日任务开始/完成、Cookie 失效提醒
-- **4 小时去重**：防止 Cookie 失效时重复轰炸
+- **WxPusher** 推送：每日任务开始/完成、Cookie 失效提醒（HARD/SOFT 分级）
+- **4 小时去重**：防止 Cookie 失效时重复轰炸，HARD/SOFT 独立 dedup key 互不覆盖
 - **测试消息**：设置页一键验证推送通道
 
 ### 🖥️ 桌面集成
@@ -85,13 +87,14 @@ pyinstaller --noconfirm WxReadAssistant.spec
 ### 第一步：扫码登录
 
 1. 启动程序，切换到 **「🔐 扫码登录」** 标签
-2. 内嵌浏览器自动打开 `weread.qq.com`
+2. 内嵌浏览器自动打开 `weread.qq.com`（或点击 **「🏠 打开首页」** 按钮手动跳转）
 3. 手机微信扫码登录，在浏览器中打开任意一本书（如《三体》）
 4. 点击 **「✅ 我已登录完成」**，程序自动：
    - 提取 Cookie（`wr_skey`、`RK`、`ptcz`、`pac_uid` 等）
    - 运行 JS 注入劫持 `fetch`/`XMLHttpRequest` 捕获阅读请求
    - 刷新章节池（`chapter_cache.json`）
    - 拉取 Skill 阅读统计基线
+   - 若之前处于 HARD 失效锁定状态，自动解锁「▶ 开始阅读」按钮
 
 ### 第二步：配置参数
 
@@ -105,6 +108,7 @@ pyinstaller --noconfirm WxReadAssistant.spec
 | WxPusher SPT | 从 [wxpusher.zjiecode.com](https://wxpusher.zjiecode.com) 申请 |
 | 开机自启 | 勾选后写入注册表 |
 | 启动入托盘 | 配合开机自启使用 |
+| 🗑️ 清除 Cookie | 一键清除所有登录态数据（config/浏览器 profile/章节缓存/Skill 缓存），被占用时标记 `pending_clear`，重启时彻底清除 |
 
 ### 第三步：开始阅读
 
@@ -214,6 +218,48 @@ sg = SHA256(ts + rn + KEY)    # KEY = "3c5c8717f3daf09iop3423zafeqoi"
 s  = cal_hash(encode_data(payload))  # FNV-1a 变体哈希
 ```
 
+### Cookie 失效分级判定
+
+```
+ensure_session()
+  ├─ check_session 通过 → OK ✅
+  ├─ RK/ptcz 锚点缺失 → HARD_INVALID 🔴 → stop + 弹窗 + 禁用按钮 + 推送
+  ├─ renewal errCode=-2010/-2012 → HARD_INVALID 🔴 → 同上
+  ├─ renewal HTTP 302→登录页 → HARD_INVALID 🔴 → 同上
+  ├─ renewal 成功但 check_session 仍失败 → HARD_INVALID 🔴 → 同上
+  ├─ renewal 5xx/超时/网络异常 → SOFT_FAIL ⚠️ → 推送+继续循环
+  └─ renewal 无 wr_skey 且无 HARD 特征 → SOFT_FAIL ⚠️ → 同上
+
+HARD_INVALID：
+  • scheduler.stop_event.set() → 阅读循环退出
+  • 「▶ 开始阅读」按钮禁用
+  • 非模态弹窗提示「必须重新扫码登录」
+  • WxPusher 推送（dedup_key=cookie_fail_hard, 4h 去重）
+  • 用户扫码后点「✅ 我已登录完成」→ 自动解锁按钮
+
+SOFT_FAIL：
+  • 阅读循环继续运行（等待网络恢复）
+  • WxPusher 推送（dedup_key=cookie_fail_soft, 4h 去重）
+```
+
+### 清除 Cookie 机制
+
+```
+设置页「🗑️ 清除 Cookie」
+  ├─ 清 config cookies/cookies_raw（成功）
+  ├─ 清 QtWebEngine / wxread-login-profile / WxReadAssistant 子目录
+  │   ├─ 删除成功 ✅
+  │   └─ 被进程占用 → 标记 pending_clear=True → 写入 config
+  ├─ 清 chapter_cache.json / wxread-skill-cache.json
+  └─ 弹窗提示重启
+
+重启应用 → _init_webview → 检查 pending_clear
+  ├─ True → 删除所有 profile 路径（此时浏览器未初始化，无进程占用）
+  │   日志：[browser-sync] pending_clear 已删除：...（39 文件, exists=False）
+  ├─ 清除标记 pending_clear=False
+  └─ saved_ok=False → 全新空 profile → 首页不再显示旧登录态
+```
+
 ---
 
 ## 🔍 调试与日志
@@ -308,10 +354,11 @@ wxread/
 
 | 文件 | 说明 |
 |------|------|
-| `config.json` | 用户配置（时长/间隔/Skill/推送等） |
+| `config.json` | 用户配置（时长/间隔/Skill/推送/pending_clear 等） |
 | `chapter_cache.json` | 章节池缓存（Cookie 指纹绑定） |
+| `wxread-skill-cache.json` | Skill 阅读统计缓存（TTL 180s） |
 | `logs/app.log` | 运行日志（按天滚动，保留 14 天） |
-| `wxread-login-profile/` | Qt WebEngine 浏览器数据 |
+| `QtWebEngine/` 或 `WxReadAssistant/` | Qt WebEngine 浏览器 profile（Cookie/LocalStorage） |
 
 ### 关键配置项
 
@@ -335,7 +382,8 @@ wxread/
   },
   "app": {
     "auto_start": false,
-    "start_minimized": false
+    "start_minimized": false,
+    "pending_clear": false
   }
 }
 ```

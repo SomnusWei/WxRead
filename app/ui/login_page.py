@@ -725,6 +725,20 @@ class LoginPage(QWidget):
         btn_col.addWidget(self._btn_reload)
         btn_col.addSpacing(10)
 
+        self._btn_home = QPushButton("🏠 打开首页")
+        self._btn_home.setStyleSheet(self._btn_style("#3a7d44", "#ffffff", hover="#33683b"))
+        self._btn_home.clicked.connect(lambda: self._web.load(QUrl("https://weread.qq.com/")))
+        self._btn_home.setMinimumWidth(168)
+        self._btn_home.setMaximumWidth(168)
+        self._btn_home.setMinimumHeight(40)
+        self._btn_home.setMaximumHeight(40)
+        try:
+            self._btn_home.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        except Exception:  # noqa: BLE001
+            pass
+        btn_col.addWidget(self._btn_home)
+        btn_col.addSpacing(10)
+
         self._btn_done = QPushButton("✅ 我已登录完成")
         self._btn_done.setStyleSheet(self._btn_style("#2d6cdf", "#ffffff", hover="#265bc0"))
         self._btn_done.clicked.connect(self._on_done_clicked)
@@ -885,6 +899,30 @@ class LoginPage(QWidget):
         # =============== Stage 1：判定 + profile/页面创建（UI 先出白框！）===============
         # 1) 纯本地判定 — 零网络、毫秒级
         saved_ok = self._has_saved_usable_session()
+
+        # 1.5) 检查 pending_clear：上次运行时清除 Cookie 被占用，标记本次启动强制 wipe
+        #      此时浏览器还没初始化，没有任何文件被占用，可以彻底清除
+        try:
+            pending = bool(getattr(self, "_cfg", None) and self._cfg.get("app.pending_clear", False))
+        except Exception:  # noqa: BLE001
+            pending = False
+        if pending:
+            log.info("[browser-sync] 检测到 pending_clear=True，强制清除所有 profile 路径")
+            appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+            app_dir = Path(appdata) / "WxReadAssistant"
+            for t in [
+                app_dir / "QtWebEngine",
+                app_dir / "wxread-login-profile",
+                app_dir / "WxReadAssistant",
+            ]:
+                if t.exists():
+                    file_count = sum(1 for _ in t.rglob("*") if _.is_file())
+                    shutil.rmtree(t, ignore_errors=True)
+                    log.info("[browser-sync] pending_clear 已删除：%s（%d 文件, exists=%s）",
+                             t, file_count, t.exists())
+            self._cfg.set("app.pending_clear", False, auto_save=True)
+            log.info("[browser-sync] pending_clear 已清除标记，saved_ok 强制设为 False")
+            saved_ok = False
 
         # 2) 目录处理的"轻量准备"：saved_ok → 只 ensure 存在（秒级）；否则先拿路径，真正的 wipe 放后台
         from pathlib import Path as _Path

@@ -1,8 +1,11 @@
 """设置页：时长范围、请求间隔范围、WxPusher SPT、开机自启、最小化托盘开关。"""
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal, Slot, QMetaObject, Q_ARG
@@ -25,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.config import ConfigStore
+from app.core.config import ConfigStore, get_app_dir
 from app.core.weread_api import WeReadApi
 from app.utils.autostart import is_autostart_enabled, set_autostart
 from app.utils.logger import get_logger
@@ -422,6 +425,36 @@ class SettingsPage(QWidget):
 
         root.addWidget(grp_app)
 
+        # ====== 登录管理 ======
+        grp_login = QGroupBox("登录管理")
+        form_login = QFormLayout(grp_login)
+        form_login.setContentsMargins(24, 20, 24, 20)
+        form_login.setVerticalSpacing(14)
+        form_login.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        login_hint = QLabel("如果登录态异常（如 errCode=-2012 登录超时）且无法通过刷新恢复，可清除所有 Cookie 和浏览器缓存后重启应用，重新扫码登录。")
+        login_hint.setWordWrap(True)
+        login_hint.setStyleSheet("color:#8a95a8; font-size:12px; line-height:1.5;")
+        form_login.addRow(self._make_form_spacer(), login_hint)
+
+        self._btn_clear_cookies = QPushButton("🗑️ 清除 Cookie")
+        self._btn_clear_cookies.setStyleSheet(
+            "QPushButton{background:#e25454; color:#ffffff; border:none; border-radius:8px;"
+            "  font-size:14px; font-weight:600; padding:0 24px;}"
+            "QPushButton:hover{background:#cf4848;}"
+            "QPushButton:pressed{background:#b83d3d;}"
+        )
+        self._btn_clear_cookies.clicked.connect(self._on_clear_cookies)
+        self._btn_clear_cookies.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self._btn_clear_cookies.setMinimumWidth(200)
+        self._btn_clear_cookies.setMinimumHeight(40)
+        self._btn_clear_cookies.setMaximumHeight(40)
+        form_login.addRow(self._make_form_spacer(), self._btn_clear_cookies)
+
+        root.addWidget(grp_login)
+
         # 底部按钮
         root.addStretch(1)
         btn_row = QHBoxLayout()
@@ -651,3 +684,109 @@ class SettingsPage(QWidget):
                 "测试发送失败",
                 "消息未成功送达，请检查 SPT 是否正确，或等待重试后查看。",
             )
+
+    # ----------------- 清除 Cookie -----------------
+    def _on_clear_cookies(self) -> None:
+        """清除所有 Cookie + 浏览器 profile + 章节缓存（不重启，方便查看日志）。"""
+        reply = QMessageBox.warning(
+            self,
+            "确认清除 Cookie",
+            "此操作将清除所有登录态数据（Cookie、浏览器缓存、章节缓存）。\n\n"
+            "清除后需要重新扫码登录。确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._btn_clear_cookies.setEnabled(False)
+        self._btn_clear_cookies.setText("清除中...")
+
+        try:
+            app_dir = get_app_dir()  # %APPDATA%/WxReadAssistant
+            log.info("🗑️ ====== 开始清除 Cookie 和缓存 ======")
+            log.info("🗑️ app_dir = %s", app_dir)
+            pending_clear = False  # 如果有目录被占用无法删除，标记下次启动时清除
+
+            # 1. 清除 config 中的 cookies / cookies_raw
+            cookies_before = self._cfg.get("cookies", {}) or {}
+            cookies_raw_before = self._cfg.get("cookies_raw", []) or []
+            log.info("🗑️ [config] 清除前：cookies=%d keys, cookies_raw=%d 条",
+                     len(cookies_before) if isinstance(cookies_before, dict) else 0,
+                     len(cookies_raw_before) if isinstance(cookies_raw_before, list) else 0)
+            if isinstance(cookies_before, dict) and cookies_before:
+                log.info("🗑️ [config] 清除前 cookies keys = %s", list(cookies_before.keys()))
+            self._cfg.set("cookies", {}, auto_save=False)
+            self._cfg.set("cookies_raw", [], auto_save=False)
+            self._cfg.save()
+            log.info("🗑️ [config] 清除后：cookies={}, cookies_raw=[]（已存盘）")
+
+            # 2. 删除浏览器 profile 目录（QtWebEngine 持久化）
+            #    profile 路径有 3 个变体（见 login_page.py）：
+            #    a) app_dir / "QtWebEngine" / "wxread-login-profile"
+            #    b) app_dir / "WxReadAssistant" / "QtWebEngine" / "wxread-login-profile"
+            #    c) app_dir / "wxread-login-profile"  (alt_root)
+            #    最彻底：删整个 QtWebEngine + alt root + WxReadAssistant 子目录
+            targets = [
+                ("QtWebEngine 目录", app_dir / "QtWebEngine"),
+                ("alt_root wxread-login-profile", app_dir / "wxread-login-profile"),
+                ("嵌套 WxReadAssistant 子目录", app_dir / "WxReadAssistant"),
+            ]
+            for label, t in targets:
+                if t.exists():
+                    # 统计目录大小和文件数
+                    file_count = sum(1 for _ in t.rglob("*") if _.is_file())
+                    log.info("🗑️ [%s] 存在：%s（%d 个文件）", label, t, file_count)
+                    shutil.rmtree(t, ignore_errors=True)
+                    # 验证删除结果
+                    if t.exists():
+                        # 被进程占用无法删除 → 标记 pending_clear，下次启动时清除
+                        log.warning("🗑️ [%s] 被占用无法删除，已标记 pending_clear，下次启动时清除", label)
+                        pending_clear = True
+                    else:
+                        log.info("🗑️ [%s] 删除成功 ✅", label)
+                else:
+                    log.info("🗑️ [%s] 不存在，跳过：%s", label, t)
+
+            # 3. 删除 chapter_cache.json
+            chapter_cache = app_dir / "chapter_cache.json"
+            if chapter_cache.exists():
+                size_kb = chapter_cache.stat().st_size / 1024
+                log.info("🗑️ [chapter_cache] 存在：%s（%.1f KB）", chapter_cache, size_kb)
+                chapter_cache.unlink(missing_ok=True)
+                log.info("🗑️ [chapter_cache] 删除成功 ✅")
+            else:
+                log.info("🗑️ [chapter_cache] 不存在，跳过")
+
+            # 4. 删除 skill 缓存
+            skill_cache = app_dir / "wxread-skill-cache.json"
+            if skill_cache.exists():
+                size_kb = skill_cache.stat().st_size / 1024
+                log.info("🗑️ [skill_cache] 存在：%s（%.1f KB）", skill_cache, size_kb)
+                skill_cache.unlink(missing_ok=True)
+                log.info("🗑️ [skill_cache] 删除成功 ✅")
+            else:
+                log.info("🗑️ [skill_cache] 不存在，跳过")
+
+            log.info("🗑️ ====== Cookie 和缓存清除完成 ======")
+            # 如果有目录被占用，标记 pending_clear，下次启动时在浏览器初始化前彻底清除
+            self._cfg.set("app.pending_clear", pending_clear, auto_save=True)
+            log.info("🗑️ pending_clear=%s（已写入 config）", pending_clear)
+        except Exception as exc:  # noqa: BLE001
+            log.error("🗑️ 清除 Cookie 失败：%s", exc)
+            self._btn_clear_cookies.setEnabled(True)
+            self._btn_clear_cookies.setText("🗑️ 清除 Cookie")
+            QMessageBox.critical(self, "清除失败", f"清除过程中出错：{exc}")
+            return
+
+        self._btn_clear_cookies.setEnabled(True)
+        self._btn_clear_cookies.setText("🗑️ 清除 Cookie")
+        if pending_clear:
+            QMessageBox.information(self, "清除完成（需重启）",
+                                   "Cookie 和缓存已清除，但部分浏览器数据被进程占用无法删除。\n\n"
+                                   "已标记 pending_clear，请手动重启应用：\n"
+                                   "重启时会自动清除所有残留数据，然后重新扫码登录。")
+        else:
+            QMessageBox.information(self, "清除完成",
+                                   "所有 Cookie 和缓存已清除。\n\n"
+                                   "请手动重启应用以重新扫码登录。")

@@ -622,6 +622,14 @@ class MainWindow(QMainWindow):
 
     def _on_session_ready(self) -> None:
         self._sb_label.setText("登录态已更新，可前往「状态」页开始阅读")
+        # 改动4：扫码后解锁 HARD 失效锁定
+        # QTimer.singleShot(0,...) 保证在 UI 线程执行 unlock_after_relogin（操作按钮需要 UI 线程）
+        try:
+            if hasattr(self, "_status_page") and self._status_page is not None:
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, self._status_page.unlock_after_relogin)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("session_ready → 解锁 HARD 锁失败：%s", exc)
         def _t() -> None:
             ok = bool(self._api.check_session())
             self._session_check_done.emit(ok)

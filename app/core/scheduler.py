@@ -72,6 +72,7 @@ class ReadingScheduler(QThread):
     cookie_broken = Signal()
     task_completed = Signal(int)  # 实际完成分钟数
     cookie_fail_reported = Signal()  # 登录态失效已推送（UI 同步红色"已失效"徽标）
+    cookie_hard_invalid = Signal(str)  # 登录态硬失效 → UI 禁用开始按钮 + 弹窗，payload=原因
 
     def __init__(
         self,
@@ -104,6 +105,9 @@ class ReadingScheduler(QThread):
         self._last_skill_refresh_ts = 0.0
         self._skill_success_refresh_count = 10  # 每 10 次成功阅读也会尝试刷新
         self._skill_fallback_used = False  # Skill 失败时是否已降级为本地估算
+        # —— 改动3：接收 WeReadApi 的硬/软失效信号 ——
+        # cookie_invalid(severity, reason)：HARD → 硬停止；SOFT → 仅告警不停止
+        self._api.cookie_invalid.connect(self._on_cookie_invalid)
 
     # ---------------- controls ----------------
     def stop(self) -> None:
@@ -426,6 +430,48 @@ class ReadingScheduler(QThread):
             dedup_key="cookie_fail",
             dedup_window_sec=3600 * 4,
         )
+
+    # ---------------- 改动3：cookie_invalid 信号接收槽 ----------------
+    def _on_cookie_invalid(self, severity: str, reason: str) -> None:
+        """接收 WeReadApi.cookie_invalid：区分 HARD（硬停止）/ SOFT（只告警不停止）。
+
+        触发路径：
+          - ensure_session() 锚点缺失（RK/ptcz 空）→ HARD
+          - _renew_wr_skey() 返回 HARD_INVALID（errCode=-2010/-2012 或跳登录页或含登录扫码文案）→ HARD
+          - renewal 成功但 check_session 仍失败 → HARD
+          - renewal 5xx/超时/网络异常 → SOFT（保持循环，冷却后重试）
+        """
+        log.warning("🔴 scheduler 收到 cookie_invalid severity=%s reason=%s", severity, reason)
+        if severity == "HARD_INVALID":
+            # —— 硬失效：停止阅读循环，不再做任何无效尝试 ——
+            self._set_state("登录态硬失效，必须重新扫码")
+            self.log.emit(f"🔴 登录态硬失效（原因：{reason}），已自动停止阅读循环，等待重新扫码")
+            # 推送：HARD 是关键事件，必须推送（独立 dedup key，不依赖 _cookie_fail_notified，
+            # 避免被先前 SOFT 推送短路；notifier 自带 4h dedup 防轰炸）
+            if self._cfg.get("push.notify_cookie_fail", True):
+                self._notifier.send_async(
+                    f"【微信读书助手】登录态硬失效（{reason}），必须打开软件重新扫码登录。今日任务暂停。",
+                    max_attempts=3,
+                    dedup_key="cookie_fail_hard",
+                    dedup_window_sec=3600 * 4,
+                )
+            # 标红 + 硬失效专用信号 → UI 弹窗 + 锁开始按钮
+            self.cookie_broken.emit()
+            self.cookie_hard_invalid.emit(reason)
+            # 停止调度器（下一轮循环回到入口时自会退出）
+            self._stop_event.set()
+        else:
+            # 软失效：仅告警不停止，保持循环，冷却后会再跑 ensure_session 再试
+            self.log.emit(f"⚠️ 登录刷新失败（软）：{reason}，稍后自动重试")
+            if not self._cookie_fail_notified and self._cfg.get("push.notify_cookie_fail", True):
+                self._cookie_fail_notified = True
+                self._notifier.send_async(
+                    f"【微信读书助手】登录刷新失败（{reason}），仍在重试；若持续出现请重新扫码。",
+                    max_attempts=2,
+                    dedup_key="cookie_fail_soft",
+                    dedup_window_sec=3600 * 4,
+                )
+            self.cookie_fail_reported.emit()
 
     # ---------------- Skill 基线（混合方案完成度检测） ----------------
     def _fetch_skill_baseline(self, plan: DailyPlan) -> None:

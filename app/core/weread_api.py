@@ -175,7 +175,7 @@ class WeReadApi(QObject):
     message = Signal(str)  # 普通日志消息
     warning = Signal(str)
     error = Signal(str)
-    cookie_invalid = Signal()  # 登录态失效（无论如何都救不回）
+    cookie_invalid = Signal(str, str)  # (severity, reason) 登录态失效：HARD_INVALID=必须扫码 / SOFT_FAIL=可重试
     # 当前书籍更新（bookId 变化 / 标题 / 进度被成功解析时 emit，供 LoginPage → StatusPage → UI 联动）
     # payload = {
     #   "book_id": "36d322f07186022636daa5e",       # 真实 bookId（原始 id）
@@ -1048,19 +1048,53 @@ class WeReadApi(QObject):
         return False
 
     def ensure_session(self) -> bool:
-        """若当前会话失效，尝试通过 renewal 接口刷新 wr_skey。"""
+        """若当前会话失效，尝试通过 renewal 接口刷新 wr_skey。
+
+        判定层级：
+          1) check_session 通过 → 直接 True
+          2) 锚点前置检查：RK / ptcz / wr_skey / wr_vid 缺失 → 直接 HARD_INVALID
+             （renewal 需要 RK+ptcz 作种子，缺失则 100% 必失败，不再徒劳尝试）
+          3) _renew_wr_skey 返回结构化结果：
+             - OK + check_session 通过 → True
+             - OK + check_session 仍失败 → HARD_INVALID（拿到新 wr_skey 但仍无效）
+             - HARD_INVALID → 信号 + False
+             - SOFT_FAIL → 信号 + False（不锁死，等下次重试）
+        """
         if self.check_session():
             return True
         log.info("当前会话已失效，开始刷新 wr_skey ...")
         self.message.emit("登录态失效，正在刷新 Cookie ...")
-        new_skey = self._renew_wr_skey()
-        if not new_skey:
-            log.error("Cookie 刷新失败，可能需要用户重新扫码登录")
-            self.error.emit("登录态已失效，Cookie 刷新失败，请重新扫码登录")
-            self.cookie_invalid.emit()
-            return False
-        # 更新 cookies（dict + raw 双写）
+
+        # —— 锚点前置检查：renewal 必需的根 Cookie（RK / ptcz），缺则直接 HARD ——
         cookies_dict = dict(self._cfg.get("cookies", {}) or {})
+        missing_anchors: list[str] = []
+        for k in ("RK", "ptcz"):  # renewal 的签名种子，缺失则永远续不上
+            if not cookies_dict.get(k):
+                missing_anchors.append(k)
+        if missing_anchors:
+            reason = f"关键 Cookie 锚点缺失：{', '.join(missing_anchors)}；无法续命，必须重新扫码"
+            log.error("登录态硬失效：%s", reason)
+            self.error.emit(f"登录态硬失效：{reason}")
+            self.cookie_invalid.emit("HARD_INVALID", reason)
+            return False
+
+        # —— 调用 renewal，接结构化结果 ——
+        result = self._renew_wr_skey()
+        if not result.get("ok"):
+            sev = result.get("severity", "SOFT_FAIL")
+            reason = result.get("reason", "未知原因")
+            if sev == "HARD_INVALID":
+                log.error("登录态硬失效：%s", reason)
+                self.error.emit(f"登录态硬失效：{reason}")
+                self.cookie_invalid.emit("HARD_INVALID", reason)
+            else:  # SOFT_FAIL
+                log.warning("Cookie 刷新失败（软）：%s", reason)
+                self.error.emit(f"Cookie 刷新失败（软）：{reason}，后续会再试")
+                self.cookie_invalid.emit("SOFT_FAIL", reason)
+            return False
+
+        # —— 续命成功：双写 cookies dict + raw ——
+        new_skey = result["wr_skey"]
         cookies_raw = list(self._cfg.get("cookies_raw", []) or [])
         cookies_dict["wr_skey"] = new_skey
         # 同步覆盖 cookies_raw 中所有名为 wr_skey 的记录，保持域/路径不变
@@ -1089,9 +1123,11 @@ class WeReadApi(QObject):
         # 再检查一次
         if self.check_session():
             return True
-        # 仍不行，抛失效信号
-        self.error.emit("Cookie 刷新后依然无效，请重新扫码登录")
-        self.cookie_invalid.emit()
+        # 拿到新 wr_skey 但 check_session 仍失败 → 升级为 HARD（账号可能被风控或多端登出）
+        reason = f"renewal 已拿到新 wr_skey（{new_skey[:4]}***），但 check_session 仍失败；账号可能被风控或多端登出"
+        log.error("登录态硬失效：%s", reason)
+        self.error.emit(f"登录态硬失效：{reason}")
+        self.cookie_invalid.emit("HARD_INVALID", reason)
         return False
 
     # -------- 当前阅读中的书（统一真相源）--------
@@ -1855,9 +1891,38 @@ class WeReadApi(QObject):
             return None
 
     # -------- 登录态 --------
-    def _renew_wr_skey(self) -> str | None:
+    # 已知微信读书服务端「登录态根失效」错误码：RK/ptcz 过期 → renewal 无法签发新 wr_skey
+    _HARD_ERR_CODES = frozenset({-2010, -2012, -2002, -2003})
+
+    def _renew_wr_skey(self) -> dict:
+        """刷新 wr_skey，返回结构化结果。
+
+        返回协议：
+            {
+                "ok": bool,                          # 是否拿到有效 wr_skey
+                "wr_skey": str,                      # ok=True 时有值
+                "severity": "OK" | "SOFT_FAIL" | "HARD_INVALID",
+                "reason": str,                       # 人类可读原因（日志/推送用）
+                "http": int | None,                  # 响应 HTTP 状态码（调试）
+                "errCode": int | None,               # 响应体 errCode（调试）
+            }
+
+        判定规则：
+          - 任一变体成功 Set-Cookie 到 wr_skey → OK
+          - 硬失效（HARD_INVALID）：
+              a. 响应体 JSON errCode ∈ _HARD_ERR_CODES（用户不存在/登录超时/签名失效）
+              b. HTTP 302/303 且 Location 含 "login"
+              c. 响应体含 "登录" 且 "扫码"（弱判定，仅当 3 变体全失败时升级）
+          - 软失败（SOFT_FAIL）：5xx / RequestException / 无 wr_skey 且无 HARD 特征
+        """
         self._augment_headers_baggage()
         json_ct = {"Content-Type": "application/json;charset=UTF-8"}
+
+        last_http: int | None = None
+        last_errcode: int | None = None
+        last_reason = "未知原因"
+        had_request_exception = False
+
         for idx, payload in enumerate(COOKIE_DATA_VARIANTS):
             try:
                 with self._lock:
@@ -1867,14 +1932,50 @@ class WeReadApi(QObject):
                         data=json.dumps(payload, separators=(",", ":")),
                         timeout=10,
                     )
-                log.info("renewal 变体 %d：HTTP=%s resp(前200)=%s", idx, resp.status_code, resp.text[:200])
+                last_http = resp.status_code
+                body_text = resp.text or ""
+                log.info("renewal 变体 %d：HTTP=%s resp(前200)=%s", idx, resp.status_code, body_text[:200])
+
+                # 1) 尝试解析 JSON body 提取 errCode
+                errcode: int | None = None
+                try:
+                    body_json = json.loads(body_text)
+                    if isinstance(body_json, dict):
+                        ec = body_json.get("errCode")
+                        if isinstance(ec, int):
+                            errcode = ec
+                            last_errcode = ec
+                except (ValueError, TypeError):
+                    pass
+
+                # 2) 硬失效判定 a：errCode 命中已知「根失效」错误码
+                if errcode in self._HARD_ERR_CODES:
+                    last_reason = f"变体{idx} 服务端拒绝续命 errCode={errcode}（账号根 Cookie 已过期，必须重新扫码）"
+                    log.error("renewal 变体 %d 硬失效：errCode=%s", idx, errcode)
+                    return {
+                        "ok": False, "wr_skey": "", "severity": "HARD_INVALID",
+                        "reason": last_reason, "http": last_http, "errCode": errcode,
+                    }
+
+                # 3) 硬失效判定 b：302/303 跳登录页
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("Location", "") or ""
+                    if "login" in loc.lower():
+                        last_reason = f"变体{idx} HTTP {resp.status_code} 跳转登录页 Location={loc[:80]}"
+                        log.error("renewal 变体 %d 硬失效：HTTP %s 跳登录页", idx, resp.status_code)
+                        return {
+                            "ok": False, "wr_skey": "", "severity": "HARD_INVALID",
+                            "reason": last_reason, "http": last_http, "errCode": errcode,
+                        }
+
+                # 4) 尝试从 resp.cookies / Set-Cookie 头抓 wr_skey
                 wr_skey = resp.cookies.get("wr_skey")
                 if wr_skey:
-                    # 注意：不再做截断！实际 wr_skey 是服务端签发的完整 token，
-                    # 截短会导致后续接口把它当成"伪造 cookie"直接 -2010 或被风控。
                     log.info("renewal 变体 %d 命中 resp.cookies.wr_skey len=%d", idx, len(str(wr_skey)))
-                    return str(wr_skey)
-                # 也可能在 Set-Cookie 头里（多值用逗号分隔，需逐段解析）
+                    return {
+                        "ok": True, "wr_skey": str(wr_skey), "severity": "OK",
+                        "reason": f"变体{idx} 续命成功", "http": last_http, "errCode": errcode,
+                    }
                 set_cookie = resp.headers.get("Set-Cookie", "")
                 if "wr_skey=" in set_cookie:
                     for segment in set_cookie.split(","):
@@ -1884,10 +1985,49 @@ class WeReadApi(QObject):
                                 val = pair.split("=", 1)[1].strip()
                                 if val:
                                     log.info("renewal 变体 %d 命中 Set-Cookie wr_skey len=%d", idx, len(val))
-                                    return val
+                                    return {
+                                        "ok": True, "wr_skey": val, "severity": "OK",
+                                        "reason": f"变体{idx} 续命成功（Set-Cookie）", "http": last_http, "errCode": errcode,
+                                    }
+
+                # 5) 此变体未拿到 wr_skey，记录诊断信息
+                # 软失败：5xx
+                if 500 <= resp.status_code < 600:
+                    last_reason = f"变体{idx} HTTP {resp.status_code} 服务端错误"
+                    continue
+                # 硬失效判定 c：body 文案含"登录"+"扫码"（弱判定）
+                if "登录" in body_text and "扫码" in body_text:
+                    last_reason = f"变体{idx} 响应体含登录扫码文案（疑似账号已登出）"
+                    log.warning("renewal 变体 %d 疑似硬失效：%s", idx, last_reason)
+                    continue
+                # 否则记录为"无 Set-Cookie wr_skey"
+                last_reason = f"变体{idx} HTTP {resp.status_code} 无 wr_skey"
             except requests.RequestException as exc:
+                had_request_exception = True
+                last_reason = f"变体{idx} 请求异常：{exc}"
                 log.warning("renew 变体 %d 请求失败：%s", idx, exc)
-        return None
+
+        # 3 变体全失败：汇总判定 HARD / SOFT
+        # 若任何一次响应中检测到"登录扫码"文案 → 升级为 HARD
+        if "登录扫码" in last_reason or "登录页" in last_reason:
+            return {
+                "ok": False, "wr_skey": "", "severity": "HARD_INVALID",
+                "reason": last_reason + "（3 变体均失败，账号疑似已登出）",
+                "http": last_http, "errCode": last_errcode,
+            }
+        # 若有 RequestException 或 5xx → 软失败（网络/服务端抖动）
+        if had_request_exception or (last_http is not None and 500 <= last_http < 600):
+            return {
+                "ok": False, "wr_skey": "", "severity": "SOFT_FAIL",
+                "reason": last_reason + "（疑似网络/服务端抖动，可重试）",
+                "http": last_http, "errCode": last_errcode,
+            }
+        # 其余情况：保守判为 SOFT_FAIL（避免误锁用户）
+        return {
+            "ok": False, "wr_skey": "", "severity": "SOFT_FAIL",
+            "reason": last_reason + "（3 变体均未拿到 wr_skey）",
+            "http": last_http, "errCode": last_errcode,
+        }
 
     def _fix_synckey(self) -> None:
         self._augment_headers_baggage()

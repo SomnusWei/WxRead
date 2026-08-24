@@ -375,6 +375,10 @@ class StatusPage(QWidget):
         self._scheduler.cookie_broken.connect(self._on_cookie_broken)
         self._scheduler.task_completed.connect(self._on_task_completed)
         self._scheduler.cookie_fail_reported.connect(self._on_cookie_broken)
+        # —— 改动4 新增：硬失效锁 UI ——
+        self._scheduler.cookie_hard_invalid.connect(self._on_cookie_hard_invalid)
+        # 硬失效锁定标志（供扫码完成后 unlock_after_relogin 检查）
+        self._cookie_hard_locked = False
 
         self._api.message.connect(lambda m: self._append_log(m, "INFO"))
         self._api.warning.connect(lambda m: self._append_log(m, "WARN"))
@@ -838,6 +842,58 @@ class StatusPage(QWidget):
     def _on_cookie_broken(self) -> None:
         self._lbl_cookie.setText("登录态：❌ 已失效")
         self._lbl_cookie.setStyleSheet("color:#e25454;font-size:12px;font-weight:600;")
+
+    # ---------------- 改动4：HARD 失效 UI 锁定 / 扫码后解锁 ----------------
+    def _on_cookie_hard_invalid(self, reason: str) -> None:
+        """硬失效：禁用【▶ 开始阅读】按钮，弹非模态窗提示用户重新扫码。"""
+        self._cookie_hard_locked = True
+        # 禁用所有操作按钮，直到重新扫码解锁
+        try:
+            self._btn_start.setEnabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._btn_pause.setEnabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._btn_stop.setEnabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        # 红色硬失效标签
+        self._lbl_cookie.setText("登录态：🚫 硬失效（需重新扫码）")
+        self._lbl_cookie.setStyleSheet("color:#e25454;font-size:12px;font-weight:700;")
+        self._append_log(f"🔴 登录态硬失效：{reason}，必须重新扫码登录才能继续", "ERROR")
+        # 弹非模态 MessageBox（不阻塞，用户可立即切到扫码登录标签）
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("登录态硬失效")
+            box.setText(
+                "登录态无法通过自动续期恢复，必须重新扫码登录。\n\n"
+                f"原因：{reason}\n\n"
+                "请切换到【🔐 扫码登录】标签，扫码后点击【✅ 我已登录完成】即可恢复。"
+            )
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.setModal(False)
+            box.show()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("硬失效弹窗失败：%s", exc)
+
+    def unlock_after_relogin(self) -> None:
+        """【✅ 我已登录完成 → session_ready.emit】后调用：解锁 HARD 失效锁定。"""
+        if not getattr(self, "_cookie_hard_locked", False):
+            return
+        self._cookie_hard_locked = False
+        try:
+            self._btn_start.setEnabled(True)
+        except Exception:  # noqa: BLE001
+            pass
+        # 恢复登录态标签为绿色
+        self._lbl_cookie.setText("登录态：✅ 有效")
+        self._lbl_cookie.setStyleSheet("color:#2eae5d;font-size:12px;font-weight:600;")
+        self._append_log("✅ 已扫码登录，解除硬失效锁定，可以重新开始阅读", "OK")
 
     def _update_cookie_status(self, ok: bool) -> None:  # noqa: FBT001
         if ok:
