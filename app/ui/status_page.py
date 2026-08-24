@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import threading
 import time
 from typing import Any
@@ -26,7 +27,9 @@ from PySide6.QtWidgets import (
 from app.core.config import ConfigStore
 from app.core.scheduler import ReadingScheduler
 from app.core.weread_api import WeReadApi
-from app.utils.logger import log_bus
+from app.utils.logger import get_logger, log_bus
+
+log = get_logger(__name__)
 
 
 def _card_style() -> str:
@@ -40,10 +43,6 @@ class StatusPage(QWidget):
     _verify_finished = Signal()
     _reading_summary_ready = Signal(dict)  # 后台线程拿到官方统计 → UI 线程更新卡
     _health_check_done = Signal(bool, str)  # ok, message
-    # 跨页：让 MainWindow 把"在登录浏览器打开某本书"路由给 LoginPage
-    request_navigate_reader = Signal(str)  # URL
-    # 跨页：通知 LoginPage / MainWindow「用户希望登录页浏览器回到当前会话登录态」
-    request_restore_browser_session = Signal()
 
     def __init__(
         self,
@@ -296,23 +295,70 @@ class StatusPage(QWidget):
 
         top_hbox.addLayout(left_vbox, 11)  # 左 55% (11/20)
 
-        # ====== 右 45%：内置浏览器容器（main_window 会把 LoginPage 塞进来）======
+        # ====== 右 35%：CDP 登录控制区（替代原内置浏览器）======
         self._right_container = QFrame()
         self._right_container.setStyleSheet(
             "QFrame{background:#f4f7fc;border:1px solid #e3e8f1;border-radius:10px;}"
         )
         self._right_layout = QVBoxLayout(self._right_container)
-        self._right_layout.setContentsMargins(8, 8, 8, 8)
-        self._right_layout.setSpacing(6)
-        # 浏览器占位标签（需求：删掉使用说明，只保留简短"浏览器加载中"）
-        self._lbl_browser_placeholder = QLabel("🔐 内置浏览器加载中…")
-        self._lbl_browser_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_browser_placeholder.setStyleSheet(
-            "color:#7a879f;font-size:13px;background:#ffffff;"
-            "border-radius:8px;padding:20px;"
+        self._right_layout.setContentsMargins(10, 10, 10, 10)
+        self._right_layout.setSpacing(8)
+
+        # CDP 登录标题
+        cdp_title = QLabel("🔐 CDP 扫码登录")
+        cdp_title.setStyleSheet("font-size:14px;font-weight:600;color:#2f3b52;")
+        self._right_layout.addWidget(cdp_title)
+
+        # CDP 登录大按钮
+        self._btn_cdp_login = QPushButton("🍪 扫码登录（CDP）")
+        self._btn_cdp_login.setStyleSheet(
+            "QPushButton{background:#2d6cdf;color:#fff;border:none;border-radius:10px;"
+            "padding:12px 24px;font-size:15px;font-weight:600;}"
+            "QPushButton:hover{background:#265bc0;}"
+            "QPushButton:disabled{background:#b9c9eb;color:#fff;}"
         )
-        self._right_layout.addWidget(self._lbl_browser_placeholder, 1)
-        top_hbox.addWidget(self._right_container, 9)  # 右 45% (9/20)
+        self._btn_cdp_login.setMinimumHeight(44)
+        self._btn_cdp_login.clicked.connect(self._open_cdp_login_dialog)
+        self._right_layout.addWidget(self._btn_cdp_login)
+
+        # 登录状态区
+        self._lbl_cdp_status = QLabel("❌ 未登录")
+        self._lbl_cdp_status.setStyleSheet(
+            "color:#e25454;font-size:13px;font-weight:600;"
+            "background:#fff;padding:8px 12px;border-radius:8px;"
+        )
+        self._right_layout.addWidget(self._lbl_cdp_status)
+
+        # 书架信息
+        self._lbl_shelf_info = QLabel("📚 书架：尚未获取")
+        self._lbl_shelf_info.setStyleSheet("color:#5f6c85;font-size:12px;")
+        self._lbl_shelf_info.setWordWrap(True)
+        self._right_layout.addWidget(self._lbl_shelf_info)
+
+        # 章节池信息
+        self._lbl_chapter_info = QLabel("📖 章节池：尚未构建")
+        self._lbl_chapter_info.setStyleSheet("color:#5f6c85;font-size:12px;")
+        self._lbl_chapter_info.setWordWrap(True)
+        self._right_layout.addWidget(self._lbl_chapter_info)
+
+        # 刷新章节池按钮
+        self._btn_refresh_chapters = QPushButton("🔄 从书架刷新章节池")
+        self._btn_refresh_chapters.setStyleSheet(self._secondary_btn())
+        self._btn_refresh_chapters.setEnabled(False)
+        self._btn_refresh_chapters.clicked.connect(self._on_refresh_chapters)
+        self._right_layout.addWidget(self._btn_refresh_chapters)
+
+        # 提示文字
+        self._lbl_cdp_hint = QLabel(
+            "💡 CDP 登录通过 Chrome DevTools Protocol 获取 Cookie，"
+            "无需在浏览器中手动操作即可完成扫码登录。"
+        )
+        self._lbl_cdp_hint.setStyleSheet("color:#93a0b8;font-size:11px;")
+        self._lbl_cdp_hint.setWordWrap(True)
+        self._right_layout.addWidget(self._lbl_cdp_hint)
+
+        self._right_layout.addStretch(1)
+        top_hbox.addWidget(self._right_container, 7)  # 右 35% (7/20)
 
         root.addLayout(top_hbox, 7)  # 上方占主体
 
@@ -518,9 +564,6 @@ class StatusPage(QWidget):
             self._btn_start.setEnabled(True)
             self._btn_pause.setEnabled(False)
             self._btn_stop.setEnabled(False)
-            # 🔧 阅读结束（完成/停止/空闲）：恢复 JS 拦截器
-            if hasattr(self, "_login_page") and self._login_page:
-                self._login_page.set_reader_active(False)
         elif "登录态失效" in state:
             self._lbl_state.setStyleSheet(
                 "color:#fff;background:#e25454;border-radius:999px;"
@@ -671,15 +714,14 @@ class StatusPage(QWidget):
         source_compact = WeReadApi.compact_source(source) or source
         source_map = {
             "shelf_booklist": "自动·书架",
-            "reader_url": "浏览器URL",
+            "reader_url": "URL解析",
             "manual": "手动粘贴链接",
-            "login_browser_nav": "扫码浏览器导航",
-            "login_page_storage": "扫码页storage",
             "shelf_pick_manual": "书架手动挑选",
             "auto_sync_book": "官方同步",
             "auto_sync_summary": "官方同步",
             "cookie_shelf_progress": "Cookie书架进度",
             "clear": "手动清除",
+            "cdp_login": "CDP登录",
         }
         # 逐段翻译（compact 后仍可能是 "a+b" 格式，按 "+" 切分逐段 map）
         segs = [s for s in source_compact.split("+") if s]
@@ -701,14 +743,12 @@ class StatusPage(QWidget):
             v = max(0, min(10000, v))
             self._book_progress.setValue(v)
             self._book_progress.setFormat(f"{progress_pct * 100:.2f}%")
-        # 提示：还没有 url 就告诉用户去"扫码登录浏览器"里打开再同步
-        # —— v2：不直接拼到 setText 里（那会让 source 标签再次变长挤爆布局），
-        #    改设 ToolTip：鼠标悬停时显示详细说明；并用标签右下角的小图标提示用户。
+        # 提示：还没有 url 就告诉用户去"扫码登录"页打开再同步
         if not url:
             current = self._lbl_book_source.text() or ""
             self._lbl_book_source.setToolTip(
-                "当前书还没有可打开的 URL：请先去「🔐 扫码登录」页的内置浏览器打开一本书的阅读页，\n"
-                "或在下方输入框粘贴微信读书 reader URL 后点击「更新到阅读状态」。"
+                "当前书还没有可打开的 URL：请先点「🍪 扫码登录（CDP）」完成登录，"
+                "系统会自动从书架获取书籍信息。"
             )
             # 只用后缀小标识，不写长文字（避免标签宽度膨胀）
             suffix = "·⚠️无URL"
@@ -793,15 +833,126 @@ class StatusPage(QWidget):
 
         threading.Thread(target=_t, daemon=True).start()
 
-    def _on_open_book_in_browser(self) -> None:
-        """把当前书 URL 交给「扫码登录」Tab 的内置浏览器打开。"""
-        cb = self._current_book_cache if isinstance(self._current_book_cache, dict) else None
-        url = str((cb or {}).get("url") or "").strip() or self._edit_book_url.text().strip()
-        if not url:
-            QMessageBox.information(self, "尚未选择书籍", "先登录，并在上方输入或点「从书架挑选」选出一本书。")
-            return
-        self._append_log(f"将在扫码登录浏览器打开：{url[:120]}", "INFO")
-        self.request_navigate_reader.emit(url)
+    def _open_cdp_login_dialog(self) -> None:
+        """打开 CDP 扫码登录对话框。"""
+        log.info("[StatusPage] 打开 CDP 登录对话框")
+        try:
+            from app.ui.cdp_login_dialog import CDPLoginDialog
+            dialog = CDPLoginDialog(self._cfg, self._api, parent=self)
+            dialog.login_success.connect(self._on_cdp_login_success)
+            dialog.login_failed.connect(self._on_cdp_login_failed)
+            dialog.exec()
+        except Exception as exc:
+            log.error("[StatusPage] 打开 CDP 对话框失败：%s", exc)
+            QMessageBox.critical(
+                self,
+                "CDP 登录失败",
+                f"无法启动 CDP 登录对话框：{exc}\n\n"
+                "请确保 PySide6-WebEngine 已正确安装。",
+            )
+
+    def _on_cdp_login_success(self, payload: dict) -> None:
+        """CDP 登录成功回调。"""
+        log.info("[StatusPage] CDP 登录成功：%s", json.dumps(payload, ensure_ascii=False)[:200])
+        book_count = payload.get("book_count", 0)
+        chapter_count = payload.get("chapter_count", 0)
+        cookies_raw = payload.get("cookies") or []
+
+        # 同步 API Session（确保 headers/baggage 正确设置）
+        try:
+            existing_headers = self._cfg.get("headers", {}) or {}
+            existing_cookies = self._cfg.get("cookies", {}) or {}
+            if cookies_raw:
+                self._api.set_session(
+                    headers=dict(existing_headers),
+                    cookies=dict(existing_cookies),
+                    cookies_raw=list(cookies_raw),
+                )
+                log.info("[StatusPage] API Session 已同步（%d 条 Cookie）", len(cookies_raw))
+        except Exception as exc:
+            log.warning("[StatusPage] API Session 同步异常：%s", exc)
+
+        # 更新 UI 状态
+        self._lbl_cdp_status.setText("✅ 已登录")
+        self._lbl_cdp_status.setStyleSheet(
+            "color:#2eae5d;font-size:13px;font-weight:600;"
+            "background:#fff;padding:8px 12px;border-radius:8px;"
+        )
+        self._lbl_shelf_info.setText(f"📚 书架：{book_count} 本书")
+        self._lbl_chapter_info.setText(f"📖 章节池：{chapter_count} 章")
+        self._btn_refresh_chapters.setEnabled(book_count > 0)
+
+        # 更新 Cookie 状态
+        self._update_cookie_status(True)
+
+        # 刷新官方数据
+        self._refresh_reading_summary(force=True)
+
+        self._append_log(
+            f"✅ CDP 登录成功：书架 {book_count} 本，章节池 {chapter_count} 章",
+            "OK",
+        )
+
+    def _on_cdp_login_failed(self, reason: str) -> None:
+        """CDP 登录失败回调。"""
+        log.warning("[StatusPage] CDP 登录失败：%s", reason)
+        self._append_log(f"⚠️ CDP 登录失败：{reason}", "WARN")
+
+    def _on_refresh_chapters(self) -> None:
+        """从书架刷新章节池。"""
+        log.info("[StatusPage] 手动刷新章节池")
+        self._btn_refresh_chapters.setEnabled(False)
+        self._lbl_chapter_info.setText("📖 正在刷新章节池...")
+
+        def _worker():
+            try:
+                books = self._cfg.get("reading.shelf_books") or []
+                if not books:
+                    QTimer.singleShot(0, lambda: self._lbl_chapter_info.setText("📖 书架为空，无法刷新"))
+                    QTimer.singleShot(0, lambda: self._btn_refresh_chapters.setEnabled(True))
+                    return
+
+                chapter_pools = self._cfg.get("reading.chapter_pools") or {}
+                # 重新获取前 5 本书的章节
+                from app.ui.cdp_login_dialog import CDPLoginDialog
+                total = 0
+                for b in books[:5]:
+                    bid = str(b.get("bookId") or b.get("book_id") or "").strip()
+                    if bid:
+                        chapters = CDPLoginDialog._fetch_chapters_for_book(
+                            self._get_cookies_for_api(), bid
+                        )
+                        chapter_pools[bid] = chapters
+                        total += len(chapters)
+                    else:
+                        log.warning("[StatusPage] 书籍无 bookId，跳过")
+
+                self._cfg.set("reading.chapter_pools", chapter_pools)
+                QTimer.singleShot(
+                    0,
+                    lambda: self._lbl_chapter_info.setText(f"📖 章节池：{total} 章（已刷新）"),
+                )
+            except Exception as exc:
+                log.error("[StatusPage] 刷新章节池异常：%s", exc)
+                QTimer.singleShot(0, lambda: self._lbl_chapter_info.setText(f"📖 刷新失败：{exc}"))
+            finally:
+                QTimer.singleShot(0, lambda: self._btn_refresh_chapters.setEnabled(True))
+
+        QTimer.singleShot(100, lambda: threading.Thread(target=_worker, daemon=True).start())
+
+    def _get_cookies_for_api(self) -> list:
+        """从 config 获取 Cookie 列表。"""
+        raw = self._cfg.get("cookies_raw") or []
+        if isinstance(raw, list):
+            return raw
+        # 从简化 dict 重建
+        simple = self._cfg.get("cookies") or {}
+        if isinstance(simple, dict):
+            cookies = []
+            for name, value in simple.items():
+                cookies.append({"name": name, "value": value, "domain": ".weread.qq.com", "path": "/"})
+            return cookies
+        return []
 
     def _on_copy_book_url(self) -> None:
         cb = self._current_book_cache if isinstance(self._current_book_cache, dict) else None
@@ -873,7 +1024,7 @@ class StatusPage(QWidget):
             box.setText(
                 "登录态无法通过自动续期恢复，必须重新扫码登录。\n\n"
                 f"原因：{reason}\n\n"
-                "请切换到【🔐 扫码登录】标签，扫码后点击【✅ 我已登录完成】即可恢复。"
+                "请点击【🍪 扫码登录（CDP）】按钮重新扫码登录。"
             )
             box.setStandardButtons(QMessageBox.StandardButton.Ok)
             box.setModal(False)
@@ -912,14 +1063,12 @@ class StatusPage(QWidget):
 
     # ---------------- Buttons ----------------
     def _on_start(self) -> None:
-        """▶ 开始阅读：启动自动化抓取工作流（状态机版本）。
+        """▶ 开始阅读：CDP 模式工作流。
 
         工作流阶段：
         1. CHECKING_SESSION - 异步自检登录态
-        2. LOADING_BOOK_LOGIN - 未登录则跳三体书 + 触发"我已登录完成"逻辑
-        3. CAPTURING - 登录态有效则注入 JS + 轮询 + 跳目标章节
-        4. VALIDATING - 校验抓取数据，满足则启动 scheduler
-        5. NEED_LOGIN - 失败则弹窗 + 禁用按钮 + 等用户扫码
+        2. NEED_LOGIN - 未登录则打开 CDP 扫码对话框
+        3. 登录态有效 → 启动阅读调度器
         """
         # 防重入：如果工作流正在跑，提示并返回
         state = getattr(self, "_workflow_state", "IDLE")
@@ -976,134 +1125,90 @@ class StatusPage(QWidget):
         """阶段1 完成：根据登录态决定下一步"""
         if ok:
             self._update_cookie_status(True)
-            self._append_log("✅ 登录态有效，进入抓取阶段", "OK")
-            self._workflow_step3_start_capture()
+            self._append_log("✅ 登录态有效，准备启动阅读调度器", "OK")
+            self._workflow_step0a_try_current_page()
         else:
             self._update_cookie_status(False)
-            self._append_log("⚠️ 登录态无效，跳三体书种 cookie", "WARN")
+            self._append_log("⚠️ 登录态无效，需要 CDP 扫码登录", "WARN")
             self._workflow_step2_load_book_for_login()
 
     def _workflow_step2_load_book_for_login(self) -> None:
-        """阶段2: 跳三体书 URL + 触发"我已登录完成"按钮逻辑（cookie 同步）"""
-        self._workflow_state = "LOADING_BOOK_LOGIN"
-        login_pg = self._login_page
-        if login_pg is None:
-            self._append_log("无法访问登录页，工作流中止", "ERROR")
-            self._workflow_state = "IDLE"
-            return
-
-        # 读三体书 URL
-        santi_book_url = str(self._cfg.get("reading.santi_book_url") or "").strip()
-        if not santi_book_url:
-            santi_book_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a"
-
-        # 1. 跳转三体书 URL
+        """阶段2: CDP 模式下登录态无效 → 打开 CDP 登录对话框。"""
+        self._workflow_state = "NEED_LOGIN"
+        self._append_log("登录态无效，请通过 CDP 扫码登录获取 Cookie", "WARN")
+        self._update_cookie_status(False)
+        # 禁用开始按钮
         try:
-            from PySide6.QtCore import QUrl, QTimer
-            web = getattr(login_pg, "_web", None)
-            if web is not None:
-                self._append_log(f"浏览器跳转：{santi_book_url[:80]}...", "INFO")
-                web.load(QUrl(santi_book_url))
-            else:
-                self._append_log("浏览器控件不可用，工作流中止", "ERROR")
-                self._workflow_state = "IDLE"
-                return
-            # 2. 等 4s 页面加载完后，触发"我已登录完成"按钮的完整逻辑（cookie 采集 + 保存到 config）
-            QTimer.singleShot(4000, self._workflow_step2_trigger_done_button)
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"阶段2跳转失败：{exc}", "ERROR")
-            self._workflow_step4_need_login()
+            self._btn_start.setEnabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        # 直接打开 CDP 登录对话框
+        QTimer.singleShot(200, self._open_cdp_login_dialog)
+
+    def _on_shelf_book_loaded(self, result: dict | None) -> None:
+        """书架书籍加载完成。"""
+        if result:
+            title = str(result.get("title") or "未命名")[:30]
+            self._append_log(f"✅ 已选书：《{title}》", "OK")
+            self._workflow_step4_start_scheduler()
+        else:
+            self._append_log("⚠️ 书架获取失败，使用默认书籍", "WARN")
+            self._workflow_step4_start_scheduler()
+
+    def _on_shelf_empty(self) -> None:
+        """书架为空。"""
+        self._append_log("⚠️ 书架为空，使用默认书籍列表", "WARN")
+        self._workflow_step4_start_scheduler()
 
     def _workflow_step2_trigger_done_button(self) -> None:
-        """阶段2.5: 调用 _on_done_clicked 完整逻辑（触发 cookie 采集 + 保存 + session_ready 信号）"""
-        login_pg = self._login_page
-        if login_pg is None:
-            self._workflow_step4_need_login()
-            return
-        try:
-            self._append_log("触发 cookie 采集（_on_done_clicked）...", "INFO")
-            login_pg._on_done_clicked()
-            # session_ready 信号会触发 _maybe_resume_workflow_after_login
-            # 但此处我们走的是 LOADING_BOOK_LOGIN 路径，不会进入恢复分支
-            # 所以需要自己接续：8s 后再次自检
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(8000, self._workflow_step2_recheck_session)
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"cookie 采集失败：{exc}", "ERROR")
-            self._workflow_step4_need_login()
+        """阶段2.5: CDP 模式下不需要手动触发完成按钮。"""
+        self._append_log("CDP 模式：登录已自动完成，跳过手动触发步骤", "INFO")
+        self._workflow_step4_start_scheduler()
 
     def _workflow_step2_recheck_session(self) -> None:
-        """阶段2.6: cookie 采集完成后再自检一次"""
-        self._append_log("阶段2: 重新自检登录态...", "INFO")
-        # 复用阶段1的 check_session 流程
-        self._workflow_step1_check_session()
+        """阶段2.6: CDP 模式下直接进入调度器启动。"""
+        self._append_log("CDP 模式：直接进入调度器启动", "INFO")
+        self._workflow_step4_start_scheduler()
+
+    def _workflow_step0a_try_current_page(self) -> None:
+        """Step0A: CDP 模式下跳过浏览器抓取，直接进入调度器。"""
+        self._append_log("CDP 模式：跳过浏览器抓取步骤，直接启动调度器", "INFO")
+        self._workflow_step4_start_scheduler()
+
+    def _step0a_stop_timers(self) -> None:
+        """Step0A 内部工具：停止所有 Step0A 用的定时器，避免泄漏。"""
+        for attr in ("_satisfaction_timer", "_capture_timeout_timer"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(self, attr, None)
+
+    def _step0a_success(self) -> None:
+        """Step0A 命中：CDP 模式下直接进入阅读。"""
+        self._step0a_stop_timers()
+        self._workflow_step5_start_reading()
+
+    def _step0a_fallback(self) -> None:
+        """Step0A 超时：CDP 模式下直接进入阅读。"""
+        self._step0a_stop_timers()
+        self._workflow_step4_start_scheduler()
 
     def _workflow_step3_start_capture(self) -> None:
-        """阶段3: 注入 JS 劫持 + 启动轮询 + 跳目标章节"""
-        self._workflow_state = "CAPTURING"
-        login_pg = self._login_page
-        if login_pg is None:
-            self._append_log("无法访问登录页，工作流中止", "ERROR")
-            self._workflow_state = "IDLE"
-            return
-
-        # 读配置
-        santi_book_url = str(self._cfg.get("reading.santi_book_url") or "").strip()
-        santi_chapter_url = str(self._cfg.get("reading.santi_chapter_url") or "").strip()
-        if not santi_book_url:
-            santi_book_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a"
-        if not santi_chapter_url:
-            santi_chapter_url = "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2ak92c3210025c92cc22753209"
-
-        # 0. 先确保浏览器在三体书页（防止用户离开过）
-        try:
-            from PySide6.QtCore import QUrl, QTimer
-            web = getattr(login_pg, "_web", None)
-            if web is not None:
-                current_url = web.url().toString().strip()
-                if santi_book_url not in current_url:
-                    self._append_log(f"先加载三体书页：{santi_book_url[:80]}...", "INFO")
-                    web.load(QUrl(santi_book_url))
-                    # 等 3s 加载完再启动抓取
-                    QTimer.singleShot(3000, lambda: login_pg.start_auto_capture_workflow(santi_chapter_url))
-                else:
-                    login_pg.start_auto_capture_workflow(santi_chapter_url)
-            else:
-                self._append_log("浏览器控件不可用，工作流中止", "ERROR")
-                self._workflow_state = "IDLE"
-                return
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"阶段3启动失败：{exc}", "ERROR")
-            self._workflow_step4_need_login()
-            return
-
-        # 启动超时定时器
-        timeout_sec = int(self._cfg.get("reading.capture_timeout_sec") or 15)
-        from PySide6.QtCore import QTimer
-        self._capture_timeout_timer = QTimer(self)
-        self._capture_timeout_timer.setSingleShot(True)
-        self._capture_timeout_timer.timeout.connect(self._workflow_step4_validate)
-        self._capture_timeout_timer.start(timeout_sec * 1000)
-
-        # 启动满意度轮询（每 1s 检查 is_capture_satisfied）
-        self._satisfaction_timer = QTimer(self)
-        self._satisfaction_timer.timeout.connect(self._check_capture_satisfaction)
-        self._satisfaction_timer.start(1000)
-        self._append_log(f"阶段3: 已启动抓取+轮询，超时 {timeout_sec}s", "INFO")
+        """阶段3: CDP 模式下跳过浏览器抓取，直接进入调度器。"""
+        self._append_log("CDP 模式：跳过浏览器抓取（阶段3），直接启动调度器", "INFO")
+        self._workflow_step4_start_scheduler()
 
     def _check_capture_satisfaction(self) -> None:
-        """每秒检查一次抓取数据是否满足条件"""
-        try:
-            if self._login_page.is_capture_satisfied():
-                self._satisfaction_timer.stop()
-                self._append_log("✅ 抓取数据已满足阅读条件", "OK")
-                self._workflow_step4_validate()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("工作流满意度检查异常：%s", exc)
+        """每秒检查抓取满意度（CDP 模式下跳过）。"""
+        # CDP 模式下无需检查浏览器抓取满意度
+        if hasattr(self, "_satisfaction_timer"):
+            self._satisfaction_timer.stop()
 
     def _workflow_step4_validate(self) -> None:
-        """阶段5: 校验抓取数据"""
-        # 停止定时器
+        """阶段5: CDP 模式下直接通过校验，启动阅读。"""
         for attr in ("_satisfaction_timer", "_capture_timeout_timer"):
             t = getattr(self, attr, None)
             if t is not None:
@@ -1112,63 +1217,25 @@ class StatusPage(QWidget):
                 except Exception:  # noqa: BLE001
                     pass
 
-        if self._login_page.is_capture_satisfied():
-            # 满足 → 关闭抓取，启动阅读
-            self._login_page.stop_auto_capture_workflow()
-            self._workflow_step5_start_reading()
-        else:
-            # 不满足 → 重试
-            self._capture_retry_count += 1
-            max_retry = int(self._cfg.get("reading.workflow_retry_count") or 2)
-            if self._capture_retry_count <= max_retry:
-                self._append_log(
-                    f"抓取数据不完整，重试第 {self._capture_retry_count}/{max_retry} 次",
-                    "WARN"
-                )
-                # 停止当前抓取再重启
-                self._login_page.stop_auto_capture_workflow()
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(1000, self._workflow_step3_start_capture)
-            else:
-                # 重试耗尽 → 需要扫码登录
-                self._append_log(f"重试 {max_retry} 次仍失败，进入需要登录流程", "WARN")
-                self._workflow_step4_need_login()
+        # CDP 模式下无需校验抓取数据，直接启动
+        self._workflow_step5_start_reading()
 
     def _workflow_step4_need_login(self) -> None:
-        """阶段4: 失败时跳转 weread.qq.com 让用户扫码 + 禁用按钮"""
+        """阶段4: CDP 模式下打开 CDP 登录对话框。"""
         self._workflow_state = "NEED_LOGIN"
-        # 停止抓取
-        try:
-            self._login_page.stop_auto_capture_workflow()
-        except Exception:  # noqa: BLE001
-            pass
-        # 跳转微信读书首页让用户扫码
-        try:
-            from PySide6.QtCore import QUrl
-            web = getattr(self._login_page, "_web", None)
-            if web is not None:
-                web.load(QUrl("https://weread.qq.com/"))
-        except Exception:  # noqa: BLE001
-            pass
-        # 弹窗提示
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.warning(
-            self, "需要重新登录",
-            "登录态失效，已自动跳转微信读书首页。\n\n"
-            "请扫码登录后，点击右侧「✅ 我已登录完成」按钮，\n"
-            "系统将自动恢复抓取工作流并启动阅读。"
-        )
+        self._append_log("需要登录：请在 CDP 对话框中扫码登录", "WARN")
         # 禁用开始按钮
         try:
             self._btn_start.setEnabled(False)
         except Exception:  # noqa: BLE001
             pass
-        self._append_log("工作流暂停：等待用户扫码登录", "WARN")
+        # 直接打开 CDP 登录对话框
+        self._open_cdp_login_dialog()
 
     def _workflow_resume_after_login(self) -> None:
         """用户扫码后点击"我已登录完成"按钮触发的恢复入口。
 
-        重新走 阶段2 → 阶段1 → 阶段3 流程。
+        先走 Step0A：尝试抓当前用户浏览页；抓不到再回退三体。
         """
         # 恢复按钮可点击
         try:
@@ -1176,27 +1243,22 @@ class StatusPage(QWidget):
         except Exception:  # noqa: BLE001
             pass
         self._capture_retry_count = 0
-        self._workflow_state = "LOADING_BOOK_LOGIN"
-        self._append_log("🎯 用户登录完成，恢复工作流：跳三体书种 cookie", "INFO")
-        self._workflow_step2_load_book_for_login()
+        self._append_log("🎯 用户登录完成，恢复工作流：先抓取当前页，抓不到再回退三体", "INFO")
+        self._workflow_step0a_try_current_page()
 
     def _workflow_step5_start_reading(self) -> None:
         """阶段6: 启动 scheduler 执行阅读循环"""
         self._workflow_state = "READING"
-        # 复用旧 _do_normal_start 的核心启动逻辑
+        self._workflow_step4_start_scheduler()
+
+    def _workflow_step4_start_scheduler(self) -> None:
+        """CDP 模式下直接启动调度器（跳过浏览器相关检查）。"""
+        self._workflow_state = "READING"
         try:
-            if not self._api.check_session():
-                if not self._api.ensure_session():
-                    self._update_cookie_status(False)
-                    self._workflow_step4_need_login()
-                    return
             self._update_cookie_status(True)
-            # 🔧 阅读中：关闭 JS 拦截器（避免干扰）
-            if hasattr(self, "_login_page") and self._login_page:
-                self._login_page.set_reader_active(True)
             if not self._scheduler.isRunning():
                 self._scheduler.start()
-                self._append_log("阅读任务已启动（拦截器已关闭）", "OK")
+                self._append_log("阅读任务已启动（CDP 模式）", "OK")
             else:
                 self._scheduler.resume()
                 self._append_log("阅读任务已恢复", "OK")
@@ -1215,10 +1277,7 @@ class StatusPage(QWidget):
 
     def _on_stop(self) -> None:
         self._scheduler.stop()
-        # 🔧 停止阅读：重新开启 JS 拦截器
-        if hasattr(self, "_login_page") and self._login_page:
-            self._login_page.set_reader_active(False)
-        self._append_log("阅读任务已停止（拦截器已恢复）", "WARN")
+        self._append_log("阅读任务已停止", "WARN")
         self._on_state_changed("已停止")
         self._next_run_at = None
 

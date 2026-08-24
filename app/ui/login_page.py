@@ -278,20 +278,33 @@ def _load_raw_from_sqlite(cookies_db_path: Path, *, copy_timeout: float = 2.5) -
         log.info("SQLite 读 profile cookies: 筛后保留 %d 条白名单条目", len(out))
         return out
 
-    # —— 策略 1：URI immutable readonly（Windows 上绕开 WebEngine 文件锁最稳）——
-    uri = f"file:{cookies_db_path.as_posix()}?mode=ro&immutable=1"
+    # —— 策略 1：URI nolock readonly（绕开 WebEngine 文件锁最稳）——
+    # nolock=1 跳过 SQLite 文件锁检查，即使 WebEngine 持有写锁也能读
+    # immutable=1 告诉 SQLite 文件不会被修改，可全表扫描（与 nolock 配合最稳）
+    # 旧版只有 immutable=1 仍报 "unable to open database file"——加 nolock=1 后绕过文件锁
+    uri = f"file:{cookies_db_path.as_posix()}?mode=ro&nolock=1&immutable=1"
     try:
+        # 文件大小诊断（判断 SQLite 是否真的有数据）
+        try:
+            db_size = cookies_db_path.stat().st_size
+            log.info("SQLite 策略 1：DB 文件 size=%d bytes; uri=%s", db_size, uri)
+        except Exception:  # noqa: BLE001
+            db_size = -1
         conn = sqlite3.connect(uri, uri=True, timeout=2.0, isolation_level=None)
         try:
             results = _read_from_conn(conn)
             if results:
+                # 关键诊断：列出所有 host_key，确认 .qq.com 跨域 cookie 是否真的在 SQLite
+                host_keys = sorted({str(r.get("domain") or "") for r in results})
+                log.info("SQLite 策略 1 成功：共 %d 条 cookie；涉及域=%s",
+                         len(results), host_keys)
                 return results
             # 可能是空库，继续走其它策略？不：空就空。
         finally:
             try: conn.close()
             except Exception: pass
     except sqlite3.Error as exc:
-        log.warning("SQLite strategy 1 (uri ro+immutable) 跳过: %s", exc)
+        log.warning("SQLite strategy 1 (uri ro+nolock+immutable) 跳过: %s", exc)
 
     # —— 策略 2：sqlite3_backup 热备（比 Python shutil.copyfile 走更低层的 sqlite 互斥，更兼容写锁）——
     tmp_dir = Path(tempfile.mkdtemp(prefix="wxread_cookie_db_"))
@@ -299,7 +312,8 @@ def _load_raw_from_sqlite(cookies_db_path: Path, *, copy_timeout: float = 2.5) -
         copy_path = tmp_dir / "Cookies.backup.sqlite"
         try:
             # 先以普通只读打开"正在被写的源"：如果被独占会抛，我们吞掉继续 fallback 3
-            src_conn = sqlite3.connect(f"file:{cookies_db_path.as_posix()}?mode=ro", uri=True, timeout=2.0, isolation_level=None)
+            # nolock=1 跳过文件锁，配合 backup 互斥
+            src_conn = sqlite3.connect(f"file:{cookies_db_path.as_posix()}?mode=ro&nolock=1", uri=True, timeout=2.0, isolation_level=None)
             try:
                 dst_conn = sqlite3.connect(str(copy_path), timeout=2.0)
                 try:
@@ -355,6 +369,13 @@ class _SetCookieInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self, collector, parent=None):  # type: ignore[no-untyped-def]
         super().__init__(parent)
         self._collector = collector
+        # 源 5：从请求头 Cookie 字段提取（含跨域 .qq.com 的 RK/ptcz/pac_uid 等）
+        # QtWebEngine 的 cookieAdded 信号只触发 .weread.qq.com 域，跨域的 RK/ptcz 不进 cookie store
+        # 但浏览器发请求时会自动把所有匹配域（含 .qq.com）的 cookie 附加到 Cookie 请求头
+        # 因此从 info.httpHeaders() 读 Cookie 字段是最权威的"完整 cookie 集"来源
+        # 参考：参考.txt 方案一（监听网络请求拦截，最准确）
+        self._request_header_cookies: dict[str, str] = {}
+        self._request_cookie_log_throttle: float = 0.0  # 日志节流（避免刷屏）
 
     def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:  # noqa: N802 (Qt 命名)
         """拦截器：
@@ -362,11 +383,66 @@ class _SetCookieInterceptor(QWebEngineUrlRequestInterceptor):
         2) 捕获 read 请求的 hex b/c + 完整 curl_bash（测试用）
         3) 捕获数字 bookId
         4) [测试模式] 记录所有 POST 请求的 URL 和 body
+        5) ★ 从请求头 Cookie 字段提取跨域 cookie（RK/ptcz/pac_uid 等）
         """
         try:
             method = bytes(info.requestMethod()).decode("ascii", "ignore") if hasattr(info, "requestMethod") else ""
             url_obj: QUrl = info.requestUrl()
             u = url_obj.toString() if isinstance(url_obj, QUrl) else str(url_obj)
+
+            # === 源 5：从 info.httpHeaders() 读 Cookie 请求头 ===
+            # PySide6 6.5+ 提供 httpHeaders()，返回 QHash<QByteArray, QByteArray>，含完整请求头
+            # 这是浏览器发请求时实际带的 cookie，包含跨域的 RK/ptcz/pac_uid
+            try:
+                headers_map = info.httpHeaders() if hasattr(info, "httpHeaders") else {}
+            except Exception:  # noqa: BLE001
+                headers_map = {}
+            if headers_map:
+                cookie_header_val: str = ""
+                try:
+                    for hk, hv in headers_map.items():
+                        try:
+                            hk_s = bytes(hk).decode("ascii", "ignore").lower() if hk else ""
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if hk_s == "cookie":
+                            try:
+                                cookie_header_val = bytes(hv).decode("utf-8", "ignore") if hv else ""
+                            except Exception:  # noqa: BLE001
+                                cookie_header_val = str(hv) if hv else ""
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+                if cookie_header_val:
+                    # 解析 "name1=val1; name2=val2; ..." → dict
+                    new_count = 0
+                    for kv in cookie_header_val.split(";"):
+                        kv = kv.strip()
+                        if not kv or "=" not in kv:
+                            continue
+                        k, _, v = kv.partition("=")
+                        k = k.strip()
+                        v = v.strip()
+                        if not k or not v:
+                            continue
+                        # 长值覆盖短值（同 _push_entry 策略）
+                        old_v = self._request_header_cookies.get(k, "")
+                        if len(v) > len(old_v):
+                            self._request_header_cookies[k] = v
+                            new_count += 1
+                    # 节流日志（每 5s 一次）
+                    import time as _t
+                    now_ts = _t.time()
+                    if new_count > 0 and (now_ts - self._request_cookie_log_throttle) > 5.0:
+                        self._request_cookie_log_throttle = now_ts
+                        # 只打印白名单内的关键字段，避免泄露
+                        try:
+                            anchors = {k: (v[:4] + "***") for k, v in self._request_header_cookies.items()
+                                       if k in ("RK", "ptcz", "pac_uid", "wr_skey", "wr_vid", "wr_rt")}
+                            log.info("🔒 拦截器请求头 Cookie 提取：dict=%d 条；关键=%s",
+                                     len(self._request_header_cookies), anchors)
+                        except Exception:  # noqa: BLE001
+                            pass
 
             # 关键路径日志
             if any(k in u for k in ("/web/login/", "/login", "weread.qq.com/web/reader", "open.weixin.qq.com", "/chapterInfos", "/book/read", "bookId=")):
@@ -552,6 +628,8 @@ class _SetCookieInterceptor(QWebEngineUrlRequestInterceptor):
 
 class LoginPage(QWidget):
     session_ready = Signal()  # 登录成功并写入 config 后发出
+    # P1-6：内嵌浏览器 profile 初始化就绪，送出 httpUserAgent 供 requests.Session 同步
+    browser_user_agent_ready = Signal(str)
     _verify_done = Signal(bool)
     _js_cookies_ready = Signal(dict)  # document.cookie 兜底采集结果: name -> value
     _js_storage_ready = Signal(dict)  # localStorage/sessionStorage 扫 wr_* 兜底
@@ -611,6 +689,12 @@ class LoginPage(QWidget):
         self._verify_timer.timeout.connect(self._on_verify_tick_timeout)
         self._verify_sec = 0
         self._verify_running = False
+        # —— 扫码完成度自检：采集到 RK/ptcz 缺失时自动延迟 8s 重新采集，最多重试 3 次 ——
+        # 用户扫码后浏览器跳转链未完成（login.qq.com → weread.qq.com）时，RK/ptcz 还没下发
+        self._anchor_selfcheck_count: int = 0
+        self._anchor_selfcheck_max: int = 3          # 最多自动重试 3 次（共 4 次采集）
+        self._anchor_selfcheck_delay: float = 8.0    # 重试延迟（秒），给浏览器跳转链足够时间
+        self._anchor_selfcheck_in_progress: bool = False  # 防止重入
         self._verify_stage = "idle"
         # —— 把 api 的 message / warning / error 实时映射到登录页状态行，
         #    否则 check_session / ensure_session 在后台线程里跑，用户只能看到最后
@@ -972,6 +1056,15 @@ class LoginPage(QWidget):
 
         self._web.urlChanged.connect(self._on_web_url_changed)
         self._web.loadFinished.connect(self._on_web_load_finished)
+
+        # ============ P1-6 UA 同步：通知主窗口把 profile UA 同步给 requests.Session ============
+        try:
+            ua = str(self._profile.httpUserAgent() or "").strip()
+            if ua:
+                log.info("🌐 内嵌浏览器 UA：%s", ua[:160])
+                self.browser_user_agent_ready.emit(ua)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("读取 profile.httpUserAgent 失败（非致命，UA 将用 requests 默认）：%s", exc)
 
         # ============ 后续流程分支 ============
         # 分支 A：saved_ok 且 profile 已经干净 → 下一回合回灌 cookie
@@ -1826,6 +1919,51 @@ class LoginPage(QWidget):
                 log.warning("🎯 工作流跳转失败：%s", exc)
         QTimer.singleShot(1500, _do_navigate)
 
+    def start_auto_capture_workflow_current_page(self) -> str:
+        """对外接口：抓取当前正在看的页面，不做任何 URL 跳转。
+
+        步骤：
+          1. 立即注入 JS 劫持（确保 __wxread_hooked__ 已挂）
+          2. 延迟 1s 再补注（兼容 iframe）
+          3. 启动 2s 轮询定时器
+          4. 延迟 1.5s 后：若当前 URL 是 reader URL 且带章节（kxxx），则"原地 reload 同一 URL"
+             触发一次浏览器自身的 read POST（不切书不切章），用于给 JS 钩子抓到完整数据
+        返回：当前浏览器 URL（方便上层判断回退逻辑）
+        """
+        from PySide6.QtCore import QUrl, QTimer
+        try:
+            current_url = self._web.url().toString().strip()
+        except Exception:  # noqa: BLE001
+            current_url = ""
+        log.info("🎯 当前页抓取工作流启动：不跳转URL，注入劫持+轮询，当前URL=%s", current_url[:120])
+        # 1. 立即注入 JS 劫持
+        self._inject_request_hook()
+        QTimer.singleShot(1000, self._inject_request_hook)
+        # 2. 启动轮询定时器
+        if not hasattr(self, "_poll_timer") or self._poll_timer is None:
+            self._poll_timer = QTimer(self)
+            self._poll_timer.timeout.connect(self._poll_captured_requests)
+        self._poll_timer.start(2000)
+        self._poll_count = 0
+        log.info("🎯 当前页抓取轮询已启动（2 秒间隔）")
+        # 3. 1.5s 后若 URL 带章节（读者详情页即已触发 read），reload 触发一次 read POST
+        def _maybe_reload_reader():
+            try:
+                url_now = (self._web.url().toString() or "").strip()
+                if not url_now:
+                    return
+                # 规则：形如 web/reader/<book>k<chapter>（带 k=章节 id 片段）
+                if "/web/reader/" in url_now and "k" in url_now.rsplit("/", 1)[-1]:
+                    log.info("🎯 当前页是读者详情页（带章节），原地 reload 触发 read POST：%s", url_now[:120])
+                    self._web.reload()
+                    QTimer.singleShot(2500, self._inject_request_hook)
+                else:
+                    log.info("🎯 当前页非读者详情页（无章节 id），不强制 reload，等待轮询自然命中")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("🎯 当前页抓取 reload 失败：%s", exc)
+        QTimer.singleShot(1500, _maybe_reload_reader)
+        return current_url
+
     def stop_auto_capture_workflow(self) -> dict:
         """停止抓取+轮询，返回捕获到的数据快照。"""
         log.info("🎯 自动抓取工作流停止")
@@ -1904,12 +2042,20 @@ class LoginPage(QWidget):
             log.warning("🎯 _maybe_resume_workflow_after_login 异常：%s", exc)
 
     def _on_done_clicked(self) -> None:
+        # 用户手动点击「我已登录完成」→ 重置自检计数器（不计入自动重试）
+        if not self._anchor_selfcheck_in_progress:
+            self._anchor_selfcheck_count = 0
+        self._anchor_selfcheck_in_progress = False
         self._status.setText(
             "正在抽取登录态（信号 + 拦截器 + SQLite + JS 四路并行）请稍候..."
         )
         self._btn_done.setEnabled(False)
         self._js_cookies_cache.clear()
         self._js_storage_cache.clear()
+        # 自检重试路径：不清空 pending/intercepted/all_cookies_raw/sqlite_snapshot
+        # 浏览器登录时 cookieAdded 是一次性下发的，第 2 次采集期间浏览器已稳定
+        # 不会再触发新 cookieAdded，清空就 = 丢失全部已采集的 cookie。
+        # _push_entry 按 name 去重（长值覆盖短值），累积保留是安全的。
         # 启动 tick 文案刷新，避免“看起来一直卡死”（每 800ms 动一次状态行末尾小秒针）
         self._tick_sec = 0
         self._tick_stage = "准备"
@@ -2136,16 +2282,16 @@ class LoginPage(QWidget):
         out: dict[str, int] = {"total_rows": 0, "domains": 0, "diag_method": 0}
         if not db_path.exists():
             return out
-        # —— 优先级同 _load_raw_from_sqlite：URI ro+immutable（最抗 WebEngine 锁） ——
-        uri = f"file:{db_path.as_posix()}?mode=ro&immutable=1"
+        # —— 优先级同 _load_raw_from_sqlite：URI ro+nolock+immutable（最抗 WebEngine 锁） ——
+        uri = f"file:{db_path.as_posix()}?mode=ro&nolock=1&immutable=1"
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=2.0, isolation_level=None)
             out["diag_method"] = 1
         except sqlite3.Error as exc1:
-            # fallback: 普通只读 URI（不带 immutable）
+            # fallback: 普通只读 URI（带 nolock，不带 immutable）
             try:
-                conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=2.0, isolation_level=None)
+                conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro&nolock=1", uri=True, timeout=2.0, isolation_level=None)
                 out["diag_method"] = 2
             except sqlite3.Error as exc2:
                 # fallback: 带超时 copy + 读
@@ -2248,6 +2394,7 @@ class LoginPage(QWidget):
             "all_cookies_loaded": 0,   # cookiesLoaded 全量回调命中
             "js_document_cookie": 0,
             "js_storage": 0,
+            "request_header_cookie": 0,  # 源 5：拦截器请求头 Cookie 字段（含跨域 RK/ptcz）
         }
 
         def _push_entry(src: str, entry: dict[str, Any]) -> None:
@@ -2483,6 +2630,120 @@ class LoginPage(QWidget):
                     "（已将采集管道摘要写入 config.json → debug.last_collect）"
                 )
                 return
+
+        # ===== P0-修复：Cookie 锚点完整性校验（RK / ptcz）=====
+        # 缺失这两个腾讯 PT 根凭据，wr_skey 续期会失败，阅读累计若干次后必 -2012 登录超时。
+        # 必须提示用户重新扫码，不能把残缺 profile 写入 config。
+        missing_anchors: list[str] = []
+        for _anchor in ("RK", "ptcz"):
+            _v = (cookies_dict.get(_anchor) or "").strip()
+            if len(_v) < 8:  # 空或异常短都算缺失
+                missing_anchors.append(_anchor)
+        if missing_anchors:
+            # —— 扫码完成度自检：缺失锚点时自动延迟 8s 重新采集，给浏览器跳转链时间 ——
+            if (
+                self._anchor_selfcheck_count < self._anchor_selfcheck_max
+                and not self._anchor_selfcheck_in_progress
+            ):
+                self._anchor_selfcheck_count += 1
+                self._anchor_selfcheck_in_progress = True
+                attempt = self._anchor_selfcheck_count
+                max_attempt = self._anchor_selfcheck_max
+                delay = self._anchor_selfcheck_delay
+                # 诊断本次各源贡献，方便排查为何缺锚点
+                src_counts = {
+                    "pending": len(self._pending_cookies),
+                    "intercepted": len(self._intercepted_raw),
+                    "all_cookies_loaded": len(self._all_cookies_raw),
+                    "sqlite": len(self._sqlite_snapshot),
+                    "js_cookie": len(cookies_dict),  # 合并后的字典大小
+                }
+                log.warning(
+                    "【Cookie 锚点自检】第 %d/%d 次缺失 %s，%gs 后自动重新采集"
+                    "（让浏览器完成 login.qq.com → weread.qq.com 跳转链）"
+                    "本次各源 pending=%d intercepted=%d all_loaded=%d sqlite=%d",
+                    attempt, max_attempt, ",".join(missing_anchors), delay,
+                    src_counts["pending"], src_counts["intercepted"],
+                    src_counts["all_cookies_loaded"], src_counts["sqlite"],
+                )
+                try:
+                    self._status.setText(
+                        f"⏳ 扫码完成度自检：第 {attempt}/{max_attempt} 次检测到"
+                        f" {','.join(missing_anchors)} 缺失，{delay:g}s 后自动重新采集..."
+                    )
+                    self._progress_bar.show()
+                    self._progress_label.setText(
+                        f"⏳ 扫码完成度自检：第 {attempt}/{max_attempt} 次检测到"
+                        f" {','.join(missing_anchors)} 缺失。\n"
+                        "浏览器跳转链可能未完成（openlogin.qq.com → login.qq.com → weread.qq.com）。\n"
+                        f"{delay:g}s 后自动重新采集，请勿关闭软件。\n"
+                        "提示：如浏览器还在跳转中，请等其稳定后让自动重采接管。\n"
+                        "若多次重试仍失败，请在浏览器中手动访问 "
+                        "https://weread.qq.com/ 触发跳转后再点【我已登录完成】。"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # ★ 关键：自检触发时立即主动调用 loadAllCookies()，强制刷新 cookie store
+                # cookiesLoaded 信号即使失效，cookieAdded 信号也可能会重新追加新 cookie
+                # （如果浏览器在跳转中下发了新 Set-Cookie）
+                try:
+                    self._cookie_store.loadAllCookies()
+                except Exception as _e:  # noqa: BLE001
+                    log.debug("自检前 loadAllCookies 异常：%s", _e)
+                # 延迟后通过 _on_done_clicked 重新走完整采集流程
+                # 注意：_on_done_clicked 自检路径不清空 pending/intercepted，累积保留
+                QTimer.singleShot(int(delay * 1000), self._on_done_clicked)
+                return
+
+            log.error(
+                "【Cookie 锚点校验失败】已自动重试 %d 次仍缺失：%s；cookies_dict keys=%s",
+                self._anchor_selfcheck_count, ",".join(missing_anchors),
+                sorted(cookies_dict.keys()),
+            )
+            _save_summary(
+                "fail.missing_pt_anchors",
+                extra={
+                    "missing_anchors": missing_anchors,
+                    "have_keys": sorted(cookies_dict.keys()),
+                    "selfcheck_attempts": self._anchor_selfcheck_count,
+                },
+            )
+            self._btn_done.setEnabled(True)
+            self._btn_reload.setEnabled(True)
+            self._status.setText(
+                f"❌ Cookie 锚点缺失：{','.join(missing_anchors)}；请重新扫码"
+            )
+            try:
+                self._progress_label.setText(
+                    f"❌ 关键 Cookie 锚点缺失：{','.join(missing_anchors)}\n"
+                    f"已自动重试 {self._anchor_selfcheck_count} 次仍未采集到，"
+                    "这俩是腾讯 PT 体系根凭据，缺失会导致 wr_skey 续期失败、"
+                    "阅读累计若干次后必触发 -2012 登录超时。\n"
+                    "请勿保存残缺 profile，重新扫码：\n"
+                    "  1) 在登录页扫码授权【同意】；\n"
+                    "  2) 跳回书架后点开任意一本书进入阅读页；\n"
+                    "  3) 停留 10 秒以上等浏览器写完所有 cookie，再点【我已登录完成】。"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            QMessageBox.critical(
+                self,
+                "Cookie 锚点缺失",
+                f"关键 PT 锚点 {','.join(missing_anchors)} 缺失或过短，"
+                "已拒绝保存残缺 profile。\n\n"
+                f"已自动重试 {self._anchor_selfcheck_count} 次仍未采集到。\n\n"
+                "这是腾讯 PT 体系根凭据，缺失会导致：\n"
+                "  - wr_skey 续期被服务器拒绝\n"
+                "  - 阅读累计若干次后必触发 errCode=-2012 登录超时\n"
+                "  - 必须重新扫码登录\n\n"
+                "请按以下步骤重新采集：\n"
+                "  1) 扫码授权【同意】\n"
+                "  2) 跳回书架后点开任意一本书进入阅读页\n"
+                "  3) 停留 10 秒以上让浏览器写完所有 cookie\n"
+                "  4) 再点【我已登录完成】\n\n"
+                "（采集摘要已写入 config.json → debug.last_collect）",
+            )
+            return
 
         headers = dict(self._cfg.get("headers", {}) or {})
         headers["user-agent"] = self._profile.httpUserAgent()
@@ -2755,6 +3016,58 @@ class LoginPage(QWidget):
             )
             storage_merged += 1
         sources["js_storage"] = storage_merged
+
+        # === 源 5：拦截器请求头 Cookie 字段（最高优先级——浏览器发请求时实际带的完整 cookie）===
+        # 这是唯一能拿到跨域 .qq.com 的 RK/ptcz/pac_uid 的途径
+        # （QtWebEngine cookieAdded 信号不触发跨域 cookie，sqlite 也只存 .weread.qq.com）
+        # 必须放在最后合并，长值覆盖短值，确保 RK/ptcz 等关键字段以请求头值为准
+        try:
+            req_header_cookies: dict[str, str] = {}
+            if self._interceptor is not None:
+                req_header_cookies = getattr(self._interceptor, "_request_header_cookies", {}) or {}
+        except Exception:  # noqa: BLE001
+            req_header_cookies = {}
+        if req_header_cookies:
+            # RK/ptcz 等跨域 cookie 的 domain 设为 .qq.com（让 requests 会话正确种到根域）
+            for k, v in req_header_cookies.items():
+                ks = str(k)
+                vs = str(v or "")
+                if not ks or not vs:
+                    continue
+                # 仅合并白名单内的（避免把无关字段也塞进 cookies_dict）
+                if not _cookie_name_should_keep(ks):
+                    continue
+                # 决定 domain：腾讯 PT 体系根凭据 → .qq.com；其他保持 .weread.qq.com
+                if ks in ("RK", "ptcz", "pac_uid", "o_cookie", "euin", "vqq_", "iip",
+                          "qimei_h5", "qimei36", "_qimei_uuid42", "_qimei_uuid32"):
+                    dm = ".qq.com"
+                else:
+                    dm = ".weread.qq.com"
+                domains.add(dm)
+                # 长值覆盖短值（_push_entry 语义）
+                old_v = cookies_dict.get(ks, "")
+                if len(vs) >= len(old_v):
+                    cookies_dict[ks] = vs
+                    # 同步 cookies_raw
+                    dup_idx = -1
+                    for i, old in enumerate(cookies_raw):
+                        if str(old.get("name")) == ks:
+                            dup_idx = i
+                            break
+                    new_entry = {
+                        "name": ks, "value": vs, "domain": dm, "path": "/",
+                        "secure": True, "httpOnly": True, "sameSite": 0,
+                    }
+                    if dup_idx >= 0:
+                        old = cookies_raw[dup_idx]
+                        if len(vs) > len(str(old.get("value") or "")):
+                            old["value"] = vs
+                            old["domain"] = dm  # 跨域 cookie 用 .qq.com
+                            old["httpOnly"] = True
+                            old["secure"] = True
+                    else:
+                        cookies_raw.append(new_entry)
+                    sources["request_header_cookie"] += 1
 
         log.info("登录抽取：各源贡献=%s；合并后 dict=%d raw=%d；涉及域=%s",
                  sources, len(cookies_dict), len(cookies_raw), sorted(domains))

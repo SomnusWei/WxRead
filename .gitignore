@@ -58,3 +58,31 @@ Thumbs.db
 # ===== 本地临时配置（config.json 存于 %APPDATA%，但如果有人误放根目录也不能提交）=====
 config.json
 settings.json
+
+# ===== 临时测试文件 =====
+cdp_test.log
+cdp_test_simple.py
+test_extension.log
+
+# ===== 临时快照 =====
+cdp_cookies_snapshot.json
+
+# ===== 构建临时目录 =====
+build5/
+build_cdp/
+build_ext/
+dist5/
+dist_cdp/
+dist_ext/
+backup_exe/
+
+# ===== 测试扩展 =====
+test_extension/
+
+# ===== 临时文档 =====
+微信读书自动读书APP-书架与章节池获取方案.md
+阅读任务-章节池持久化方案(纯Web-Cookie-无Skill).md
+CDP重构方案.md
+现有官方数据卡从Skill获取数据的核心.md
+微信读书自动阅读开发指南-bookId与chapterUid获取.md
+项目计划.txt

@@ -146,6 +146,30 @@ class ReadingScheduler(QThread):
             if not self._api.ensure_session():
                 self._set_state("登录态失效，等待扫码")
                 self._notify_cookie_fail()
+        # ===== P0-3 启动随机延迟（反机器指纹：避免点"开始阅读"立即秒级请求）=====
+        reading_cfg = self._cfg.get("reading", {}) or {}
+        try:
+            s_min = float(reading_cfg.get("startup_delay_min_sec", 30))
+            s_max = float(reading_cfg.get("startup_delay_max_sec", 90))
+            if s_max < s_min:
+                s_max = s_min
+            startup_delay = random.uniform(s_min, s_max)
+        except (ValueError, TypeError):
+            startup_delay = random.uniform(30, 90)
+        log.info("⏱️ 启动随机延迟：%.1fs（%s~%ss），模拟真人进入阅读前的思考准备", startup_delay, s_min, s_max)
+        self.log.emit(
+            f"⏱️ 启动随机延迟 {startup_delay:.0f}s（{s_min:.0f}~{s_max:.0f}s），"
+            "模拟真人进入阅读前的准备"
+        )
+        self._set_state(f"启动准备中（{startup_delay:.0f}s）")
+        # 用分段 sleep，确保 stop/pause 可打断；每 200ms 检查一次 stop
+        _dl = startup_delay
+        while _dl > 0 and not self._stop_event.is_set():
+            chunk = min(0.2, _dl)
+            time.sleep(chunk)
+            _dl -= chunk
+        if self._stop_event.is_set():
+            return
         # 主循环：跨日期自动滚动到下一天计划
         while not self._stop_event.is_set():
             # —— 每次回到循环入口都尝试一次"登录态健康巡检"（到期才会真的跑）
@@ -356,7 +380,14 @@ class ReadingScheduler(QThread):
             return self._daily
 
     def _do_one_reading_step(self, plan: DailyPlan) -> bool:
-        last_time = int(time.time()) - 30
+        # P0-修复 rt 随机：传 None 让 weread_api 走 random.randint(25, 60)
+        # 原先固定传 now-30 导致 diff=30，rt 永远等于 30，强机器人指纹
+        last_time = None
+        # P1-4 换书判定：成功计数同步给 weread_api
+        try:
+            self._api.set_success_count(int(plan.success_count or 0))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("set_success_count 失败（非致命）：%s", exc)
         ok = self._api.read_once(last_time=last_time)
         # ===== 连续 2 次 HTTP 200 空 body → 自动清缓存 + 重拉章节池 =====
         try:

@@ -222,6 +222,17 @@ class WeReadApi(QObject):
         self._current_book: dict | None = None
         self._last_read_ts: int = 0
         self._book_progress_override: float | None = None
+        # ===== P1 风控：书籍/章节多样性状态 =====
+        # 当前连续使用同一个 c（章节 uid）的次数统计
+        self._same_c_streak: dict[str, int] = {}  # key: chapter_uid, value: 连续使用次数
+        self._last_c_used: str = ""               # 上一次实际使用的 c（跨调用统计）
+        # 换书调度：_next_book_switch = 下一次应当换书的阈值（success_count 到达此数换 b）
+        self._next_book_switch: int | None = None
+        # 调度器侧当前累计的成功次数（供换书判断 _build_payload 使用，thread-safe wrapper）
+        self._success_count_shared: int = 0
+        self._success_count_lock = threading.Lock()
+        # b 替换策略：构造时若命中"该换书"，会把 JS 捕获/回退池里的 b 替换为 DEFAULT_BOOKS 随机一本；
+        # 但保留 JS 捕获的其他字段（appId/ps/pc/ci/co/pr/sm/rt），服务端已验证不校验 b/c 从属关系
         # —— 本地阅读累计（web 端无统计接口时的兜底方案）——
         # key=日期字符串 "YYYY-MM-DD", value=当日累计秒数
         self._daily_read_seconds: dict[str, int] = self._load_daily_read_seconds()
@@ -334,12 +345,36 @@ class WeReadApi(QObject):
             self._plant_cookies(cookies_dict=cookies, cookies_raw=cookies_raw)
             self._session.headers.clear()  # 彻底清空旧 Session 头，防止历史残留污染
             self._session.headers.update(headers)
+            # —— P1-6 UA 同步：如果 browser_user_agent 已设置（主窗口从 Qt profile 读取），覆盖 User-Agent
+            sync_ua = str(getattr(self, "_browser_ua_sync", "") or "").strip()
+            if sync_ua:
+                # 不要大小写不一致：统一用 "User-Agent"
+                for k in ("User-Agent", "user-agent", "USER-AGENT"):
+                    self._session.headers.pop(k, None)
+                self._session.headers["User-Agent"] = sync_ua
         log.info(
-            "从 config 装载登录态：dict=%d, raw=%d, jar=%d",
+            "从 config 装载登录态：dict=%d, raw=%d, jar=%d, UA同步=%s",
             len(cookies),
             len(cookies_raw),
             len(getattr(self._session, "cookies", [])),
+            "启用(" + (str(getattr(self, "_browser_ua_sync", "") or "")[:48]) + ")"
+            if str(getattr(self, "_browser_ua_sync", "") or "").strip()
+            else "未启用",
         )
+        # UA 同步方法
+    def sync_browser_user_agent(self, browser_ua: str) -> None:
+        """P1-6：主窗口/登录页 完成 QtWebEngine 初始化后，把内嵌浏览器的 profile UA 传给 requests.Session。
+        这样 requests 发的 /web/book/read 等请求 UA 和浏览器一致，降低被风控识别为「非同源 UA 请求」的概率。"""
+        ua = str(browser_ua or "").strip()
+        if not ua:
+            return
+        self._browser_ua_sync = ua  # type: ignore[attr-defined]
+        # 立即覆写 Session 的 User-Agent（不用等下次 _update_from_config）
+        with self._lock:
+            for k in ("User-Agent", "user-agent", "USER-AGENT"):
+                self._session.headers.pop(k, None)
+            self._session.headers["User-Agent"] = ua
+        log.info("🌐 UA 已同步：requests.Session.User-Agent = %s", ua[:120])
 
     def _augment_headers_baggage(self) -> None:
         """按「关键技术点.txt」动态合成 Baggage header：
@@ -421,8 +456,8 @@ class WeReadApi(QObject):
 
     # -------- 章节池持久化 · 指纹 & 磁盘读写 --------
     def calc_cookie_fingerprint(self, cookies_dict: dict[str, str] | None = None) -> str:
-        """按方案 §2.3 计算 16 位 cookie 短指纹。
-        anchor_keys=sorted([wr_skey, RK, ptcz, pac_uid, wr_vid])，缺失填 empty，
+        """按 CDP 模式计算 16 位 cookie 短指纹。
+        anchor_keys=sorted([wr_skey, wr_vid, wr_rt, wr_pf])，缺失填 empty，
         值 strip 后去 \\s+，按 k=v& 拼接，UTF-8 → SHA-1 → 前 16 hex。"""
         if cookies_dict is None:
             # 优先从 session cookies 取；fallback 到 config
@@ -440,7 +475,8 @@ class WeReadApi(QObject):
             if not cd:
                 cd = dict(self._cfg.get("cookies", {}) or {})
             cookies_dict = cd
-        anchor_keys = sorted(["wr_skey", "RK", "ptcz", "pac_uid", "wr_vid"])
+        # CDP 模式：不再使用 RK/ptcz，改用 wr_* 系列 Cookie
+        anchor_keys = sorted(["wr_skey", "wr_vid", "wr_rt", "wr_pf"])
         parts: list[str] = []
         for k in anchor_keys:
             v = cookies_dict.get(k)
@@ -1050,10 +1086,9 @@ class WeReadApi(QObject):
     def ensure_session(self) -> bool:
         """若当前会话失效，尝试通过 renewal 接口刷新 wr_skey。
 
-        判定层级：
+        CDP 模式简化判定：
           1) check_session 通过 → 直接 True
-          2) 锚点前置检查：RK / ptcz / wr_skey / wr_vid 缺失 → 直接 HARD_INVALID
-             （renewal 需要 RK+ptcz 作种子，缺失则 100% 必失败，不再徒劳尝试）
+          2) 仅检查 wr_skey 是否存在且长度 ≥ 8（CDP 模式不再强制 RK/ptcz）
           3) _renew_wr_skey 返回结构化结果：
              - OK + check_session 通过 → True
              - OK + check_session 仍失败 → HARD_INVALID（拿到新 wr_skey 但仍无效）
@@ -1065,14 +1100,11 @@ class WeReadApi(QObject):
         log.info("当前会话已失效，开始刷新 wr_skey ...")
         self.message.emit("登录态失效，正在刷新 Cookie ...")
 
-        # —— 锚点前置检查：renewal 必需的根 Cookie（RK / ptcz），缺则直接 HARD ——
+        # —— CDP 模式：仅检查 wr_skey 是否存在且有效（长度 ≥ 8）——
         cookies_dict = dict(self._cfg.get("cookies", {}) or {})
-        missing_anchors: list[str] = []
-        for k in ("RK", "ptcz"):  # renewal 的签名种子，缺失则永远续不上
-            if not cookies_dict.get(k):
-                missing_anchors.append(k)
-        if missing_anchors:
-            reason = f"关键 Cookie 锚点缺失：{', '.join(missing_anchors)}；无法续命，必须重新扫码"
+        wr_skey_val = cookies_dict.get("wr_skey", "")
+        if not wr_skey_val or len(str(wr_skey_val)) < 8:
+            reason = "wr_skey 缺失或长度不足，必须重新扫码"
             log.error("登录态硬失效：%s", reason)
             self.error.emit(f"登录态硬失效：{reason}")
             self.cookie_invalid.emit("HARD_INVALID", reason)
@@ -1359,6 +1391,59 @@ class WeReadApi(QObject):
                         len(self._captured_chapter_ids.get(book_hex, []))
                     )
 
+                    # ★ 关键修复：主动调用 chapterInfos 接口拉取全书章节
+                    # 解决「JS 捕获只拿到当前 1 章」→ _build_payload 章节池只有 1 章 → 无法换章的根因
+                    # 异步执行避免阻塞 JS 回调链
+                    bid_for_refresh = numeric_id or book_hex
+                    if bid_for_refresh:
+                        def _fetch_full_chapters(bid: str = bid_for_refresh,
+                                                hex_id: str = book_hex) -> None:
+                            try:
+                                # 先看是否已有缓存且足够多（>=3 章），避免重复请求
+                                existing = self.get_captured_chapter_ids(bid)
+                                if len(existing) >= 3:
+                                    log.info(
+                                        "📖 [全章拉取] 已有 %d 章（book=%s），跳过主动拉取",
+                                        len(existing), bid[:20],
+                                    )
+                                    return
+                                log.info(
+                                    "📖 [全章拉取] 启动：book=%s（hex=%s）当前仅 %d 章，"
+                                    "主动 POST /web/book/chapterInfos 拉取全书章节...",
+                                    bid[:20], hex_id[:20], len(existing),
+                                )
+                                ok = self.refresh_chapters_for_book(bid)
+                                if not ok:
+                                    log.warning(
+                                        "📖 [全章拉取] 失败：book=%s，将退回当前 1 章 + 三体固定池兜底",
+                                        bid[:20],
+                                    )
+                                    return
+                                # 拉取成功后，立即把全量章节合并到 _captured_chapter_ids[hex_id]
+                                # 这样 _build_payload 的 JS 路径才能拿到 >=3 章
+                                bucket = self.scoped_chapters.get(bid) if isinstance(self.scoped_chapters, dict) else None
+                                if isinstance(bucket, dict):
+                                    uids = [str(u) for u in (bucket.get("uids") or [])]
+                                    if uids:
+                                        # 同时写 hex 和 numeric key
+                                        with self._book_lock:
+                                            for k in (hex_id, bid):
+                                                cur = list(self._captured_chapter_ids.get(k, []))
+                                                for u in uids:
+                                                    if u not in cur:
+                                                        cur.append(u)
+                                                self._captured_chapter_ids[k] = cur
+                                        log.info(
+                                            "📖 [全章拉取] 成功：book=%s 共 %d 章已合并到捕获池"
+                                            "（hex=%s 池=%d，numeric=%s 池=%d）",
+                                            bid[:20], len(uids),
+                                            hex_id[:20], len(self._captured_chapter_ids.get(hex_id, [])),
+                                            bid[:20], len(self._captured_chapter_ids.get(bid, [])),
+                                        )
+                            except Exception as exc:  # noqa: BLE001
+                                log.warning("📖 [全章拉取] 异常：book=%s err=%s", bid_for_refresh[:20], exc)
+                        threading.Thread(target=_fetch_full_chapters, daemon=True).start()
+
         # 2) /web/book/chapterInfos → 解析请求体中的 bookIds 占位，并尝试从响应体（payload.data）
         #    提取 chapterUid 填充 _captured_chapter_ids（以实际 web 浏览器响应为准）
         elif "/web/book/chapterInfos" in url_lower:
@@ -1503,6 +1588,16 @@ class WeReadApi(QObject):
     def get_captured_read_template(self) -> dict | None:
         """获取最近一次捕获的 read 请求模板。"""
         return self._last_captured_read.copy() if self._last_captured_read else None
+
+    def set_success_count(self, count: int) -> None:
+        """P1-4 辅助：scheduler 侧把当前 plan.success_count 同步给 API（用于换书时机判定）。"""
+        with self._success_count_lock:
+            self._success_count_shared = max(0, int(count or 0))
+
+    def get_success_count(self) -> int:
+        """返回最近一次 set_success_count 同步的值（thread-safe）。"""
+        with self._success_count_lock:
+            return int(self._success_count_shared)
 
     def resolve_book_id_to_numeric(self, book_id: str) -> str:
         """将任意 book_id（hex 或 numeric）解析为 numeric。
@@ -2045,106 +2140,293 @@ class WeReadApi(QObject):
             log.warning("synckey 修复请求失败：%s", exc)
 
     # -------- payload 构造 --------
-    def _build_payload(self, *, last_time: int | None = None) -> dict[str, Any]:
+    def _roll_next_book_switch_if_needed(self, reading_cfg: dict | None) -> None:
+        """P1-4：初始化/重新随机下一次换书的阈值（成功次数达到就换书 b）。"""
+        if self._next_book_switch is not None:
+            return
+        cfg = reading_cfg or (self._cfg.get("reading", {}) if self._cfg else {}) or {}
+        try:
+            mn = int(cfg.get("switch_book_every_min", 20) or 0)
+            mx = int(cfg.get("switch_book_every_max", 40) or 0)
+        except (ValueError, TypeError):
+            mn, mx = 0, 0
+        if mn <= 0:
+            # 0 = 用户关闭换书
+            self._next_book_switch = 1_000_000_000  # 永不触发（等价于关闭）
+            return
+        if mx < mn:
+            mx = mn
+        # 下次换书点：在 [mn, mx] 随机取一次
+        self._next_book_switch = random.randint(mn, mx)
+        log.info("📚 下次换书阈值：success_count ≥ %d（%d~%d 区间）", self._next_book_switch, mn, mx)
+
+    def _should_switch_book_now(self, success_count: int) -> bool:
+        """判断是否应该换书（达到阈值），如果阈值未初始化则自动首次初始化。"""
+        self._roll_next_book_switch_if_needed(None)
+        if self._next_book_switch is None:
+            return False
+        return int(success_count or 0) >= self._next_book_switch
+
+    # -------- CDP 模式：书架/章节池获取 --------
+    def fetch_bookshelf(self, *, timeout: int = 15) -> list[dict]:
+        """调 /web/shelf/booklist 获取完整书架列表（CDP 模式专用）。
+
+        内部走 _augment_headers_baggage() + self._lock + Session，
+        和 refresh_current_book_from_shelf 使用相同的调用路径。
+        """
+        try:
+            self._augment_headers_baggage()
+            with self._lock:
+                resp = self._session.get(
+                    BOOKLIST_URL,
+                    headers={"Referer": "https://weread.qq.com/web/shelf"},
+                    timeout=timeout,
+                )
+            log.info("fetch_bookshelf HTTP=%d body_len=%d", resp.status_code, len(resp.text))
+            if resp.status_code != 200:
+                log.warning("fetch_bookshelf 非 200：%s", resp.text[:200])
+                return []
+            try:
+                data = resp.json()
+            except ValueError:
+                log.warning("fetch_bookshelf 非 JSON：%s", resp.text[:200])
+                return []
+            books: list[dict] = []
+            if isinstance(data, list):
+                books = [b for b in data if isinstance(b, dict)]
+            elif isinstance(data, dict):
+                for k in ("books", "book", "booklist", "shelfBookIds", "data"):
+                    v = data.get(k)
+                    if isinstance(v, list):
+                        books = [b for b in v if isinstance(b, dict)]
+                        if books:
+                            log.info("fetch_bookshelf 从 '%s' 字段解析到 %d 本", k, len(books))
+                            break
+            # 过滤有效书籍（有 bookId）
+            valid = [b for b in books
+                     if str(b.get("bookId") or b.get("book_id") or "").strip()]
+            log.info("fetch_bookshelf 解析完成：%d 本有效书籍", len(valid))
+            return valid
+        except Exception as exc:
+            log.error("fetch_bookshelf 异常：%s", exc)
+            return []
+
+    def _get_shelf_books(self) -> list[dict]:
+        """从 config 获取 CDP 登录时保存的用户书架。"""
+        try:
+            books = self._cfg.get("reading.shelf_books") or []
+            if isinstance(books, list):
+                return [b for b in books if isinstance(b, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _get_shelf_book_ids(self) -> list[str]:
+        """获取用户书架的 bookId 列表。"""
+        ids = []
+        for b in self._get_shelf_books():
+            bid = str(b.get("bookId") or b.get("book_id") or "").strip()
+            if bid:
+                ids.append(bid)
+        return ids
+
+    def _get_chapter_pool_for_book(self, book_id: str) -> list[str]:
+        """从 config 获取指定书籍的章节池。"""
+        try:
+            pools = self._cfg.get("reading.chapter_pools") or {}
+            if isinstance(pools, dict):
+                chs = pools.get(book_id, [])
+                if isinstance(chs, list):
+                    return [str(c) for c in chs if c]
+        except Exception:
+            pass
+        return []
+
+    def _consume_book_switch(self, success_count: int = 0) -> str:
+        """执行换书：优先从用户书架选书，无书架则回退到 DEFAULT_BOOKS。"""
+        # CDP 模式：优先使用用户书架
+        shelf_ids = self._get_shelf_book_ids()
+        if shelf_ids:
+            # 排除最近使用的书籍
+            recent = list(getattr(self, "_recent_book_ids", [])[-3:])
+            candidates = [b for b in shelf_ids if b not in recent]
+            if not candidates:
+                candidates = list(shelf_ids)
+            last = getattr(self, "_last_b_override", "") or ""
+            if len(candidates) > 1 and last in candidates:
+                pool = [b for b in candidates if b != last]
+                chosen = random.choice(pool) if pool else random.choice(candidates)
+            else:
+                chosen = random.choice(candidates)
+        else:
+            # 回退：使用 DEFAULT_BOOKS
+            candidates = list(DEFAULT_BOOKS)
+            last = getattr(self, "_last_b_override", "") or ""
+            if len(candidates) > 1 and last in candidates:
+                pool = [b for b in candidates if b != last]
+                chosen = random.choice(pool) if pool else random.choice(candidates)
+            else:
+                chosen = random.choice(candidates)
+        # 记录最近使用的书籍 ID
+        recent_ids = list(getattr(self, "_recent_book_ids", []))
+        recent_ids.append(chosen)
+        if len(recent_ids) > 10:
+            recent_ids = recent_ids[-10:]
+        self._recent_book_ids = recent_ids
+        self._last_b_override = chosen  # type: ignore[attr-defined]
+        # 重新随机下一个换书阈值（相对当前 success_count）
+        cfg = self._cfg.get("reading", {}) if self._cfg else {}
+        cfg = cfg or {}
+        try:
+            mn = int(cfg.get("switch_book_every_min", 20) or 0)
+            mx = int(cfg.get("switch_book_every_max", 40) or 0)
+        except (ValueError, TypeError):
+            mn, mx = 20, 40
+        if mn <= 0:
+            self._next_book_switch = 1_000_000_000
+        else:
+            if mx < mn:
+                mx = mn
+            # 新阈值 = 当前成功次数 + [mn, mx] 随机
+            self._next_book_switch = int(success_count or 0) + random.randint(mn, mx)
+        log.info(
+            "📚 换书：%s → %s（下次换书点：success_count≥%d）",
+            (last[:16] + "...") if last else "(初次)",
+            chosen[:16] + "...",
+            self._next_book_switch,
+        )
+        return chosen
+
+    def _enforce_chapter_rotation(self, chapter_uid: str, available_pool: list[str]) -> str:
+        """P1-5：同一章 c 超过 same_chapter_max_reuse（默认 5）次强制换 c。"""
+        cfg = self._cfg.get("reading", {}) if self._cfg else {}
+        cfg = cfg or {}
+        try:
+            max_reuse = int(cfg.get("same_chapter_max_reuse", 5) or 0)
+        except (ValueError, TypeError):
+            max_reuse = 5
+        if max_reuse <= 0:
+            # 0 = 关闭
+            self._last_c_used = chapter_uid
+            return chapter_uid
+        # 统计 streak：同一章连续出现多少次
+        if chapter_uid == self._last_c_used:
+            self._same_c_streak[chapter_uid] = self._same_c_streak.get(chapter_uid, 0) + 1
+        else:
+            # 换了章，上一章的 streak 重置（可选地清零当前章的记忆，避免越用越大）
+            self._same_c_streak = {chapter_uid: 1}
+            self._last_c_used = chapter_uid
+            return chapter_uid
+        streak = self._same_c_streak.get(chapter_uid, 1)
+        if streak < max_reuse or len(available_pool) <= 1:
+            return chapter_uid
+        # 达到阈值，从 pool 中挑一个 != current 的
+        others = [c for c in available_pool if c != chapter_uid]
+        if not others:
+            return chapter_uid
+        new_c = random.choice(others)
+        self._same_c_streak = {new_c: 1}
+        self._last_c_used = new_c
+        log.info("📖 同一章使用 %d 次超过阈值 %d，强制换章节：%s → %s",
+                 streak, max_reuse, chapter_uid[:16] + "...", new_c[:16] + "...")
+        return new_c
+
+    def _build_payload(self, *, last_time: int | None = None, success_count_hint: int = 0) -> dict[str, Any]:
         """按官方字段格式构造单次阅读上报 payload。
 
-        方案A（参考 findmover/wxread）：
-        - 默认走三体固定池：b = DEFAULT_BOOKS[12]（三体）, c = random.choice(DEFAULT_CHAPTERS)
-        - 当 JS 捕获到完整 /web/book/read 模板（_last_captured_read 非空，含 b 和 c）
-          且有足够章节池（>=3 章）时，走 JS 捕获路径（真实书+真实章节）
-        - 否则一律走三体固定池（不校验 b 和 c 的从属关系，服务端只验签名）
+        CDP 模式改造：
+        - 优先使用用户书架（CDP 登录获取）和章节池
+        - 无书架时回退到 DEFAULT_BOOKS
+        - 章节选择优先使用章节池，回退到 DEFAULT_CHAPTERS
 
-        删除的旧逻辑：scoped_chapters / refresh_chapters_for_book / fail-fast。
-        服务端验证规则：只要 sg = SHA256(ts+rn+KEY) 和 s = cal_hash(encode_data(data)) 正确即可。
+        success_count_hint: scheduler 成功计数，用于换书时机判定。
         """
-        # ===== 路径 1：JS 捕获到完整模板 + 章节池充足 → 用真实数据 =====
-        captured_template = self._last_captured_read
-        template_book_id = str(captured_template.get("b", "")).strip() if captured_template else ""
-        captured_chapters = self.get_captured_chapter_ids(template_book_id) if template_book_id else []
+        # 解析最终 success_count_hint（0 → 用外部共享值）
+        try:
+            hint = int(success_count_hint or 0)
+        except (ValueError, TypeError):
+            hint = 0
+        if hint <= 0:
+            hint = int(self.get_success_count())
+        success_count_hint = hint  # noqa: PLW0632  type narrowing
+        # 预初始化换书阈值（只在首次调用初始化，之后不会重置）
+        self._roll_next_book_switch_if_needed(None)
 
-        if captured_template and template_book_id and len(captured_chapters) >= 1:
-            log.info(
-                "_build_payload: 走 JS 捕获路径（book=%s, %d 章, last_captured_c=%s）",
-                template_book_id[:20], len(captured_chapters),
-                str(captured_template.get("c", ""))[:20],
-            )
-            last_c = str(captured_template.get("c", "")).strip()
-            available = [c for c in captured_chapters if c != last_c]
-            if not available:
-                available = captured_chapters
-            new_c = random.choice(available)
-
-            now = int(time.time())
-            ts = int(now * 1000) + random.randint(0, 999)
-            rn = random.randint(0, 9999)
-            rt = 30 if last_time is None else max(20, min(90, now - last_time))
-
-            data: dict[str, Any] = {
-                "appId": captured_template.get("appId", DEFAULT_APP_ID),
-                "b": template_book_id,
-                "c": new_c,
-                "ci": captured_template.get("ci", random.randint(1, 200)),
-                "co": captured_template.get("co", random.randint(100, 800)),
-                "sm": captured_template.get("sm", random.choice(DEFAULT_SM_SNIPPETS)),
-                "pr": captured_template.get("pr", random.randint(1, 200)),
-                "rt": rt,
-                "ts": ts,
-                "rn": rn,
-                "sg": hashlib.sha256(f"{ts}{rn}{KEY}".encode()).hexdigest(),
-                "ct": now,
-                "ps": captured_template.get("ps", DEFAULT_PS),
-                "pc": captured_template.get("pc", DEFAULT_PC),
-            }
-            data["s"] = cal_hash(encode_data(data))
-            self._last_read_ts = int(now)
-            return data
-
-        # ===== 路径 2：默认走三体固定池（参考 findmover/wxread main.py）=====
-        # 服务端不校验 b 和 c 的从属关系，只校验签名 s 和 sg 是否正确。
-        # b 固定为三体，c 从 DEFAULT_CHAPTERS（三体章节池）随机选取。
-        if captured_template and not template_book_id:
-            log.debug("_build_payload: 有捕获模板但无 b 字段，走三体固定池")
-        elif captured_template and len(captured_chapters) < 1:
-            log.info(
-                "_build_payload: JS 捕获章节为空，走三体固定池（book=%s）",
-                template_book_id[:20] if template_book_id else "(空)"
-            )
+        # ===== 获取当前要使用的书籍 =====
+        shelf_ids = self._get_shelf_book_ids()
+        if shelf_ids:
+            # CDP 模式：从书架选书
+            if self._should_switch_book_now(success_count_hint):
+                b_used = self._consume_book_switch(int(success_count_hint))
+            else:
+                if getattr(self, "_last_b_override", ""):
+                    b_used = self._last_b_override
+                else:
+                    b_used = random.choice(shelf_ids)
+                    self._last_b_override = b_used
         else:
-            log.debug("_build_payload: 无 JS 捕获数据，走三体固定池")
+            # 回退：使用 DEFAULT_BOOKS
+            if self._should_switch_book_now(success_count_hint):
+                b_used = self._consume_book_switch(int(success_count_hint))
+            else:
+                if getattr(self, "_last_b_override", ""):
+                    b_used = self._last_b_override
+                else:
+                    b_used = DEFAULT_BOOK_ID
+                    self._last_b_override = b_used
+        if not b_used:
+            b_used = DEFAULT_BOOK_ID
 
+        # ===== 获取章节池（优先 CDP 章节池，回退到 DEFAULT_CHAPTERS）=====
+        chapter_pool = self._get_chapter_pool_for_book(str(b_used))
+        if not chapter_pool:
+            chapter_pool = list(DEFAULT_CHAPTERS)
+        pool_c = list(chapter_pool)
+
+        # 选择章节：排除最近使用的，避免连续重复
+        last_c = getattr(self, "_last_c_used", "") or ""
+        if last_c and last_c in pool_c and len(pool_c) > 1:
+            others_c = [c for c in pool_c if c != last_c]
+            new_c = random.choice(others_c) if others_c else random.choice(pool_c)
+        else:
+            new_c = random.choice(pool_c)
+        # P1-5: 同章超限强制换
+        new_c = self._enforce_chapter_rotation(new_c, pool_c)
+
+        # ===== 构造 payload =====
         now = int(time.time())
         ts = int(now * 1000) + random.randint(0, 999)
         rn = random.randint(0, 9999)
-        rt = 30 if last_time is None else max(20, min(90, now - last_time))
-
-        # 若有捕获模板，复用其 appId/ps/pc/sm/ci/co/pr（仍是真实书数据，但 b/c 用三体固定池）
-        # 这样比纯随机更接近真实阅读模式
-        app_id = captured_template.get("appId", DEFAULT_APP_ID) if captured_template else DEFAULT_APP_ID
-        ps = captured_template.get("ps", DEFAULT_PS) if captured_template else DEFAULT_PS
-        pc = captured_template.get("pc", DEFAULT_PC) if captured_template else DEFAULT_PC
-        sm = captured_template.get("sm", random.choice(DEFAULT_SM_SNIPPETS)) if captured_template else random.choice(DEFAULT_SM_SNIPPETS)
-        ci = captured_template.get("ci", random.randint(1, 200)) if captured_template else random.randint(1, 200)
-        co = captured_template.get("co", random.randint(100, 800)) if captured_template else random.randint(100, 800)
-        pr = captured_template.get("pr", random.randint(1, 200)) if captured_template else random.randint(1, 200)
+        # rt 区间风控：[25, 60] 全区间随机
+        if last_time is None:
+            rt = random.randint(25, 60)
+        else:
+            diff = int(now - last_time)
+            rt = max(25, min(60, diff))
 
         data: dict[str, Any] = {
-            "appId": app_id,
-            "b": DEFAULT_BOOK_ID,  # 三体
-            "c": random.choice(DEFAULT_CHAPTERS),  # 三体章节
-            "ci": ci,
-            "co": co,
-            "sm": sm,
-            "pr": pr,
+            "appId": DEFAULT_APP_ID,
+            "b": b_used,
+            "c": new_c,
+            "ci": random.randint(1, 200),
+            "co": random.randint(100, 800),
+            "sm": random.choice(DEFAULT_SM_SNIPPETS),
+            "pr": random.randint(1, 200),
             "rt": rt,
             "ts": ts,
             "rn": rn,
             "sg": hashlib.sha256(f"{ts}{rn}{KEY}".encode()).hexdigest(),
             "ct": now,
-            "ps": ps,
-            "pc": pc,
+            "ps": DEFAULT_PS,
+            "pc": DEFAULT_PC,
         }
         data["s"] = cal_hash(encode_data(data))
         self._last_read_ts = int(now)
+
+        log.info(
+            "📖 CDP 模式 payload：book=%s chapter=%s rt=%d (success_count=%d)",
+            str(b_used)[:20], str(new_c)[:20], rt, success_count_hint,
+        )
         return data
 
     # -------- 对外：单次阅读上报 --------
@@ -2230,7 +2512,13 @@ class WeReadApi(QObject):
             retry_payload["ts"] = int(now_i * 1000) + random.randint(0, 999)
             retry_payload["rn"] = random.randint(0, 9999)
             retry_payload["ct"] = now_i
-            retry_payload["rt"] = 30
+            # 失败回退 rt 不写死，落在 [25,60] 安全区间（风控建议）
+            # P0-修复：原 28~34 区间太窄，改为 25~60 全区间随机
+            last = int(self._last_read_ts or 0)
+            if last <= 0:
+                retry_payload["rt"] = random.randint(25, 60)
+            else:
+                retry_payload["rt"] = max(25, min(60, now_i - last))
             retry_payload["sg"] = hashlib.sha256(
                 f"{retry_payload['ts']}{retry_payload['rn']}{KEY}".encode()
             ).hexdigest()
@@ -2452,7 +2740,7 @@ class WeReadApi(QObject):
         now = _dt.datetime.now(BEIJING)
         today_bj_00 = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
-        skill_version = str(self._cfg.get("skill.version") or "1.0.4")
+        skill_version = str(self._cfg.get("skill.version") or "1.0.5")
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -2662,7 +2950,7 @@ class WeReadApi(QObject):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        skill_version = str(self._cfg.get("skill.version") or "1.0.4")
+        skill_version = str(self._cfg.get("skill.version") or "1.0.5")
         try:
             r = self._session.post(
                 SKILL_GATEWAY_URL,
@@ -2712,3 +3000,137 @@ class WeReadApi(QObject):
                 log.info("已清空 Skill 阅读统计缓存")
         except Exception as exc:  # noqa: BLE001
             log.warning("清空 Skill 缓存失败：%s", exc)
+
+    # ============================================================
+    # Skill 1.0.5 新增接口
+    # ============================================================
+
+    def _call_skill_api(
+        self, api_name: str, params: dict, *, timeout: int = 10
+    ) -> dict | None:
+        """通用 Skill API 调用方法（1.0.5+ 版本）。
+
+        Args:
+            api_name: API 名称，如 /shelf/sync, /book/chapterinfo
+            params: 业务参数（平铺在 body 顶层）
+            timeout: 请求超时秒数
+
+        Returns:
+            响应数据 dict，或 None 表示失败
+        """
+        api_key = str(self._cfg.get("skill.api_key") or "").strip()
+        if not api_key:
+            log.warning("Skill API 调用失败：API Key 未配置")
+            return None
+
+        skill_version = str(self._cfg.get("skill.version") or "1.0.5")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "api_name": api_name,
+            "skill_version": skill_version,
+        }
+        # 平铺业务参数
+        payload.update(params)
+
+        try:
+            log.info("🔄 Skill %s 请求：%s", api_name, {k: str(v)[:50] for k, v in params.items()})
+            t0 = time.time()
+            r = self._session.post(SKILL_GATEWAY_URL, headers=headers, json=payload, timeout=timeout)
+            elapsed = (time.time() - t0) * 1000
+            log.info("🔄 Skill %s 响应：HTTP=%d time=%.0fms", api_name, r.status_code, elapsed)
+
+            if r.status_code == 499:
+                log.warning("Skill %s 触发 499 限流", api_name)
+                return None
+            if r.status_code == 401 or r.status_code == 403:
+                log.warning("Skill %s 鉴权失败（HTTP %d）", api_name, r.status_code)
+                return None
+
+            r.raise_for_status()
+            data = r.json()
+
+            if isinstance(data, dict) and data.get("errcode", 0) != 0:
+                log.warning("Skill %s 调用失败：errcode=%s msg=%s",
+                            api_name, data.get("errcode"), data.get("errmsg"))
+                return None
+
+            # 检查 upgrade_info
+            if isinstance(data, dict) and "upgrade_info" in data:
+                log.warning("⚠️ Skill 有新版可用：%s", data.get("upgrade_info"))
+
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            log.warning("Skill %s 请求异常：%s", api_name, exc)
+            return None
+
+    def skill_fetch_shelf_sync(self, *, timeout: int = 10) -> list[dict]:
+        """通过 Skill 1.0.5 /shelf/sync 获取完整书架。
+
+        Returns:
+            书籍列表 [{bookId, title, author, ...}]
+        """
+        log.info("📚 通过 Skill /shelf/sync 获取书架...")
+        data = self._call_skill_api("/shelf/sync", {}, timeout=timeout)
+        if not data:
+            return []
+
+        books = data.get("books") or data.get("data") or []
+        if not isinstance(books, list):
+            return []
+
+        # 过滤有效书籍
+        valid = []
+        for b in books:
+            if not isinstance(b, dict):
+                continue
+            bid = str(b.get("bookId") or "").strip()
+            if bid:
+                valid.append(b)
+
+        log.info("📚 Skill /shelf/sync 返回 %d 本有效书籍", len(valid))
+        return valid
+
+    def skill_fetch_chapter_info(self, book_id: str, *, timeout: int = 10) -> list[dict]:
+        """通过 Skill 1.0.5 /book/chapterinfo 获取章节池。
+
+        Args:
+            book_id: 书籍 ID（纯数字）
+
+        Returns:
+            章节列表 [{chapterUid, title, level, wordCount, ...}]
+        """
+        log.info("📖 通过 Skill /book/chapterinfo 获取章节池：bookId=%s", book_id)
+        data = self._call_skill_api(
+            "/book/chapterinfo",
+            {"bookId": book_id},
+            timeout=timeout,
+        )
+        if not data:
+            return []
+
+        chapters = data.get("chapters") or data.get("chapterInfos") or []
+        if not isinstance(chapters, list):
+            return []
+
+        log.info("📖 Skill /book/chapterinfo 返回 %d 个章节", len(chapters))
+        return chapters
+
+    def skill_get_book_progress(self, book_id: str, *, timeout: int = 10) -> dict | None:
+        """通过 Skill 1.0.5 /book/getprogress 获取阅读进度。
+
+        Args:
+            book_id: 书籍 ID（纯数字）
+
+        Returns:
+            进度数据 {chapterUid, percent, readingTime, ...}
+        """
+        log.info("📊 通过 Skill /book/getprogress 获取阅读进度：bookId=%s", book_id)
+        data = self._call_skill_api(
+            "/book/getprogress",
+            {"bookId": book_id},
+            timeout=timeout,
+        )
+        return data

@@ -52,16 +52,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ),
     },
     "reading": {
-        "min_hours": 8,            # 每日最少小时数
-        "max_hours": 10,           # 每日最多小时数
-        "min_interval_sec": 25,    # 单次 /read 请求后等待下限
+        "min_hours": 1.5,          # 每日最少小时数（风控建议：1.5~3h，避免 >6h 单日高危）
+        "max_hours": 3,            # 每日最多小时数（风控建议：>6h 平台开始对超长段打折不计）
+        "min_interval_sec": 30,    # 单次 /read 请求后等待下限（风控建议：30~45s，真人平均翻页节奏）
         "max_interval_sec": 45,    # 单次 /read 请求后等待上限
         "daily_random_hour_start": 0,   # 每天随机开始小时（0-23），0=启用就跑/按计划跑
         "health_check_first_min": 3,    # 调度器启动后首次登录态巡检间隔（分钟）
         "health_check_min": 12,          # 之后每多少分钟一次登录态巡检
+        # ===== 启动随机延迟（机器指纹伪装）=====
+        "startup_delay_min_sec": 30,     # 点击开始后首次阅读前随机等待下限
+        "startup_delay_max_sec": 90,     # 点击开始后首次阅读前随机等待上限
+        # ===== 风控：书籍/章节多样性 =====
+        "switch_book_every_min": 20,     # 阅读多少次后换一本书，0=不换
+        "switch_book_every_max": 40,     # 换书区间上限（在 [min,max] 随机换书点）
+        "same_chapter_max_reuse": 5,     # 同一章节最多连续使用多少次，超过强制换章
+        # ===== CDP 模式：书架跳读配置 =====
+        "shelf_books": [],               # CDP 登录获取的用户书架 [{bookId, title, ...}]
+        "chapter_pools": {},             # CDP 登录获取的章节池 {book_id: [chapter_uid, ...]}
+        "max_shelf_books_for_chapters": 5,  # 章节池构建时取前 N 本书
+        "book_switch_recent_exclude": 3,     # 换书时排除最近 N 本
+        "chapter_switch_recent_exclude": 5,  # 换章时排除最近 N 章
         # 今日目标当天持久化：当天首次启动随机取值后写入，当天多次启动复用，次日重取
         "daily_plan": {"date": "", "target_minutes": 0},
-        # ===== 自动化抓取工作流配置（方案 v7）=====
+        # ===== 自动化抓取工作流配置（保留兼容）=====
         "capture_timeout_sec": 15,        # 单次抓取超时秒数
         "workflow_retry_count": 2,       # 抓取失败重试次数
         "santi_book_url": "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a",
@@ -80,7 +93,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "skill": {
         "api_key": "",                # WEREAD_API_KEY (wrk-xxxxxxxx)，申请：https://weread.qq.com/r/weread-skills
-        "version": "1.0.4",          # Skill 版本号
+        "version": "1.0.5",          # Skill 版本号
         "summary_cache_ttl": 180,    # 阅读统计缓存秒数（默认 3 分钟）
     },
 }

@@ -1,6 +1,7 @@
 # 📖 WxReadAssistant
 
 > 基于 PySide6 的微信读书自动阅读桌面助手（Windows 平台）
+> 通过 CDP (Chrome DevTools Protocol) 扫码登录，配合 Skill 1.0.5 API 获取书架和章节池
 
 ## 功能特性
 
@@ -8,22 +9,45 @@
 
 | 功能 | 说明 |
 |------|------|
-| **扫码登录** | 内嵌浏览器扫码登录，自动提取 Cookie 与 Headers 持久化保存 |
-| **JS 请求劫持** | 注入 `fetch`/`XMLHttpRequest` 捕获真实 `b`/`c` 字段，构造合法阅读请求 |
-| **拦截器智能开关** | 阅读中静默 JS 轮询与注入，避免干扰；空闲时自动恢复捕获 |
-| **每日目标持久化** | 当日首次启动随机取值（如 9h47m），写入 `config.json`，次日自动重取 |
-| **章节池** | 内置 `chapter_cache.json`，按 Cookie 指纹分桶存储，Cookie 失效自动重建 |
-| **Skill 统计** | 对接微信读书 Skill 1.0.4 网关，获取今日/本周/本月/总累计 4 项权威时长 |
+| **CDP 扫码登录** | 通过 Chrome DevTools Protocol 连接本地 Chrome 浏览器扫码登录，自动提取 Cookie |
+| **Skill 1.0.5 API** | 对接微信读书 Skill 网关，获取书架、章节池、阅读统计等 |
+| **书架书籍跳跃阅读** | 在书架中随机切换书籍，避免单一章节重复 |
+| **章节池分桶存储** | 按 bookId 分桶存储章节 UID，避免跨书章节错配 |
+| **每日目标持久化** | 当日首次启动随机取值（如 8-10h），写入 `config.json`，次日自动重取 |
+| **Skill 统计** | 对接微信读书 Skill 1.0.5 网关，获取今日/本周/本月/总累计 4 项权威时长 |
 | **混合完成度检测** | Skill 基线（每 5 分钟/10 次成功刷新）+ 本地累加双保险，精准判断达标 |
-| **自动续期** | `wr_skey` 过期自动调用 `/web/login/renewal` 续命 |
-| **Cookie 失效分级判定** | 3 级判定（HARD/SOFT/OK）：RK/ptcz 缺失 / errCode=-2012 / 302→登录页 → HARD 硬停止+弹窗+禁用按钮；5xx/超时 → SOFT 仅告警继续重试 |
-| **一键清除 Cookie** | 设置页「🗑️ 清除 Cookie」按钮：清除 config/浏览器 profile/章节缓存/Skill 缓存，被占用时标记 `pending_clear` 下次启动彻底清除 |
+| **Cookie 有效性检测** | 简化为 wr_skey 长度检查（≥8 位即有效），不再强制校验 RK/ptcz |
 | **风控规避** | 随机书籍/章节切换、±15% 间隔抖动、每 20 次插入长休息（60-180s） |
-| **详细调试日志** | 3 大验证节点（间隔随机化/完成度检测/章节池持久化）全链路可追踪 |
+| **详细调试日志** | CDP 连接、Cookie 获取、书架拉取、章节池构建等关键节点全链路日志 |
+
+### 🔧 CDP + Skill 技术栈
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    WxReadAssistant                          │
+├─────────────────────────────────────────────────────────────┤
+│  CDP 登录流程                                               │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ 1. 启动 Chrome (--remote-debugging-port=9223)         │  │
+│  │ 2. 程序连接 CDP WebSocket                             │  │
+│  │ 3. 用户在 Chrome 中扫码登录微信读书                   │  │
+│  │ 4. 通过 Network.getCookies 获取 wr_* Cookie          │  │
+│  │ 5. 自动调用 Skill API 获取书架和章节池                │  │
+│  └───────────────────────────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│  Skill 1.0.5 API                                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ /shelf/sync → 获取书架（电子书+专辑+文章收藏）        │  │
+│  │ /book/chapterinfo → 获取指定书籍的章节池              │  │
+│  │ /book/getprogress → 获取阅读进度                      │  │
+│  │ /readdata/detail → 获取阅读统计（日/周/月/年/总）     │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### 📊 阅读统计 4 项
 
-通过微信读书 Skill 网关获取官方统计数据：
+通过微信读书 Skill 1.0.5 网关获取官方统计数据：
 
 - **今日阅读时长** — 当日累计秒数
 - **本周累计时长** — 本周一至今累计
@@ -32,8 +56,8 @@
 
 ### 🔔 推送通知
 
-- **WxPusher** 推送：每日任务开始/完成、Cookie 失效提醒（HARD/SOFT 分级）
-- **4 小时去重**：防止 Cookie 失效时重复轰炸，HARD/SOFT 独立 dedup key 互不覆盖
+- **WxPusher** 推送：每日任务开始/完成、Cookie 失效提醒
+- **Skill 登录成功推送**：CDP 登录成功后推送包含书架统计信息
 - **测试消息**：设置页一键验证推送通道
 
 ### 🖥️ 桌面集成
@@ -41,7 +65,7 @@
 - **系统托盘**：关闭窗口自动最小化到托盘后台运行
 - **开机自启**：注册表免管理员写入
 - **单实例**：QLocalSocket 确保全局唯一，二次启动自动激活
-- **启动入托盘**：配合开机自启，后台静默运行
+- **CDP 登录对话框**：独立弹窗进行扫码登录，不依赖内嵌浏览器
 
 ---
 
@@ -51,6 +75,7 @@
 
 - **操作系统**：Windows 10/11（64 位）
 - **Python**：≥ 3.10
+- **Chrome 浏览器**：最新版（需支持 CDP）
 - **依赖管理**：pip
 
 ### 安装 & 运行
@@ -75,28 +100,46 @@ python main.py
 
 ```powershell
 pip install pyinstaller
+
+# 主程序
 pyinstaller --noconfirm WxReadAssistant.spec
+
+# CDP 测试程序
+pyinstaller --noconfirm CDPStandaloneTest.spec
 ```
 
-打包产物位于 `dist/WxReadAssistant/WxReadAssistant.exe`。
+打包产物：
+- 主程序：`dist/WxReadAssistant/WxReadAssistant.exe`
+- 测试程序：`dist/CDPStandaloneTest.exe`
 
 ---
 
 ## 使用流程
 
-### 第一步：扫码登录
+### 第一步：配置 Skill API Key
 
-1. 启动程序，切换到 **「🔐 扫码登录」** 标签
-2. 内嵌浏览器自动打开 `weread.qq.com`（或点击 **「🏠 打开首页」** 按钮手动跳转）
-3. 手机微信扫码登录，在浏览器中打开任意一本书（如《三体》）
-4. 点击 **「✅ 我已登录完成」**，程序自动：
-   - 提取 Cookie（`wr_skey`、`RK`、`ptcz`、`pac_uid` 等）
-   - 运行 JS 注入劫持 `fetch`/`XMLHttpRequest` 捕获阅读请求
-   - 刷新章节池（`chapter_cache.json`）
+1. 访问 [weread.qq.com/r/weread-skills](https://weread.qq.com/r/weread-skills) 申请 `wrk-` 开头的 API Key
+2. 启动程序，进入 **「⚙️ 设置」** 标签
+3. 在 Skill API Key 输入框中填入 API Key
+
+### 第二步：CDP 扫码登录
+
+1. 启动程序，点击 **「🔐 CDP 登录」** 按钮
+2. 程序会自动打开 Chrome 浏览器（若未启动 CDP 模式会提示手动启动）
+3. **手动启动 CDP 模式**（如自动启动失败）：
+   ```powershell
+   # Chrome CDP 模式启动
+   chrome.exe --remote-debugging-port=9223 --user-data-dir=C:\Temp\ChromeCDP
+   ```
+4. 在 Chrome 中访问 `https://weread.qq.com` 并扫码登录
+5. 登录成功后，点击 **「✅ 已登录完成」**，程序自动：
+   - 通过 CDP 获取 `wr_*` Cookie
+   - 调用 Skill `/shelf/sync` 获取书架
+   - 调用 Skill `/book/chapterinfo` 获取章节池
+   - 持久化存储所有数据
    - 拉取 Skill 阅读统计基线
-   - 若之前处于 HARD 失效锁定状态，自动解锁「▶ 开始阅读」按钮
 
-### 第二步：配置参数
+### 第三步：配置阅读参数
 
 切换到 **「⚙️ 设置」** 标签：
 
@@ -104,76 +147,83 @@ pyinstaller --noconfirm WxReadAssistant.spec
 |--------|------|
 | 每日时长范围 | 如 8-10 小时，每日启动时在区间内随机一个精确时长 |
 | 阅读间隔范围 | 默认 25-45 秒，每次请求间随机 |
+| 换书频率 | 每 20-40 次阅读随机切换书籍 |
 | Skill API Key | 从 [weread.qq.com/r/weread-skills](https://weread.qq.com/r/weread-skills) 申请 |
 | WxPusher SPT | 从 [wxpusher.zjiecode.com](https://wxpusher.zjiecode.com) 申请 |
 | 开机自启 | 勾选后写入注册表 |
-| 启动入托盘 | 配合开机自启使用 |
-| 🗑️ 清除 Cookie | 一键清除所有登录态数据（config/浏览器 profile/章节缓存/Skill 缓存），被占用时标记 `pending_clear`，重启时彻底清除 |
 
-### 第三步：开始阅读
+### 第四步：开始阅读
 
 切换到 **「🟢 状态」** 标签，点击 **「▶ 开始阅读」**。
 
 程序会自动：
-1. 检测登录态有效性
+1. 检测 Cookie 有效性（wr_skey 长度 ≥ 8 即有效）
 2. 从 Skill 网关获取今日基线时长
 3. 在目标区间内随机生成今日目标
-4. 启动阅读循环，按随机间隔上报
-5. 完成目标后通过 WxPusher 推送完成通知
+4. 从书架中随机选择书籍和章节
+5. 启动阅读循环，按随机间隔上报
+6. 完成目标后通过 WxPusher 推送完成通知
 
 ---
 
 ## 架构设计
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    WxReadAssistant                    │
-├─────────────┬───────────────────┬───────────────────┤
-│   main.py   │   PySide6 / Qt     │   app/resources   │
-│  应用入口    │  GUI 框架 + WebEngine │   图标资源       │
-├─────────────┴───────────────────┴───────────────────┤
-│                      app/core                         │
-│  ┌──────────┬──────────┬───────────┬────────────────┐ │
-│  │ config.py │weread_api│scheduler  │  notifier.py   │ │
-│  │ JSON 配置 │ 微信读书  │ 阅读调度  │ WxPusher 推送  │ │
-│  │ 持久化    │ API 封装  │ 随机节奏  │ 异步+重试      │ │
-│  └──────────┴──────────┴───────────┴────────────────┘ │
-├───────────────────────────────────────────────────────┤
-│                      app/ui                           │
-│  ┌──────────┬──────────┬───────────┬────────────────┐ │
-│  │main_window│status_page│login_page │ settings_page   │ │
-│  │ 主窗口+  │ 状态+    │ 扫码+     │ 设置+          │ │
-│  │ 托盘     │ 统计卡   │ JS 劫持   │ Skill 配置      │ │
-│  └──────────┴──────────┴───────────┴────────────────┘ │
-├───────────────────────────────────────────────────────┤
-│                      app/utils                        │
-│  ┌───────────────────┬──────────────────────────────┐ │
-│  │    logger.py      │     autostart.py              │ │
-│  │  日志（文件+控制台） │  开机自启（注册表 Run）       │ │
-│  └───────────────────┴──────────────────────────────┘ │
-└───────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    WxReadAssistant                          │
+├─────────────────────────────────────────────────────────────┤
+│                          app/core                            │
+│  ┌──────────┬──────────┬───────────┬──────────────────────┐│
+│  │ config.py │weread_api│scheduler  │  notifier.py         ││
+│  │ JSON 配置 │ 微信读书  │ 阅读调度  │ WxPusher 推送        ││
+│  │ 持久化    │ API 封装  │ 随机节奏  │ 异步+重试            ││
+│  └──────────┴──────────┴───────────┴──────────────────────┘│
+├─────────────────────────────────────────────────────────────┤
+│                          app/ui                              │
+│  ┌──────────┬──────────┬───────────┬──────────────────────┐│
+│  │main_window│status_page│cdp_login_dialog│settings_page    ││
+│  │ 主窗口+  │ 状态+    │ CDP 登录   │ 设置+               ││
+│  │ 托盘     │ 统计卡   │ 对话框     │ Skill 配置          ││
+│  └──────────┴──────────┴───────────┴──────────────────────┘│
+├─────────────────────────────────────────────────────────────┤
+│                          CDP + Skill                         │
+│  ┌───────────────────────┬──────────────────────────────────┐│
+│  │  CDP Protocol         │  Skill 1.0.5 API                 ││
+│  │  Network.getCookies  │  /shelf/sync                     ││
+│  │  WebSocket 通信       │  /book/chapterinfo               ││
+│  │                       │  /book/getprogress               ││
+│  └───────────────────────┴──────────────────────────────────┘│
+├─────────────────────────────────────────────────────────────┤
+│                          app/utils                           │
+│  ┌───────────────────┬──────────────────────────────────────┐│
+│  │    logger.py      │     autostart.py                      ││
+│  │  日志（文件+控制台） │  开机自启（注册表 Run）               ││
+│  └───────────────────┴──────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 阅读数据流程
+### CDP 数据流程
 
 ```
-内嵌浏览器 (weread.qq.com/web/reader)
+Chrome 浏览器 (weread.qq.com)
     │
-    ├── JS 注入 → 劫持 fetch / XMLHttpRequest
-    │   └── 捕获 POST /web/book/read 请求
-    │       → 提取 b(book hex)、c(chapter hex)、ct、rt 等
+    ├── CDP 连接
+    │   └── WebSocket: ws://127.0.0.1:9223/devtools/page/{id}
     │
-    ├── 章节池获取
-    │   └── POST /web/book/chapterInfos (Cookie 鉴权)
-    │       → 持久化到 chapter_cache.json
-    │       → cookie_fingerprint 绑定生命周期
+    ├── Cookie 获取
+    │   └── Network.getCookies → 获取 wr_* 系列 Cookie
+    │       → wr_skey, wr_vid, wr_rt 等
     │
-    └── Skill 统计基线
-        └── POST /api/agent/gateway (Bearer wrk-*)
-            mode=overall / weekly / monthly
-            → 3 次请求 + 700ms 间隔
-            → readTimes 分桶累加
-            → 提取今日/本周/本月/总累计
+    └── Skill API 调用
+        ├── POST /api/agent/gateway (Bearer wrk-*)
+        │   ├── /shelf/sync → 获取书架（365+ 本书籍）
+        │   ├── /book/chapterinfo → 获取章节池（chapterUid 列表）
+        │   └── /readdata/detail → 获取阅读统计
+        │
+        └── 数据持久化
+            → config.json（Cookie、配置）
+            → chapter_cache.json（章节池，按 bookId 分桶）
+            → wxread-skill-cache.json（Skill 统计缓存）
 ```
 
 ### 完成度计算
@@ -193,116 +243,74 @@ completed_minutes = max(completed_sec, fallback_sec) // 60
 
 **刷新周期**：
 - 启动时立即拉取 Skill 网关基线（今日已读权威秒数）
-- 每 5 分钟 或 每 10 次成功阅读 → 刷新 Skill 基线，`session_accum_sec` 归零（从新基线继续累加）
-- Skill 不可用时降级为本地估算模式，日志标记清晰，不影响运行
+- 每 5 分钟 或 每 10 次成功阅读 → 刷新 Skill 基线，`session_accum_sec` 归零
 
-**每日目标持久化**：
-```
-config.json.reading.daily_plan = {
-    "date": "2026-08-23",        # 日期键
-    "target_minutes": 580,        # 当日随机目标（分钟）
-    "locked": false               # 用户是否手动锁定（锁定不重取）
-}
+### 书籍跳跃阅读
 
-规则：
-  • 首次启动（config 无 daily_plan 或 date ≠ 今日）→ 重取目标 → 写入 → 复用
-  • 当日多次启动 → 命中 date = 今日 → 直接复用，不再随机
-  • 次日启动 → date 不匹配 → 重新随机取值 → 覆盖写入
-  • locked = true → 任何情况不重取，用户锁定的目标值绝对保留
+```python
+# 换书逻辑
+每 20-40 次阅读 → 随机切换书籍
+同一章节连续使用超过 5 次 → 强制切换
+
+# 换章逻辑
+从 chapter_pool[bookId] 中随机选择章节
+优先选择 level >= 3 的正文章节
 ```
 
-### 签名算法
+### Cookie 有效性检测
 
 ```
-sg = SHA256(ts + rn + KEY)    # KEY = "3c5c8717f3daf09iop3423zafeqoi"
-s  = cal_hash(encode_data(payload))  # FNV-1a 变体哈希
+check_session()
+  ├─ wr_skey 存在且长度 ≥ 8 → ✅ 有效
+  └─ wr_skey 缺失或长度不足 → ❌ 失效 → 需重新 CDP 登录
 ```
 
-### Cookie 失效分级判定
-
-```
-ensure_session()
-  ├─ check_session 通过 → OK ✅
-  ├─ RK/ptcz 锚点缺失 → HARD_INVALID 🔴 → stop + 弹窗 + 禁用按钮 + 推送
-  ├─ renewal errCode=-2010/-2012 → HARD_INVALID 🔴 → 同上
-  ├─ renewal HTTP 302→登录页 → HARD_INVALID 🔴 → 同上
-  ├─ renewal 成功但 check_session 仍失败 → HARD_INVALID 🔴 → 同上
-  ├─ renewal 5xx/超时/网络异常 → SOFT_FAIL ⚠️ → 推送+继续循环
-  └─ renewal 无 wr_skey 且无 HARD 特征 → SOFT_FAIL ⚠️ → 同上
-
-HARD_INVALID：
-  • scheduler.stop_event.set() → 阅读循环退出
-  • 「▶ 开始阅读」按钮禁用
-  • 非模态弹窗提示「必须重新扫码登录」
-  • WxPusher 推送（dedup_key=cookie_fail_hard, 4h 去重）
-  • 用户扫码后点「✅ 我已登录完成」→ 自动解锁按钮
-
-SOFT_FAIL：
-  • 阅读循环继续运行（等待网络恢复）
-  • WxPusher 推送（dedup_key=cookie_fail_soft, 4h 去重）
-```
-
-### 清除 Cookie 机制
-
-```
-设置页「🗑️ 清除 Cookie」
-  ├─ 清 config cookies/cookies_raw（成功）
-  ├─ 清 QtWebEngine / wxread-login-profile / WxReadAssistant 子目录
-  │   ├─ 删除成功 ✅
-  │   └─ 被进程占用 → 标记 pending_clear=True → 写入 config
-  ├─ 清 chapter_cache.json / wxread-skill-cache.json
-  └─ 弹窗提示重启
-
-重启应用 → _init_webview → 检查 pending_clear
-  ├─ True → 删除所有 profile 路径（此时浏览器未初始化，无进程占用）
-  │   日志：[browser-sync] pending_clear 已删除：...（39 文件, exists=False）
-  ├─ 清除标记 pending_clear=False
-  └─ saved_ok=False → 全新空 profile → 首页不再显示旧登录态
-```
+**简化说明**：
+- 微信读书 Web 端仅依赖 `wr_*` 系列 Cookie
+- 不再强制校验 RK/ptcz（Web 端不下发这两个 Cookie）
+- 简化为 wr_skey 长度检查
 
 ---
 
 ## 🔍 调试与日志
 
-运行时日志位于 `%APPDATA%\WxReadAssistant\logs\app.log`，3 大核心验证节点全链路打印：
+运行时日志位于 `%APPDATA%\WxReadAssistant\logs\app.log`，关键节点全链路打印：
 
-### 📏 验证节点 1：阅读间隔随机化
-
-```
-📏 阅读间隔：间隔=25~45s | 基础=32.4s | 抖动×0.93 | 失败冷却+47s → 最终=77.1s
-☕ 每 20 次长休息：+112s（下一轮 ≈ 145.3s）
-```
-
-包含字段：范围、基础值、抖动系数、失败冷却/长休息额外值、最终等待秒数。
-
-### 📊 验证节点 2：Skill 混合完成度检测
+### CDP 连接日志
 
 ```
-🔄 _fetch_skill_baseline 返回：today_seconds=20072 source=skill_gateway
-✅ Skill 统计完整：今日=20072s 本周=35640s 本月=86400s 总累计=1209600s
-📊 Skill 基线刷新完成：20072s → 20160s（Δ=+88），本次累加归零
-📊 完成度详情：35/502 分钟 (6%) | Skill基线=20160s 本次累加=1500s 本地估算=17min
-🎯 完成度检查：502/502 分钟（已达标）Skill基线=21600s 本地累加=2400s
+[CDP] 尝试连接 CDP 端口 9223...
+[CDP] 端口已就绪（第 1 次尝试）
+[CDP] 获取到 1 个 targets
+[CDP]   - type=page title=微信读书
+[CDP] 连接 WebSocket: ws://127.0.0.1:9223/devtools/page/...
+[CDP] ✅ 连接成功：页面标题=微信读书
 ```
 
-包含字段：基线获取结果、4 项统计值、刷新前后差值（Δ）、完成度明细百分比、停止时最终报告。
-
-### 📂 验证节点 3：章节池持久化
+### Skill API 日志
 
 ```
-🔑 章节池指纹计算：fp=06e499e6...（from_session_cookies=11 keys）
-🔍 指纹比对：disk_fingerprint=06e499... new_fingerprint=06e499... match=True | 磁盘桶数=3
-✅ 章节缓存载入成功：指纹匹配（fp=06e499e6 前8位），共 3 本书 / 156 章节
-💾 章节缓存写盘成功：book_id=842609 books=3 chapters=156 size=2304B
+🔄 Skill /shelf/sync 请求: {}
+🔄 Skill /shelf/sync 响应：HTTP=200 time=510ms
+📚 Skill /shelf/sync 返回 365 本有效书籍
+
+🔄 Skill /book/chapterinfo 请求: {'bookId': '842609'}
+🔄 Skill /book/chapterinfo 响应：HTTP=200 time=140ms
+📖 Skill /book/chapterinfo 返回 31 个章节
 ```
 
-包含字段：Cookie 指纹来源和长度、磁盘/内存指纹匹配结果、书数和章节数、写盘字节大小。
-
-### ✅ read_once 成功/失败日志
+### 书架与章节池日志
 
 ```
-✅ read_once 成功：succ=1 synckey=abc123 b=677321c0... c=k92c3210... rt=30
-⚠️ read_once 最终空 body：HTTP=200 payload(b=677321c0... c=k92c3210...) body_keys=[]
+📚 共提取到 365 本书籍：
+  - 祈祷落幕时 (bookId=842609)
+  - 金蚕往事全集（1—14）(bookId=35821223)
+  ...
+
+📖 书籍「祈祷落幕时」章节池：31 个章节
+  - chapterUid=1, level=1, title=封面
+  - chapterUid=33, level=1, title=1
+  ...
 ```
 
 ---
@@ -313,35 +321,44 @@ SOFT_FAIL：
 wxread/
 ├── main.py                     # 应用入口（单例+托盘）
 ├── requirements.txt            # Python 依赖
-├── WxReadAssistant.spec        # PyInstaller 打包配置
+├── WxReadAssistant.spec        # PyInstaller 打包配置（主程序）
+├── CDPStandaloneTest.spec      # PyInstaller 打包配置（测试程序）
+├── cdp_test_standalone.py      # CDP 独立测试程序
 ├── README.md                   # 本文件
+├── weread_skill_latest/        # Skill 1.0.5 文档
+│   └── weread-skills/
+│       ├── SKILL.md
+│       ├── search.md
+│       ├── book.md
+│       ├── shelf.md
+│       ├── readdata.md
+│       ├── notes.md
+│       ├── review.md
+│       └── discover.md
 ├── app/
 │   ├── __init__.py
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py           # 配置管理（APPDATA 持久化）
-│   │   ├── weread_api.py       # 微信读书 API（签名/续期/阅读上报）
+│   │   ├── weread_api.py       # 微信读书 API（Skill 1.0.5 + Cookie）
 │   │   ├── scheduler.py        # 阅读调度（随机时长/间隔/完成检测）
 │   │   └── notifier.py         # WxPusher 推送
 │   ├── ui/
 │   │   ├── __init__.py
-│   │   ├── main_window.py      # 主窗口（三标签页+系统托盘）
+│   │   ├── main_window.py      # 主窗口（状态页+设置页）
 │   │   ├── status_page.py      # 状态页（进度+统计卡+日志）
-│   │   ├── login_page.py       # 登录页（内嵌浏览器+JS劫持）
+│   │   ├── cdp_login_dialog.py # CDP 登录对话框（独立弹窗）
 │   │   ├── settings_page.py    # 设置页（时长/推送/Skill/自启）
 │   │   └── styles.py           # 全局 QSS
 │   ├── utils/
 │   │   ├── __init__.py
 │   │   ├── logger.py           # 日志（文件+UI 信号）
-│   │   └── autostart.py       # 开机自启
+│   │   └── autostart.py        # 开机自启
 │   └── resources/
 │       └── app.ico             # 应用图标
-└── _weread_skills_104/         # Skill 1.0.4 文档
-    └── weread-skills/
-        ├── SKILL.md
-        ├── readdata.md
-        ├── shelf.md
-        └── ...
+└── dist/
+    ├── WxReadAssistant/        # 主程序打包产物
+    └── CDPStandaloneTest.exe   # 测试程序打包产物
 ```
 
 ---
@@ -354,11 +371,10 @@ wxread/
 
 | 文件 | 说明 |
 |------|------|
-| `config.json` | 用户配置（时长/间隔/Skill/推送/pending_clear 等） |
-| `chapter_cache.json` | 章节池缓存（Cookie 指纹绑定） |
+| `config.json` | 用户配置（Cookie/Skill/推送/阅读参数等） |
+| `chapter_cache.json` | 章节池缓存（按 bookId 分桶） |
 | `wxread-skill-cache.json` | Skill 阅读统计缓存（TTL 180s） |
 | `logs/app.log` | 运行日志（按天滚动，保留 14 天） |
-| `QtWebEngine/` 或 `WxReadAssistant/` | Qt WebEngine 浏览器 profile（Cookie/LocalStorage） |
 
 ### 关键配置项
 
@@ -368,25 +384,64 @@ wxread/
     "min_hours": 8,
     "max_hours": 10,
     "min_interval_sec": 25,
-    "max_interval_sec": 45
+    "max_interval_sec": 45,
+    "switch_book_every_min": 20,
+    "switch_book_every_max": 40
   },
   "skill": {
     "api_key": "wrk-xxxxxxxxxxxxxxxx",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "summary_cache_ttl": 180
   },
   "push": {
     "wxpusher_spt": "SPT_xxxxxxxxxxxx",
     "notify_cookie_fail": true,
-    "notify_daily_done": true
+    "notify_daily_done": true,
+    "notify_login_success": true
   },
   "app": {
     "auto_start": false,
-    "start_minimized": false,
-    "pending_clear": false
+    "start_minimized": false
   }
 }
 ```
+
+---
+
+## 测试程序
+
+`cdp_test_standalone.py` 是独立的 CDP 测试程序，用于调试和验证 CDP 连接、Cookie 获取、Skill API 调用等功能。
+
+### 功能按钮
+
+| 按钮 | 功能 |
+|------|------|
+| 🔌 连接 CDP | 连接本地 Chrome CDP 端口 |
+| 🍪 获取 Cookie | 通过 CDP Network.getCookies 获取 Cookie |
+| 📚 Skill 书架 | 调用 Skill `/shelf/sync` 获取书架 |
+| 📖 Skill 章节池 | 调用 Skill `/book/chapterinfo` 获取章节池 |
+| 🎯 DOM 提取书架 | 从页面 DOM 解析书籍链接 |
+| 🎯 DOM 提取章节 | 从页面 DOM 解析章节信息 |
+| 🔍 页面深度分析 | 分析页面结构、脚本、API 端点等 |
+| 💾 保存数据 | 保存获取的所有数据到本地文件 |
+| 🔄 恢复按钮 | 强制恢复所有按钮到可用状态 |
+
+### 使用方法
+
+```powershell
+# 运行测试程序
+python cdp_test_standalone.py
+
+# 或运行打包后的 EXE
+dist/CDPStandaloneTest.exe
+```
+
+测试流程：
+1. 启动 Chrome CDP 模式
+2. 点击 **「🔌 连接 CDP」**
+3. 在 Skill API Key 输入框填入 `wrk-` 开头的 Key
+4. 点击 **「📚 Skill 书架」** 获取书架
+5. 点击 **「📖 Skill 章节池」** 获取章节池
 
 ---
 
@@ -394,11 +449,11 @@ wxread/
 
 > ⚠️ **本项目仅供学习交流，自动化行为可能触发风控**
 
-1. **签名风险**：微信读书可能更新 `sg`/`s` 签名算法，届时需同步更新
-2. **频率风险**：过于频繁的请求可能导致账号被限制
-3. **Cookie 过期**：`wr_skey` 有效期有限，需配合自动续期
-4. **IP 风险**：长时间固定 IP 可能触发风控，建议配合代理使用
-5. **Skill Key**：`wrk-*` 开头的 API Key 需妥善保管，切勿提交到代码仓库
+1. **频率风险**：过于频繁的请求可能导致账号被限制
+2. **Cookie 过期**：`wr_skey` 有效期有限，需定期重新 CDP 登录
+3. **IP 风险**：长时间固定 IP 可能触发风控，建议配合代理使用
+4. **Skill Key**：`wrk-*` 开头的 API Key 需妥善保管，切勿提交到代码仓库
+5. **Chrome 版本**：建议使用最新版 Chrome，确保 CDP 协议兼容性
 
 ---
 
@@ -408,16 +463,18 @@ wxread/
 |------|------|------|
 | Python | ≥ 3.10 | 主语言 |
 | PySide6 | ≥ 6.7 | Qt 官方 Python 绑定 |
-| QtWebEngine | ≥ 6.7 | 内嵌浏览器（Chromium 内核） |
-| requests | ≥ 2.32 | HTTP 请求 |
+| Chrome | 最新版 | CDP 浏览器载体 |
+| websocket-client | ≥ 1.6 | CDP WebSocket 通信 |
+| requests | ≥ 2.32 | HTTP 请求（Skill API） |
 | PyInstaller | ≥ 6.0 | EXE 打包 |
 
 ---
 
 ## 参考项目
 
-- [findmover/wxread](https://github.com/findmover/wxread) — 微信读书刷时长脚本（核心签名算法来源）
-- [微信读书 Skill 1.0.4](https://weread.qq.com/r/weread-skills) — 官方 Skill API 文档
+- [findmover/wxread](https://github.com/findmover/wxread) — 微信读书刷时长脚本
+- [微信读书 Skill](https://weread.qq.com/r/weread-skills) — 官方 Skill API（当前版本 1.0.5）
+- [WeReadX](https://github.com/aprpure/wereadx) — 微信读书 Web 接口封装参考
 
 ## License
 
