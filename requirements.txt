@@ -3,4 +3,5 @@ PySide6-Addons>=6.7
 PySide6-Essentials>=6.7
 requests>=2.32.3
 urllib3>=2.2.3
+websocket-client>=1.7.0
 pyinstaller>=6.0

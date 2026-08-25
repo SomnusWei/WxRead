@@ -102,13 +102,6 @@ QPushButton:pressed { background: #d6deee; }
 QPushButton:disabled { background: #eef2f8; color: #b5bccf; }
 
 /* ============ 输入框 ============ */
-/* NOTE: settings_page.py sets MORE SPECIFIC rules per groupbox.  These
-   globals intentionally carry ZERO vertical padding on the outer widget
-   (经验 100011018 / 100017565) — padding-top/bottom is the #1 reason a
-   setFixedHeight(36) ends up at min=50/max=36 at 125% DPI because Qt's
-   style engine pads each internal stacked child (lineedit + button
-   frame) separately.  Use 0 vertical padding + setTextMargins() for
-   optical centering instead. */
 QLineEdit, QComboBox, QSpinBox {
     border: 1px solid #dfe4ef;
     border-radius: 6px;
@@ -121,9 +114,6 @@ QLineEdit, QComboBox, QSpinBox {
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
     border: 1px solid #2d6cdf;
 }
-/* 全局 SpinBox 箭头兜底（防止 settings_page.py 未覆盖到的实例也能看到箭头）。
-   原理：QStyle 的 arrow subcontrol 不走文本绘制流程，所以 color= 无效；
-   必须用 border-triangle 构造实心三角才能保证 Windows/Mac 平台一致可见。 */
 QSpinBox::up-button, QSpinBox::down-button {
     width: 22px;
     border: none;
@@ -199,6 +189,22 @@ CardPanel {
     background: #ffffff;
     border: 1px solid #e5eaf2;
     border-radius: 14px;
+}
+
+/* ============ 分组标题 ============ */
+QGroupBox {
+    border: 1px solid #e5eaf2;
+    border-radius: 10px;
+    margin-top: 16px;
+    padding-top: 10px;
+    background: #ffffff;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #2d6cdf;
 }
 """
 

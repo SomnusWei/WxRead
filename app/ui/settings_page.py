@@ -1,34 +1,38 @@
-"""设置页：时长范围、请求间隔范围、WxPusher SPT、开机自启、最小化托盘开关。"""
+"""设置页（v2）。
+
+布局参考方案 3.1：
+  📖 阅读参数 / 🔑 Skill API Key / 📢 WxPusher / 💻 系统设置 / 🧹 数据维护 / 💾 保存
+
+特性：
+  - Skill API Key 验证按钮（QThread 异步）
+  - 清除 Cookie 并重启按钮（QProcess::startDetached）
+  - 所有配置变更即时写入 config.json
+"""
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import threading
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import Qt, Signal, Slot, QMetaObject, Q_ARG
+from PySide6.QtCore import QThread, Signal, Qt, QProcess, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
-    QFormLayout,
-    QFrame,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
+    QFormLayout,
 )
+from PySide6.QtGui import QFont
 
-from app.core.config import ConfigStore, get_app_dir
+from app.core.config import ConfigStore
+from app.core.skill_api import SkillAPI
 from app.core.weread_api import WeReadApi
 from app.utils.autostart import is_autostart_enabled, set_autostart
 from app.utils.logger import get_logger
@@ -36,757 +40,388 @@ from app.utils.logger import get_logger
 log = get_logger(__name__)
 
 
-def _form_spin(min_v: int, max_v: int, value: int, *, suffix: str = "") -> QSpinBox:
-    sb = QSpinBox()
-    sb.setRange(min_v, max_v)
-    sb.setValue(value)
-    if suffix:
-        sb.setSuffix(suffix)
-    # SIZING CONTRACT v2（和 groupbox_qss 完全对齐，避免代码层 & QSS 层互相打架）：
-    #   outer 40px = content 38px + border 1+1
-    #   up/down button = 宽 26 × 高 19（38/2，能容纳 125%/150% DPI 字体基线）
-    sb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    sb.setStyleSheet(
-        "QSpinBox{"
-        "  border:1px solid #dfe4ef; border-radius:6px;"
-        "  padding:0 42px 0 12px;"
-        "  background:#ffffff; color:#1f2a40; selection-background-color:#2d6cdf;"
-        "  selection-color:#ffffff;"
-        "  min-height:38px; max-height:38px;"
-        "}"
-        "QSpinBox:disabled{background:#f6f8fc; color:#9aa4bb;}"
-        "QSpinBox::up-button{"
-        "  subcontrol-origin: content; subcontrol-position: top right;"
-        "  width:26px; height:19px; min-width:26px; min-height:19px;"
-        "  border:none; background:transparent;"
-        "  border-left:1px solid #e5eaf2; border-bottom:1px solid #eef2f8;"
-        "  border-top-right-radius:5px;"
-        "}"
-        "QSpinBox::down-button{"
-        "  subcontrol-origin: content; subcontrol-position: bottom right;"
-        "  width:26px; height:19px; min-width:26px; min-height:19px;"
-        "  border:none; background:transparent;"
-        "  border-left:1px solid #e5eaf2; border-top:1px solid #eef2f8;"
-        "  border-bottom-right-radius:5px;"
-        "}"
-        "QSpinBox::up-button:hover, QSpinBox::down-button:hover{background:#eef2f8;}"
-        "QSpinBox::up-arrow, QSpinBox::down-arrow{"
-        "  width:9px; height:9px; background:transparent;"
-        "}"
-        "QSpinBox::up-arrow{"
-        "  border-left:4px solid transparent;"
-        "  border-right:4px solid transparent;"
-        "  border-bottom:5px solid #4a5675;"
-        "}"
-        "QSpinBox::down-arrow{"
-        "  border-left:4px solid transparent;"
-        "  border-right:4px solid transparent;"
-        "  border-top:5px solid #4a5675;"
-        "}"
-        "QSpinBox::up-button:hover QSpinBox::up-arrow{border-bottom-color:#2d6cdf;}"
-        "QSpinBox::down-button:hover QSpinBox::down-arrow{border-top-color:#2d6cdf;}"
-        "QSpinBox:disabled QSpinBox::up-arrow{border-bottom-color:#b5bccf;}"
-        "QSpinBox:disabled QSpinBox::down-arrow{border-top-color:#b5bccf;}"
-    )
-    # textMargins(2, 2, 0, 0)：让数字在 40px 高的框里更居中（微软雅黑中文基线偏上）
-    try:
-        sb.setTextMargins(2, 2, 0, 0)
-    except Exception:  # PySide6 < 6.3
-        pass
-    sb.setMinimumHeight(40)
-    sb.setMaximumHeight(40)
-    return sb
+class _ApiKeyChecker(QThread):
+    """异步验证 Skill API Key。"""
+    result = Signal(bool, str)
+
+    def __init__(self, skill: SkillAPI) -> None:
+        super().__init__()
+        self._skill = skill
+
+    def run(self) -> None:  # noqa: D401
+        ok, msg = self._skill.verify_api_key()
+        self.result.emit(ok, msg)
 
 
 class SettingsPage(QWidget):
-    settings_changed = Signal()
-    verify_requested = Signal()  # 让主窗口发起"立即检测登录态"
-    _test_push_done = Signal(bool)
+    """设置页。"""
 
     def __init__(
         self,
+        config: ConfigStore,
         api: WeReadApi,
-        config: ConfigStore | None = None,
-        parent: QWidget | None = None,
+        skill: SkillAPI,
+        main_window: "QWidget | None" = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__()
+        self._cfg = config
         self._api = api
-        self._cfg = config or ConfigStore()
-        self._dirty = False
-        self._test_push_done.connect(self._handle_test_push_result)
+        self._skill = skill
+        self._main_window = main_window
+        self._checker: _ApiKeyChecker | None = None
         self._build_ui()
-        self._load_from_config()
+        self._load_values()
 
-    # ----------------- UI -----------------
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        # —— 把内容整体包进 QScrollArea：即使 DPI=125%/150% 也能滚动，
-        #    不会把 SpinBox/CheckBox/按钮硬压缩到尺寸下限导致文字裁切（经验 816112/100017565）
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(16)
 
-        scroll = QScrollArea()
-        scroll.setObjectName("SettingsScrollArea")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "#SettingsScrollArea{background:#f6f8fc;border:none;}"
-            "#SettingsScrollArea > QWidget > QWidget{background:#f6f8fc;}"
-        )
-
-        inner = QWidget()
-        inner.setObjectName("SettingsInner")
-        inner.setStyleSheet("#SettingsInner{background:#f6f8fc;}")
-        root = QVBoxLayout(inner)
-        root.setContentsMargins(24, 20, 24, 28)
-        root.setSpacing(20)
-
-        # Root-level container scope: explicit background + default label color
-        # so child widgets never fall back to the generic "QWidget" wildcard rule.
-        self.setObjectName("SettingsPageRoot")
-        self.setStyleSheet(
-            "#SettingsPageRoot{background:#f6f8fc;}"
-            "#SettingsPageRoot > QLabel{color:#2f3b52;}"
-        )
-        # Size policy: generous vertical minimum so enlarged controls do not
-        # clip at the page level on 100% / 125% / 150% DPI.
-        self.setMinimumHeight(760)
-
-        title = QLabel("⚙️ 个性化设置")
-        title.setStyleSheet("font-size:18px;font-weight:600;color:#2f3b52;")
-        root.addWidget(title)
-
-        # Single canonical QGroupBox style block. Enumerate every child
-        # control that can accept user edits / paint text so they all have
-        # stable, non-negotiable geometry.
-        #
-        # SIZING CONTRACT v2（single source of truth, 经验 100011018 / 100017565 / 649815）：
-        #   所有控件高度统一上调到"能容纳系统 125%/150% DPI 缩放默认字体"的档位：
-        #   QSpinBox/QLineEdit/QComboBox  -> 40px outer (inner 38 + border 1+1)
-        #   QCheckBox                     -> 34px outer, indicator 20x20
-        #   QPushButton inside groupbox   -> 38px outer (inner 36)
-        #   QGroupBox QLabel              -> min-height 28px（避免长 WordWrap 被截断）
-        #   FormLayout margins 24/30/24/24; verticalSpacing=22
-        #   SpinBox buttons 19px high; QComboBox drop-down 38px
-        groupbox_qss = (
-            "QGroupBox{"
-            "  font-weight:600; color:#2f3b52; font-size:13px;"
-            "  border:1px solid #e5eaf2; border-radius:10px;"
-            "  margin-top:14px; background:#ffffff;"
-            "}"
-            "QGroupBox::title{"
-            "  subcontrol-origin: margin; left:12px; padding:0 8px;"
-            "  color:#2f3b52; background:transparent; font-weight:600;"
-            "}"
-            "QGroupBox QLabel{color:#2f3b52; background:#ffffff; min-height:28px; padding:4px 0;}"
-            "QGroupBox QLabel:disabled{color:#9aa4bb; background:#ffffff;}"
-            "QGroupBox QLineEdit, QGroupBox QComboBox{"
-            "  border:1px solid #dfe4ef; border-radius:6px;"
-            "  padding:0 12px; background:#ffffff; color:#1f2a40;"
-            "  selection-background-color:#2d6cdf; selection-color:#ffffff;"
-            "  min-height:38px; max-height:38px;"
-            "}"
-            "QGroupBox QLineEdit:focus, QGroupBox QComboBox:focus{"
-            "  border:1px solid #2d6cdf;"
-            "}"
-            "QGroupBox QLineEdit:disabled, QGroupBox QComboBox:disabled{"
-            "  background:#f6f8fc; color:#8a95a8;"
-            "}"
-            "QGroupBox QLineEdit::placeholder, QGroupBox QLineEdit:placeholder-text{"
-            "  color:#9aa4bb;"
-            "}"
-            "QGroupBox QSpinBox{"
-            "  border:1px solid #dfe4ef; border-radius:6px;"
-            "  padding:0 42px 0 12px; background:#ffffff; color:#1f2a40;"
-            "  selection-background-color:#2d6cdf; selection-color:#ffffff;"
-            "  min-height:38px; max-height:38px;"
-            "}"
-            "QGroupBox QSpinBox:disabled{background:#f6f8fc; color:#9aa4bb;}"
-            "QGroupBox QCheckBox{"
-            "  color:#2f3b52; background:#ffffff; spacing:12px;"
-            "  padding:4px 2px; min-height:30px; max-height:30px;"
-            "}"
-            "QGroupBox QCheckBox::indicator{width:20px; height:20px;}"
-            "QGroupBox QCheckBox:disabled{color:#8a95a8; background:#ffffff;}"
-            "QGroupBox QPushButton{"
-            "  color:#2f3b52; min-height:36px; max-height:36px; padding:0 16px; font-size:12px;"
-            "}"
-            "QGroupBox QPushButton:disabled{color:#8a95a8;}"
-            "QGroupBox QSpinBox::up-button{"
-            "  subcontrol-origin: content; subcontrol-position: top right;"
-            "  width:26px; height:19px; min-width:26px; min-height:19px;"
-            "  border:none; background:transparent;"
-            "  border-left:1px solid #e5eaf2; border-bottom:1px solid #eef2f8;"
-            "  border-top-right-radius:5px;"
-            "}"
-            "QGroupBox QSpinBox::down-button{"
-            "  subcontrol-origin: content; subcontrol-position: bottom right;"
-            "  width:26px; height:19px; min-width:26px; min-height:19px;"
-            "  border:none; background:transparent;"
-            "  border-left:1px solid #e5eaf2; border-top:1px solid #eef2f8;"
-            "  border-bottom-right-radius:5px;"
-            "}"
-            "QGroupBox QSpinBox::up-arrow, QGroupBox QSpinBox::down-arrow{"
-            "  width:9px; height:9px; background:transparent;"
-            "}"
-            "QGroupBox QSpinBox::up-arrow{"
-            "  border-left:4px solid transparent;"
-            "  border-right:4px solid transparent;"
-            "  border-bottom:5px solid #4a5675;"
-            "}"
-            "QGroupBox QSpinBox::down-arrow{"
-            "  border-left:4px solid transparent;"
-            "  border-right:4px solid transparent;"
-            "  border-top:5px solid #4a5675;"
-            "}"
-            "QGroupBox QSpinBox::up-button:hover QGroupBox QSpinBox::up-arrow{border-bottom-color:#2d6cdf;}"
-            "QGroupBox QSpinBox::down-button:hover QGroupBox QSpinBox::down-arrow{border-top-color:#2d6cdf;}"
-            "QGroupBox QSpinBox:disabled QGroupBox QSpinBox::up-arrow{border-bottom-color:#b5bccf;}"
-            "QGroupBox QSpinBox:disabled QGroupBox QSpinBox::down-arrow{border-top-color:#b5bccf;}"
-            "QGroupBox QComboBox::drop-down{width:26px; height:38px; border:none;}"
-        )
-
-        scroll.setWidget(inner)
-        outer.addWidget(scroll)
-
-        # 阅读设置组 -----------------------------------------------------------
-        grp_read = QGroupBox("阅读节奏")
-        grp_read.setStyleSheet(groupbox_qss)
-        form_read = QFormLayout(grp_read)
-        form_read.setContentsMargins(24, 30, 24, 24)
-        form_read.setHorizontalSpacing(14)
-        form_read.setVerticalSpacing(22)
-        form_read.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form_read.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        self._min_hours = _form_spin(0, 23, 8, suffix=" 小时")
-        self._max_hours = _form_spin(1, 24, 10, suffix=" 小时")
-        self._min_hours.valueChanged.connect(self._sync_max_lower_bound)
-        self._max_hours.valueChanged.connect(self._sync_min_upper_bound)
-        form_read.addRow("每日最少阅读时长：", self._min_hours)
-        form_read.addRow("每日最多阅读时长：", self._max_hours)
-
-        self._interval_min = _form_spin(10, 120, 25, suffix=" 秒")
-        self._interval_max = _form_spin(10, 300, 45, suffix=" 秒")
-        self._interval_min.valueChanged.connect(self._sync_interval)
-        self._interval_max.valueChanged.connect(self._sync_interval)
-        form_read.addRow("单页停留下限：", self._interval_min)
-        form_read.addRow("单页停留上限：", self._interval_max)
-
-        # 登录态健康巡检（阅读过程中自动跑 chapter_sync / shelf_sync 并推送告警）
-        tip_health = QLabel("阅读过程中会自动检测登录态；连续失败 2 次时通过 WxPusher 推送。")
-        tip_health.setStyleSheet(
-            "color:#7a879f;font-size:12px;padding:0 0 4px;"
-        )
-        tip_health.setWordWrap(True)
-        form_read.addRow(self._make_form_spacer(), tip_health)
-        self._health_first_min = _form_spin(1, 60, 3, suffix=" 分钟")
-        self._health_min = _form_spin(3, 240, 12, suffix=" 分钟")
-        form_read.addRow("首次巡检延迟：", self._health_first_min)
-        form_read.addRow("之后每隔：", self._health_min)
-
-        # 自动化抓取工作流（方案 v7）
-        tip_workflow = QLabel(
-            "开始阅读会自动跳转三体书 → 注入 JS 抓取真实请求 → 跳目标章节捕获完整 payload。"
-            "超时秒数内若未抓到足够数据则自动重试（次数可配置）。"
-        )
-        tip_workflow.setStyleSheet("color:#7a879f;font-size:12px;padding:0 0 4px;")
-        tip_workflow.setWordWrap(True)
-        form_read.addRow(self._make_form_spacer(), tip_workflow)
-        self._capture_timeout = _form_spin(5, 120, 15, suffix=" 秒")
-        self._workflow_retry = _form_spin(0, 5, 2, suffix=" 次")
-        form_read.addRow("抓取超时秒数：", self._capture_timeout)
-        form_read.addRow("抓取失败重试：", self._workflow_retry)
-
-        root.addWidget(grp_read)
-
-        # 微信读书 Skill（官方阅读统计）-----------------------------------------
-        grp_skill = QGroupBox("微信读书 Skill（官方阅读统计）")
-        grp_skill.setStyleSheet(groupbox_qss)
-        form_skill = QFormLayout(grp_skill)
-        form_skill.setContentsMargins(24, 30, 24, 24)
-        form_skill.setHorizontalSpacing(14)
-        form_skill.setVerticalSpacing(22)
-        form_skill.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form_skill.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        tip_skill = QLabel(
-            "API Key 用于调官方 readdata 接口获取真实阅读时长统计（今日/本周/本月/总累计）。\n"
-            "未填写或验证失败时，状态页阅读统计卡将显示 \"—\"。\n"
-            "申请地址：https://weread.qq.com/r/weread-skills"
-        )
-        tip_skill.setStyleSheet("color:#7a879f;font-size:12px;padding:0 0 4px;")
-        tip_skill.setWordWrap(True)
-        form_skill.addRow(self._make_form_spacer(), tip_skill)
-
-        # API Key 输入框 + 验证按钮
-        self._skill_api_key = QLineEdit()
-        self._skill_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._skill_api_key.setPlaceholderText("wrk-xxxxxxxx")
-        skill_key_row = QHBoxLayout()
-        skill_key_row.addWidget(self._skill_api_key, 1)
-        self._btn_verify_skill = QPushButton("🔍 验证")
-        self._btn_verify_skill.clicked.connect(self._on_verify_skill_key)
-        skill_key_row.addWidget(self._btn_verify_skill)
-        form_skill.addRow("API Key：", skill_key_row)
-
-        # 缓存 TTL
-        self._skill_ttl = _form_spin(60, 1800, 180, suffix=" 秒")
-        form_skill.addRow("缓存有效时长：", self._skill_ttl)
-
-        root.addWidget(grp_skill)
-
-        # 推送 -----------------------------------------------------------------
-        grp_push = QGroupBox("消息推送（WxPusher）")
-        grp_push.setStyleSheet(groupbox_qss)
-        form_push = QFormLayout(grp_push)
-        form_push.setContentsMargins(24, 30, 24, 24)
-        form_push.setHorizontalSpacing(14)
-        form_push.setVerticalSpacing(22)
-        form_push.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form_push.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        self._wxpusher_spt = QLineEdit()
-        self._wxpusher_spt.setPlaceholderText(
-            "请填入 WxPusher 极简推送 SPT（留空则不推送）"
-        )
-        # NOTE: _wxpusher_spt sits INSIDE grp_push, which has just had a
-        #   QGroupBox-level stylesheet applied.  Apply size constraints LAST
-        #   so the groupbox-level QSS can't clobber them via implicit
-        #   sizeHint reflow (经验 100017565 — Qt can re-raise minHeight on
-        #   descendants after parent stylesheet resolves).
-        self._wxpusher_spt.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self._wxpusher_spt.setTextMargins(12, 3, 12, 3)
-        self._wxpusher_spt.setMinimumHeight(40)
-        self._wxpusher_spt.setMaximumHeight(40)
-        form_push.addRow("WxPusher SPT：", self._wxpusher_spt)
-
-        self._chk_cookie_fail = QCheckBox("Cookie 失效时提醒我重新登录")
-        self._chk_daily = QCheckBox("每天任务完成时推送一条结果")
-        self._btn_test_push = QPushButton("发送一条测试消息")
-        self._btn_test_push.setStyleSheet(self._btn_secondary())
-        self._btn_test_push.clicked.connect(self._on_test_push)
-        for w in (self._chk_cookie_fail, self._chk_daily):
-            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            w.setMinimumHeight(34)
-            w.setMaximumHeight(34)
-        self._btn_test_push.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_test_push.setMinimumWidth(140)
-        self._btn_test_push.setMinimumHeight(38)
-        self._btn_test_push.setMaximumHeight(38)
-
-        # Align checkboxes/buttons to the field column (left spacer in label col)
-        form_push.addRow(self._make_form_spacer(), self._chk_cookie_fail)
-        form_push.addRow(self._make_form_spacer(), self._chk_daily)
-        form_push.addRow(self._make_form_spacer(), self._btn_test_push)
-
-        root.addWidget(grp_push)
-
-        # 应用 -----------------------------------------------------------------
-        grp_app = QGroupBox("应用")
-        grp_app.setStyleSheet(groupbox_qss)
-        form_app = QFormLayout(grp_app)
-        form_app.setContentsMargins(24, 30, 24, 24)
-        form_app.setHorizontalSpacing(14)
-        form_app.setVerticalSpacing(22)
-        form_app.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form_app.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        self._chk_autostart = QCheckBox("开机自启动（启动后最小化到右下角任务栏）")
-        self._chk_tray = QCheckBox("点击关闭按钮时最小化到托盘（不退出程序）")
-        self._chk_start_min = QCheckBox("启动后直接最小化到托盘")
-        self._chk_start_max = QCheckBox("启动后窗口默认最大化（推荐）")
-        self._btn_verify = QPushButton("立即检测当前登录态是否有效")
-        self._btn_verify.setStyleSheet(self._btn_secondary())
-        self._btn_verify.clicked.connect(self.verify_requested.emit)
-        for w in (
-            self._chk_autostart, self._chk_tray, self._chk_start_min, self._chk_start_max,
-        ):
-            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            w.setMinimumHeight(34)
-            w.setMaximumHeight(34)
-        self._btn_verify.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_verify.setMinimumWidth(190)
-        self._btn_verify.setMinimumHeight(38)
-        self._btn_verify.setMaximumHeight(38)
-
-        form_app.addRow(self._make_form_spacer(), self._chk_autostart)
-        form_app.addRow(self._make_form_spacer(), self._chk_tray)
-        form_app.addRow(self._make_form_spacer(), self._chk_start_min)
-        form_app.addRow(self._make_form_spacer(), self._chk_start_max)
-        form_app.addRow(self._make_form_spacer(), self._btn_verify)
-
-        root.addWidget(grp_app)
-
-        # ====== 登录管理 ======
-        grp_login = QGroupBox("登录管理")
-        form_login = QFormLayout(grp_login)
-        form_login.setContentsMargins(24, 20, 24, 20)
-        form_login.setVerticalSpacing(14)
-        form_login.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        login_hint = QLabel("如果登录态异常（如 errCode=-2012 登录超时）且无法通过刷新恢复，可清除所有 Cookie 和浏览器缓存后重启应用，重新扫码登录。")
-        login_hint.setWordWrap(True)
-        login_hint.setStyleSheet("color:#8a95a8; font-size:12px; line-height:1.5;")
-        form_login.addRow(self._make_form_spacer(), login_hint)
-
-        self._btn_clear_cookies = QPushButton("🗑️ 清除 Cookie")
-        self._btn_clear_cookies.setStyleSheet(
-            "QPushButton{background:#e25454; color:#ffffff; border:none; border-radius:8px;"
-            "  font-size:14px; font-weight:600; padding:0 24px;}"
-            "QPushButton:hover{background:#cf4848;}"
-            "QPushButton:pressed{background:#b83d3d;}"
-        )
-        self._btn_clear_cookies.clicked.connect(self._on_clear_cookies)
-        self._btn_clear_cookies.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_clear_cookies.setMinimumWidth(200)
-        self._btn_clear_cookies.setMinimumHeight(40)
-        self._btn_clear_cookies.setMaximumHeight(40)
-        form_login.addRow(self._make_form_spacer(), self._btn_clear_cookies)
-
-        root.addWidget(grp_login)
-
-        # 底部按钮
-        root.addStretch(1)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        self._btn_save = QPushButton("💾 保存设置")
-        self._btn_save.setStyleSheet(self._btn_primary())
-        self._btn_save.clicked.connect(self._on_save)
-        self._btn_save.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self._btn_save.setMinimumHeight(38)
-        self._btn_save.setMaximumHeight(38)
-        self._btn_save.setMinimumWidth(160)
-        btn_row.addWidget(self._btn_save)
-        root.addLayout(btn_row)
-
-    @staticmethod
-    def _make_form_spacer() -> QWidget:
-        """Zero-size left column widget used for checkboxes/buttons rows.
-
-        Using a real widget keeps QFormLayout horizontal alignment stable
-        (avoids creating invisible QLabel placeholders that can get their
-        palette hit by wildcard styles on some Qt versions / DPI settings).
-        """
-        w = QWidget()
-        w.setFixedWidth(0)
-        w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        return w
-
-    @staticmethod
-    def _btn_primary() -> str:
-        return (
-            # Primary "保存设置" button sits in root QVBoxLayout outside any
-            # groupbox so it gets its own sizing.  Match the secondary
-            # button outer-height contract (38px) for visual symmetry.
+        title_row = QHBoxLayout()
+        title = QLabel("⚙️ 设置")
+        title.setStyleSheet("font-size:18px;font-weight:700;color:#2f3b52;")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self._btn_back = QPushButton("🏠 返回主界面")
+        self._btn_back.setStyleSheet(
             "QPushButton{background:#2d6cdf;color:#fff;border:none;border-radius:8px;"
-            "padding:0 20px;font-size:13px;font-weight:600;"
-            "min-height:38px;max-height:38px;}"
-            "QPushButton:hover{background:#265bc0;}"
+            "padding:6px 16px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#2257b8;}"
         )
+        self._btn_back.clicked.connect(self._on_back_to_main)
+        title_row.addWidget(self._btn_back)
+        root.addLayout(title_row)
 
-    @staticmethod
-    def _btn_secondary() -> str:
-        return (
-            # Sizing contract v2：outer 38 = inner 36 (no border here)
-            "QPushButton{"
-            "background:#eef2f8;color:#2f3b52;border:none;border-radius:8px;"
-            "padding:0 14px;font-size:12px;"
-            "min-height:38px;max-height:38px;"
-            "}"
-            "QPushButton:hover{background:#e2e8f4;}"
+        # ===== 📖 阅读参数 =====
+        reading_box = QGroupBox("📖 阅读参数")
+        reading_form = QFormLayout(reading_box)
+
+        # 每日时长范围
+        hours_row = QHBoxLayout()
+        self._min_hours = QDoubleSpinBox()
+        self._min_hours.setRange(0.5, 24.0)
+        self._min_hours.setSingleStep(0.5)
+        self._min_hours.setSuffix(" 小时")
+        self._max_hours = QDoubleSpinBox()
+        self._max_hours.setRange(0.5, 24.0)
+        self._max_hours.setSingleStep(0.5)
+        self._max_hours.setSuffix(" 小时")
+        hours_row.addWidget(QLabel("最少"))
+        hours_row.addWidget(self._min_hours)
+        hours_row.addWidget(QLabel("最多"))
+        hours_row.addWidget(self._max_hours)
+        hours_row.addStretch(1)
+        reading_form.addRow("每日时长范围：", hours_row)
+
+        # 单页停留范围
+        interval_row = QHBoxLayout()
+        self._min_interval = QSpinBox()
+        self._min_interval.setRange(5, 600)
+        self._min_interval.setSuffix(" 秒")
+        self._max_interval = QSpinBox()
+        self._max_interval.setRange(5, 600)
+        self._max_interval.setSuffix(" 秒")
+        interval_row.addWidget(QLabel("下限"))
+        interval_row.addWidget(self._min_interval)
+        interval_row.addWidget(QLabel("上限"))
+        interval_row.addWidget(self._max_interval)
+        interval_row.addStretch(1)
+        reading_form.addRow("单页停留范围：", interval_row)
+
+        # 启动延迟范围
+        startup_row = QHBoxLayout()
+        self._startup_min = QSpinBox()
+        self._startup_min.setRange(0, 600)
+        self._startup_min.setSuffix(" 秒")
+        self._startup_max = QSpinBox()
+        self._startup_max.setRange(0, 600)
+        self._startup_max.setSuffix(" 秒")
+        startup_row.addWidget(QLabel("下限"))
+        startup_row.addWidget(self._startup_min)
+        startup_row.addWidget(QLabel("上限"))
+        startup_row.addWidget(self._startup_max)
+        startup_row.addStretch(1)
+        reading_form.addRow("启动延迟范围：", startup_row)
+
+        # 长休息频率 + 时长
+        longrest_row = QHBoxLayout()
+        self._long_rest_every = QSpinBox()
+        self._long_rest_every.setRange(5, 100)
+        self._long_rest_every.setSuffix(" 次")
+        self._long_rest_min = QSpinBox()
+        self._long_rest_min.setRange(10, 600)
+        self._long_rest_min.setSuffix(" 秒")
+        self._long_rest_max = QSpinBox()
+        self._long_rest_max.setRange(10, 600)
+        self._long_rest_max.setSuffix(" 秒")
+        longrest_row.addWidget(QLabel("每"))
+        longrest_row.addWidget(self._long_rest_every)
+        longrest_row.addWidget(QLabel("次休息"))
+        longrest_row.addWidget(self._long_rest_min)
+        longrest_row.addWidget(QLabel("~"))
+        longrest_row.addWidget(self._long_rest_max)
+        longrest_row.addStretch(1)
+        reading_form.addRow("长休息：", longrest_row)
+
+        # 失败冷却范围
+        cooldown_row = QHBoxLayout()
+        self._fail_cd_min = QSpinBox()
+        self._fail_cd_min.setRange(0, 600)
+        self._fail_cd_min.setSuffix(" 秒")
+        self._fail_cd_max = QSpinBox()
+        self._fail_cd_max.setRange(0, 600)
+        self._fail_cd_max.setSuffix(" 秒")
+        cooldown_row.addWidget(QLabel("下限"))
+        cooldown_row.addWidget(self._fail_cd_min)
+        cooldown_row.addWidget(QLabel("上限"))
+        cooldown_row.addWidget(self._fail_cd_max)
+        cooldown_row.addStretch(1)
+        reading_form.addRow("失败冷却范围：", cooldown_row)
+
+        root.addWidget(reading_box)
+
+        # ===== 🔑 Skill API Key =====
+        skill_box = QGroupBox("🔑 Skill API Key")
+        skill_layout = QVBoxLayout(skill_box)
+        key_row = QHBoxLayout()
+        self._api_key_input = QLineEdit()
+        self._api_key_input.setPlaceholderText("wrk-xxxxxxxxxxxxxxxx")
+        self._api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._btn_verify = QPushButton("✅ 验证")
+        self._btn_verify.clicked.connect(self._on_verify_api_key)
+        key_row.addWidget(self._api_key_input, 1)
+        key_row.addWidget(self._btn_verify)
+        skill_layout.addLayout(key_row)
+        self._lbl_key_status = QLabel("状态：未验证")
+        self._lbl_key_status.setStyleSheet("color:#5f6c85;font-size:12px;")
+        skill_layout.addWidget(self._lbl_key_status)
+
+        # Skill 数据刷新频率
+        refresh_row = QHBoxLayout()
+        refresh_row.addWidget(QLabel("Skill 数据刷新间隔："))
+        self._refresh_interval = QSpinBox()
+        self._refresh_interval.setRange(1, 240)
+        self._refresh_interval.setSuffix(" 分钟")
+        self._refresh_interval.setToolTip("调度器每 N 分钟调用 Skill 覆盖阅读统计和书籍进度")
+        refresh_row.addWidget(self._refresh_interval)
+        refresh_row.addStretch(1)
+        skill_layout.addLayout(refresh_row)
+
+        root.addWidget(skill_box)
+
+        # ===== 📢 WxPusher 推送 =====
+        push_box = QGroupBox("📢 WxPusher 推送")
+        push_layout = QVBoxLayout(push_box)
+        spt_row = QHBoxLayout()
+        spt_row.addWidget(QLabel("SPT:"))
+        self._spt_input = QLineEdit()
+        self._spt_input.setPlaceholderText("SPT_xxxxxxxxxxxx")
+        spt_row.addWidget(self._spt_input, 1)
+        push_layout.addLayout(spt_row)
+        rules_label = QLabel("通知规则（多选）：")
+        rules_label.setStyleSheet("font-weight:600;margin-top:8px;")
+        push_layout.addWidget(rules_label)
+        self._chk_daily_start = QCheckBox("每日首次开始（包含今日目标）")
+        self._chk_cookie_fail = QCheckBox("Cookie 失效通知")
+        self._chk_daily_done = QCheckBox("任务完成发送")
+        self._chk_login_success = QCheckBox("登录成功通知")
+        push_layout.addWidget(self._chk_daily_start)
+        push_layout.addWidget(self._chk_cookie_fail)
+        push_layout.addWidget(self._chk_daily_done)
+        push_layout.addWidget(self._chk_login_success)
+        root.addWidget(push_box)
+
+        # ===== 💻 系统设置 =====
+        sys_box = QGroupBox("💻 系统设置")
+        sys_layout = QVBoxLayout(sys_box)
+        self._chk_autostart = QCheckBox("开机自启动")
+        self._chk_autostart.toggled.connect(self._on_autostart_toggled)
+        self._chk_minimize_tray = QCheckBox("点击关闭时最小化到托盘")
+        sys_layout.addWidget(self._chk_autostart)
+        sys_layout.addWidget(self._chk_minimize_tray)
+        root.addWidget(sys_box)
+
+        # ===== 🧹 数据维护 =====
+        data_box = QGroupBox("🧹 数据维护")
+        data_layout = QVBoxLayout(data_box)
+        clean_row = QHBoxLayout()
+        clean_label = QLabel("清除 Cookie 并重启程序")
+        clean_label.setStyleSheet("color:#2f3b52;")
+        self._btn_clean = QPushButton("🧹 清除")
+        self._btn_clean.setStyleSheet(
+            "QPushButton{background:#d9534f;color:#fff;border:none;border-radius:8px;"
+            "padding:8px 20px;font-size:13px;font-weight:600;}"
+            "QPushButton:hover{background:#c9302c;}"
         )
+        self._btn_clean.clicked.connect(self._on_clean_cookie)
+        clean_row.addWidget(clean_label, 1)
+        clean_row.addWidget(self._btn_clean)
+        data_layout.addLayout(clean_row)
+        hint = QLabel("说明：清除后需重新扫码登录")
+        hint.setStyleSheet("color:#93a0b8;font-size:11px;")
+        data_layout.addWidget(hint)
+        root.addWidget(data_box)
 
-    # ----------------- Sync bounds -----------------
-    def _sync_max_lower_bound(self, v: int) -> None:
-        if self._max_hours.value() < v:
-            self._max_hours.setValue(v)
+        # ===== 保存按钮 =====
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self._btn_save = QPushButton("💾 保存设置")
+        self._btn_save.setStyleSheet(
+            "QPushButton{background:#2d9d3c;color:#fff;border:none;border-radius:8px;"
+            "padding:8px 24px;font-size:13px;font-weight:600;}"
+            "QPushButton:hover{background:#258a35;}"
+        )
+        self._btn_save.clicked.connect(self._on_save)
+        save_row.addWidget(self._btn_save)
+        root.addLayout(save_row)
 
-    def _sync_min_upper_bound(self, v: int) -> None:
-        if self._min_hours.value() > v:
-            self._min_hours.setValue(v)
+        root.addStretch(1)
 
-    def _sync_interval(self, *_: Any) -> None:
-        lo = self._interval_min.value()
-        hi = self._interval_max.value()
-        if lo > hi:
-            sender = self.sender()
-            if sender is self._interval_min:
-                self._interval_max.setValue(lo)
-            else:
-                self._interval_min.setValue(hi)
-
-    # ----------------- Skill API Key 验证 -----------------
-    def _on_verify_skill_key(self) -> None:
-        """验证 Skill API Key 是否有效（异步，避免 UI 卡死）。"""
-        api_key = self._skill_api_key.text().strip()
-        if not api_key:
-            QMessageBox.warning(self, "验证失败", "请先填入 API Key")
-            return
-        if not api_key.startswith("wrk-"):
-            QMessageBox.warning(self, "格式错误", "API Key 应以 wrk- 开头")
-            return
-        # 临时禁用按钮防止重复点击
-        self._btn_verify_skill.setEnabled(False)
-        self._btn_verify_skill.setText("验证中...")
-
-        def _task():
-            try:
-                main_window = self.window()
-                api = getattr(main_window, "_api", None)
-                if api is None:
-                    # fallback：从 status_page 取
-                    status_page = getattr(main_window, "_status_page", None)
-                    api = getattr(status_page, "_api", None) if status_page else None
-                if api is None:
-                    ok, msg = False, "无法访问 WeReadApi 实例"
-                else:
-                    ok, msg = api.verify_skill_api_key(api_key)
-            except Exception as exc:  # noqa: BLE001
-                ok, msg = False, f"验证异常：{exc}"
-            # 回到 UI 线程显示结果
-            QMetaObject.invokeMethod(
-                self, "_on_verify_skill_done", Qt.ConnectionType.QueuedConnection,
-                Q_ARG(bool, ok), Q_ARG(str, msg)
-            )
-
-        threading.Thread(target=_task, daemon=True).start()
-
-    @Slot(bool, str)
-    def _on_verify_skill_done(self, ok: bool, msg: str) -> None:
-        self._btn_verify_skill.setEnabled(True)
-        self._btn_verify_skill.setText("🔍 验证")
-        if ok:
-            QMessageBox.information(self, "验证成功", msg)
-        else:
-            QMessageBox.warning(self, "验证失败", msg)
-
-    # ----------------- Load / Save -----------------
-    def _load_from_config(self) -> None:
+    # ------------------------------------------------------------------
+    # 加载当前配置
+    # ------------------------------------------------------------------
+    def _load_values(self) -> None:
         reading = self._cfg.get("reading", {}) or {}
-        self._min_hours.setValue(int(reading.get("min_hours", 8)))
-        self._max_hours.setValue(int(reading.get("max_hours", 10)))
-        self._interval_min.setValue(int(reading.get("min_interval_sec", 25)))
-        self._interval_max.setValue(int(reading.get("max_interval_sec", 45)))
-        self._health_first_min.setValue(int(reading.get("health_check_first_min", 3)))
-        self._health_min.setValue(int(reading.get("health_check_min", 12)))
-        self._capture_timeout.setValue(int(reading.get("capture_timeout_sec", 15)))
-        self._workflow_retry.setValue(int(reading.get("workflow_retry_count", 2)))
+        self._min_hours.setValue(float(reading.get("min_hours", 1.5)))
+        self._max_hours.setValue(float(reading.get("max_hours", 3.0)))
+        self._min_interval.setValue(int(reading.get("min_interval_sec", 30)))
+        self._max_interval.setValue(int(reading.get("max_interval_sec", 45)))
+        self._startup_min.setValue(int(reading.get("startup_delay_min_sec", 15)))
+        self._startup_max.setValue(int(reading.get("startup_delay_max_sec", 25)))
+        self._long_rest_every.setValue(int(reading.get("long_rest_every", 20)))
+        self._long_rest_min.setValue(int(reading.get("long_rest_min_sec", 60)))
+        self._long_rest_max.setValue(int(reading.get("long_rest_max_sec", 180)))
+        self._fail_cd_min.setValue(int(reading.get("fail_cooldown_min_sec", 30)))
+        self._fail_cd_max.setValue(int(reading.get("fail_cooldown_max_sec", 60)))
 
-        push = self._cfg.get("push", {}) or {}
-        self._wxpusher_spt.setText(str(push.get("wxpusher_spt", "") or ""))
-        self._chk_cookie_fail.setChecked(bool(push.get("notify_cookie_fail", True)))
-        self._chk_daily.setChecked(bool(push.get("notify_daily_done", True)))
+        self._api_key_input.setText(str(self._cfg.get("skill.api_key", "")))
+        self._refresh_interval.setValue(int(self._cfg.get("skill.refresh_interval_min", 30)))
+        self._spt_input.setText(str(self._cfg.get("push.wxpusher_spt", "")))
+        self._chk_daily_start.setChecked(bool(self._cfg.get("push.notify_daily_start", True)))
+        self._chk_cookie_fail.setChecked(bool(self._cfg.get("push.notify_cookie_fail", True)))
+        self._chk_daily_done.setChecked(bool(self._cfg.get("push.notify_daily_done", True)))
+        self._chk_login_success.setChecked(bool(self._cfg.get("push.notify_login_success", False)))
 
-        skill = self._cfg.get("skill", {}) or {}
-        self._skill_api_key.setText(str(skill.get("api_key", "") or ""))
-        self._skill_ttl.setValue(int(skill.get("summary_cache_ttl", 180)))
-
-        app = self._cfg.get("app", {}) or {}
-        # 开机自启优先取注册表真实状态
         self._chk_autostart.setChecked(is_autostart_enabled())
-        self._chk_tray.setChecked(bool(app.get("minimize_to_tray", True)))
-        self._chk_start_min.setChecked(bool(app.get("start_minimized", False)))
-        self._chk_start_max.setChecked(bool(app.get("start_maximized", True)))
+        self._chk_minimize_tray.setChecked(bool(self._cfg.get("app.minimize_to_tray", True)))
 
-    def _on_save(self) -> None:
-        # 校验
-        if self._min_hours.value() > self._max_hours.value():
-            QMessageBox.warning(self, "设置错误", "每日最少时长不能大于最多时长")
+    # ------------------------------------------------------------------
+    # 按钮槽
+    # ------------------------------------------------------------------
+    def _on_verify_api_key(self) -> None:
+        api_key = self._api_key_input.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "提示", "请先输入 API Key")
             return
-        if self._interval_min.value() > self._interval_max.value():
-            QMessageBox.warning(self, "设置错误", "单页停留下限不能大于上限")
-            return
+        # 先保存到 config（verify_api_key 会从 config 读取）
+        self._cfg.set("skill.api_key", api_key, auto_save=False)
+        self._cfg.save()
+        self._lbl_key_status.setText("状态：⏳ 验证中...")
+        self._lbl_key_status.setStyleSheet("color:#c49100;font-size:12px;")
+        self._btn_verify.setEnabled(False)
+        self._btn_verify.setText("⏳ 验证中...")
 
-        self._cfg.update_dict(
-            "reading",
-            {
-                "min_hours": self._min_hours.value(),
-                "max_hours": self._max_hours.value(),
-                "min_interval_sec": self._interval_min.value(),
-                "max_interval_sec": self._interval_max.value(),
-                "health_check_first_min": int(self._health_first_min.value()),
-                "health_check_min": int(self._health_min.value()),
-                "capture_timeout_sec": int(self._capture_timeout.value()),
-                "workflow_retry_count": int(self._workflow_retry.value()),
-            },
-        )
-        self._cfg.update_dict(
-            "push",
-            {
-                "wxpusher_spt": self._wxpusher_spt.text().strip(),
-                "notify_cookie_fail": self._chk_cookie_fail.isChecked(),
-                "notify_daily_done": self._chk_daily.isChecked(),
-            },
-        )
-        self._cfg.update_dict(
-            "skill",
-            {
-                "api_key": self._skill_api_key.text().strip(),
-                "summary_cache_ttl": int(self._skill_ttl.value()),
-            },
-        )
-        # 开机自启
-        ok, msg = set_autostart(self._chk_autostart.isChecked())
-        if not ok and self._chk_autostart.isChecked():
-            QMessageBox.warning(self, "开机自启设置失败", msg)
+        self._checker = _ApiKeyChecker(self._skill)
+        self._checker.result.connect(self._on_verify_done)
+        self._checker.start()
+        # 超时保护（30s）
+        QTimer.singleShot(30000, lambda: self._on_verify_done(False, "❌ 超时") if self._checker and self._checker.isRunning() else None)
 
-        self._cfg.update_dict(
-            "app",
-            {
-                "auto_start": self._chk_autostart.isChecked(),
-                "minimize_to_tray": self._chk_tray.isChecked(),
-                "start_minimized": self._chk_start_min.isChecked(),
-                "start_maximized": self._chk_start_max.isChecked(),
-            },
-        )
-        self.settings_changed.emit()
-        QMessageBox.information(self, "保存成功", "设置已生效 ✅")
-
-    # ----------------- 测试推送 -----------------
-    def _on_test_push(self) -> None:
-        spt = self._wxpusher_spt.text().strip()
-        if not spt:
-            QMessageBox.information(self, "缺少 SPT", "请先填入 WxPusher SPT 再测试")
-            return
-        # 先保存再发送
-        self._cfg.set("push.wxpusher_spt", spt)
-        from app.core.notifier import WxPusherNotifier
-
-        notifier = WxPusherNotifier(self._cfg)
-        self._btn_test_push.setEnabled(False)
-        self._btn_test_push.setText("发送中...")
-
-        def _on_done(ok: bool) -> None:  # noqa: FBT001
-            self._test_push_done.emit(bool(ok))
-
-        notifier.send_async("【微信读书助手】测试消息：推送通道正常～", on_done=_on_done)
-
-    def _handle_test_push_result(self, ok: bool) -> None:  # noqa: FBT001
-        self._btn_test_push.setEnabled(True)
-        self._btn_test_push.setText("发送一条测试消息")
+    def _on_verify_done(self, ok: bool, msg: str) -> None:
+        self._btn_verify.setEnabled(True)
+        self._btn_verify.setText("✅ 验证")
         if ok:
-            QMessageBox.information(self, "测试发送", "测试消息已发出，请在微信中查看 ✅")
+            self._lbl_key_status.setText(f"状态：{msg}")
+            self._lbl_key_status.setStyleSheet("color:#2d9d3c;font-size:12px;font-weight:600;")
         else:
-            QMessageBox.warning(
-                self,
-                "测试发送失败",
-                "消息未成功送达，请检查 SPT 是否正确，或等待重试后查看。",
-            )
+            self._lbl_key_status.setText(f"状态：{msg}")
+            self._lbl_key_status.setStyleSheet("color:#d9534f;font-size:12px;font-weight:600;")
 
-    # ----------------- 清除 Cookie -----------------
-    def _on_clear_cookies(self) -> None:
-        """清除所有 Cookie + 浏览器 profile + 章节缓存（不重启，方便查看日志）。"""
-        reply = QMessageBox.warning(
+    def _on_autostart_toggled(self, checked: bool) -> None:
+        ok, msg = set_autostart(checked)
+        if not ok:
+            QMessageBox.warning(self, "设置失败", msg)
+            self._chk_autostart.blockSignals(True)
+            self._chk_autostart.setChecked(is_autostart_enabled())
+            self._chk_autostart.blockSignals(False)
+
+    def _on_clean_cookie(self) -> None:
+        reply = QMessageBox.question(
             self,
             "确认清除 Cookie",
-            "此操作将清除所有登录态数据（Cookie、浏览器缓存、章节缓存）。\n\n"
-            "清除后需要重新扫码登录。确定继续吗？",
+            "确定要清除 Cookie 并重启程序吗？\n\n清除后需要重新扫码登录。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-
-        self._btn_clear_cookies.setEnabled(False)
-        self._btn_clear_cookies.setText("清除中...")
-
+        log.info("用户确认清除 Cookie 并重启")
         try:
-            app_dir = get_app_dir()  # %APPDATA%/WxReadAssistant
-            log.info("🗑️ ====== 开始清除 Cookie 和缓存 ======")
-            log.info("🗑️ app_dir = %s", app_dir)
-            pending_clear = False  # 如果有目录被占用无法删除，标记下次启动时清除
-
-            # 1. 清除 config 中的 cookies / cookies_raw
-            cookies_before = self._cfg.get("cookies", {}) or {}
-            cookies_raw_before = self._cfg.get("cookies_raw", []) or []
-            log.info("🗑️ [config] 清除前：cookies=%d keys, cookies_raw=%d 条",
-                     len(cookies_before) if isinstance(cookies_before, dict) else 0,
-                     len(cookies_raw_before) if isinstance(cookies_raw_before, list) else 0)
-            if isinstance(cookies_before, dict) and cookies_before:
-                log.info("🗑️ [config] 清除前 cookies keys = %s", list(cookies_before.keys()))
-            self._cfg.set("cookies", {}, auto_save=False)
-            self._cfg.set("cookies_raw", [], auto_save=False)
-            self._cfg.save()
-            log.info("🗑️ [config] 清除后：cookies={}, cookies_raw=[]（已存盘）")
-
-            # 2. 删除浏览器 profile 目录（QtWebEngine 持久化）
-            #    profile 路径有 3 个变体（见 login_page.py）：
-            #    a) app_dir / "QtWebEngine" / "wxread-login-profile"
-            #    b) app_dir / "WxReadAssistant" / "QtWebEngine" / "wxread-login-profile"
-            #    c) app_dir / "wxread-login-profile"  (alt_root)
-            #    最彻底：删整个 QtWebEngine + alt root + WxReadAssistant 子目录
-            targets = [
-                ("QtWebEngine 目录", app_dir / "QtWebEngine"),
-                ("alt_root wxread-login-profile", app_dir / "wxread-login-profile"),
-                ("嵌套 WxReadAssistant 子目录", app_dir / "WxReadAssistant"),
-            ]
-            for label, t in targets:
-                if t.exists():
-                    # 统计目录大小和文件数
-                    file_count = sum(1 for _ in t.rglob("*") if _.is_file())
-                    log.info("🗑️ [%s] 存在：%s（%d 个文件）", label, t, file_count)
-                    shutil.rmtree(t, ignore_errors=True)
-                    # 验证删除结果
-                    if t.exists():
-                        # 被进程占用无法删除 → 标记 pending_clear，下次启动时清除
-                        log.warning("🗑️ [%s] 被占用无法删除，已标记 pending_clear，下次启动时清除", label)
-                        pending_clear = True
-                    else:
-                        log.info("🗑️ [%s] 删除成功 ✅", label)
-                else:
-                    log.info("🗑️ [%s] 不存在，跳过：%s", label, t)
-
-            # 3. 删除 chapter_cache.json
-            chapter_cache = app_dir / "chapter_cache.json"
-            if chapter_cache.exists():
-                size_kb = chapter_cache.stat().st_size / 1024
-                log.info("🗑️ [chapter_cache] 存在：%s（%.1f KB）", chapter_cache, size_kb)
-                chapter_cache.unlink(missing_ok=True)
-                log.info("🗑️ [chapter_cache] 删除成功 ✅")
-            else:
-                log.info("🗑️ [chapter_cache] 不存在，跳过")
-
-            # 4. 删除 skill 缓存
-            skill_cache = app_dir / "wxread-skill-cache.json"
-            if skill_cache.exists():
-                size_kb = skill_cache.stat().st_size / 1024
-                log.info("🗑️ [skill_cache] 存在：%s（%.1f KB）", skill_cache, size_kb)
-                skill_cache.unlink(missing_ok=True)
-                log.info("🗑️ [skill_cache] 删除成功 ✅")
-            else:
-                log.info("🗑️ [skill_cache] 不存在，跳过")
-
-            log.info("🗑️ ====== Cookie 和缓存清除完成 ======")
-            # 如果有目录被占用，标记 pending_clear，下次启动时在浏览器初始化前彻底清除
-            self._cfg.set("app.pending_clear", pending_clear, auto_save=True)
-            log.info("🗑️ pending_clear=%s（已写入 config）", pending_clear)
+            self._cfg.clear_cookies()
+            self._cfg.set("app.pending_clear", True, auto_save=True)
+            log.info("Cookie 已清除，pending_clear 已设置")
         except Exception as exc:  # noqa: BLE001
-            log.error("🗑️ 清除 Cookie 失败：%s", exc)
-            self._btn_clear_cookies.setEnabled(True)
-            self._btn_clear_cookies.setText("🗑️ 清除 Cookie")
-            QMessageBox.critical(self, "清除失败", f"清除过程中出错：{exc}")
+            log.error("清除 Cookie 失败：%s", exc)
+            QMessageBox.critical(self, "错误", f"清除 Cookie 失败：{exc}")
             return
+        QMessageBox.information(
+            self,
+            "即将重启",
+            "Cookie 已清除，程序将在 3 秒后自动重启。",
+        )
+        QTimer.singleShot(3000, self._restart_app)
 
-        self._btn_clear_cookies.setEnabled(True)
-        self._btn_clear_cookies.setText("🗑️ 清除 Cookie")
-        if pending_clear:
-            QMessageBox.information(self, "清除完成（需重启）",
-                                   "Cookie 和缓存已清除，但部分浏览器数据被进程占用无法删除。\n\n"
-                                   "已标记 pending_clear，请手动重启应用：\n"
-                                   "重启时会自动清除所有残留数据，然后重新扫码登录。")
+    def _restart_app(self) -> None:
+        """通过 QProcess::startDetached 重启程序。"""
+        exe = Path(sys.executable)
+        if exe.name.lower() in ("python.exe", "pythonw.exe"):
+            main_py = Path(__file__).resolve().parents[2] / "main.py"
+            pythonw = exe.with_name("pythonw.exe")
+            runner = pythonw if pythonw.exists() else exe
+            QProcess.startDetached(str(runner), [str(main_py)])
         else:
-            QMessageBox.information(self, "清除完成",
-                                   "所有 Cookie 和缓存已清除。\n\n"
-                                   "请手动重启应用以重新扫码登录。")
+            QProcess.startDetached(str(exe), [])
+        QApplication.instance().quit()
+        sys.exit(0)
+
+    def _on_back_to_main(self) -> None:
+        """返回主界面。"""
+        if self._main_window and hasattr(self._main_window, "show_main_page"):
+            self._main_window.show_main_page()
+
+    def _on_save(self) -> None:
+        """保存所有设置到 config.json。"""
+        try:
+            self._cfg.set("reading.min_hours", self._min_hours.value(), auto_save=False)
+            self._cfg.set("reading.max_hours", self._max_hours.value(), auto_save=False)
+            self._cfg.set("reading.min_interval_sec", self._min_interval.value(), auto_save=False)
+            self._cfg.set("reading.max_interval_sec", self._max_interval.value(), auto_save=False)
+            self._cfg.set("reading.startup_delay_min_sec", self._startup_min.value(), auto_save=False)
+            self._cfg.set("reading.startup_delay_max_sec", self._startup_max.value(), auto_save=False)
+            self._cfg.set("reading.long_rest_every", self._long_rest_every.value(), auto_save=False)
+            self._cfg.set("reading.long_rest_min_sec", self._long_rest_min.value(), auto_save=False)
+            self._cfg.set("reading.long_rest_max_sec", self._long_rest_max.value(), auto_save=False)
+            self._cfg.set("reading.fail_cooldown_min_sec", self._fail_cd_min.value(), auto_save=False)
+            self._cfg.set("reading.fail_cooldown_max_sec", self._fail_cd_max.value(), auto_save=False)
+            self._cfg.set("skill.api_key", self._api_key_input.text().strip(), auto_save=False)
+            self._cfg.set("skill.refresh_interval_min", self._refresh_interval.value(), auto_save=False)
+            self._cfg.set("push.wxpusher_spt", self._spt_input.text().strip(), auto_save=False)
+            self._cfg.set("push.notify_daily_start", self._chk_daily_start.isChecked(), auto_save=False)
+            self._cfg.set("push.notify_cookie_fail", self._chk_cookie_fail.isChecked(), auto_save=False)
+            self._cfg.set("push.notify_daily_done", self._chk_daily_done.isChecked(), auto_save=False)
+            self._cfg.set("push.notify_login_success", self._chk_login_success.isChecked(), auto_save=False)
+            self._cfg.set("app.minimize_to_tray", self._chk_minimize_tray.isChecked(), auto_save=True)
+            log.info("设置已保存")
+            QMessageBox.information(self, "成功", "设置已保存 ✅")
+            # 保存成功后自动返回主界面
+            self._on_back_to_main()
+        except Exception as exc:  # noqa: BLE001
+            log.error("保存设置失败：%s", exc)
+            QMessageBox.critical(self, "错误", f"保存失败：{exc}")
+
+
+# 延迟导入避免循环依赖
+from PySide6.QtWidgets import QApplication  # noqa: E402

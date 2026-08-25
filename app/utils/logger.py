@@ -98,12 +98,6 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         datefmt="%H:%M:%S",
     )
 
-    # —— 关键修复：旧版只给根 logger "wxread" 装了 handlers，然后
-    #    `root.propagate = False`，导致 get_logger("wxread.ui.login_page")
-    #    等子 logger 自己 handlers=[]、又不向 root 冒泡 —— 所有子模块日志
-    #    直接丢进 lastResort(stderr, 仅 WARN+)，app.log 永远 0 字节。
-    #    新版：根 logger 装 handlers 且 propagate=True（默认），子 logger
-    #    保持 propagate=True，记录自然冒泡到根并写文件/UI。
     already_installed = any(
         getattr(h, "__wxread_core__", False) for h in root.handlers
     )
@@ -116,10 +110,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
                 pass
     root.propagate = False  # 根 logger 不再向 Python 根冒泡（避免重复输出 stderr）
 
-    # 顺手把 logging.lastResort 降级：任何 logger 都不会缺 handler 了，
-    # 如果 Python 自动 fallback 到 lastResort，说明 setup_logging 漏装了，
-    # 那就干脆把 lastResort 换成一个等价的 stdout 输出，免得 PowerShell
-    # 把 WARNING 打成"红色异常块"误导用户。
+    # 顺手把 logging.lastResort 降级
     class _SoftLastResort(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover
             try:
@@ -139,10 +130,6 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
 def get_logger(name: str = "wxread") -> logging.Logger:
     setup_logging()
-    # —— 兼容：项目代码 `get_logger(__name__)` 传入的是 "app.xxx"，
-    #    但我们统一用 "wxread.*" 命名空间写日志到 app.log / UI 信号，
-    #    否则 app.xxx 与 wxread 根 logger 没有父子关系、冒泡不到根的
-    #    TimedRotatingFileHandler / StreamHandler / _QtSignalHandler。
     if not name:
         mapped = "wxread"
     elif name == "wxread":
@@ -154,8 +141,6 @@ def get_logger(name: str = "wxread") -> logging.Logger:
     else:
         mapped = "wxread." + name
     logger = logging.getLogger(mapped)
-    # 子 logger（name != "wxread"）不需要自己装任何 handler，
-    # 只要 propagate=True，就会把记录冒泡给 wxread 根的 3 个带 flush 包裹的 handler。
     if mapped != "wxread":
         logger.propagate = True
     return logger

@@ -1,39 +1,68 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
-from PyInstaller.utils.hooks import collect_dynamic_libs
-from PyInstaller.utils.hooks import collect_submodules
+r"""WxReadAssistant v2.0 打包配置。
 
-datas = [('app/resources', 'app/resources')]
+用法：
+  cd e:\item\wxread\v2
+  python -m PyInstaller WxReadAssistant.spec --noconfirm
+"""
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
+
+datas = []
 binaries = []
 hiddenimports = [
-    'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'PySide6.QtNetwork',
-    'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtPrintSupport',
-    # CDP 模式新增依赖
-    'websocket', 'websocket._abnf', 'websocket._app', 'websocket._core', 'websocket._exceptions',
-    'websocket._http', 'websocket._logging', 'websocket._socket', 'websocket._ssl', 'websocket._url',
-    'websocket._utils', 'requests', 'urllib3', 'certifi', 'charset_normalizer', 'idna',
+    # PySide6 核心 + 嵌入式浏览器（CDP 扫码登录需要 QWebEngineView）
+    'PySide6.QtCore',
+    'PySide6.QtGui',
+    'PySide6.QtWidgets',
+    'PySide6.QtNetwork',
+    'PySide6.QtWebEngineCore',
+    'PySide6.QtWebEngineWidgets',
+    'PySide6.QtPrintSupport',
+    # CDP / HTTP 依赖（websocket-client 新版结构）
+    'websocket',
+    'websocket._abnf',
+    'websocket._app',
+    'websocket._core',
+    'websocket._exceptions',
+    'websocket._http',
+    'websocket._logging',
+    'websocket._socket',
+    'websocket._ssl_compat',
+    'websocket._url',
+    'websocket._utils',
+    'websocket._cookiejar',
+    'websocket._dispatcher',
+    'websocket._handshake',
+    'websocket._wsdump',
+    # HTTP 栈
+    'requests',
+    'urllib3',
+    'certifi',
+    'charset_normalizer',
+    'idna',
 ]
-datas += collect_data_files('PySide6.QtCore')
-datas += collect_data_files('PySide6.QtGui')
-datas += collect_data_files('PySide6.QtWidgets')
-datas += collect_data_files('PySide6.QtNetwork')
-datas += collect_data_files('PySide6.QtWebEngineCore')
-datas += collect_data_files('PySide6.QtWebEngineWidgets')
-datas += collect_data_files('PySide6.QtPrintSupport')
-binaries += collect_dynamic_libs('PySide6.QtCore')
-binaries += collect_dynamic_libs('PySide6.QtGui')
-binaries += collect_dynamic_libs('PySide6.QtWidgets')
-binaries += collect_dynamic_libs('PySide6.QtNetwork')
-binaries += collect_dynamic_libs('PySide6.QtWebEngineCore')
-binaries += collect_dynamic_libs('PySide6.QtWebEngineWidgets')
-binaries += collect_dynamic_libs('PySide6.QtPrintSupport')
-hiddenimports += collect_submodules('PySide6.QtCore')
-hiddenimports += collect_submodules('PySide6.QtGui')
-hiddenimports += collect_submodules('PySide6.QtWidgets')
-hiddenimports += collect_submodules('PySide6.QtNetwork')
-hiddenimports += collect_submodules('PySide6.QtWebEngineCore')
-hiddenimports += collect_submodules('PySide6.QtWebEngineWidgets')
-hiddenimports += collect_submodules('PySide6.QtPrintSupport')
+
+# PySide6 数据/动态库/子模块收集（含 WebEngine，供 CDP 扫码登录使用）
+for mod in (
+    'PySide6',
+    'PySide6.QtCore',
+    'PySide6.QtGui',
+    'PySide6.QtWidgets',
+    'PySide6.QtNetwork',
+    'PySide6.QtWebEngineCore',
+    'PySide6.QtWebEngineWidgets',
+    'PySide6.QtPrintSupport',
+):
+    try:
+        datas += collect_data_files(mod)
+        binaries += collect_dynamic_libs(mod)
+        hiddenimports += collect_submodules(mod)
+    except Exception:
+        pass
 
 
 a = Analysis(
@@ -45,7 +74,15 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # 仍排除 QML/Quick 等 v2 不用的模块（QtWebEngine 已加回）
+        'PySide6.QtQml',
+        'PySide6.QtQuick',
+        'PySide6.QtQuick3D',
+        'PySide6.QtCharts',
+        'PySide6.QtDataVisualization',
+        'PySide6.Qt3DCore',
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -67,8 +104,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['app\\resources\\app.ico'],
 )
+
 coll = COLLECT(
     exe,
     a.binaries,

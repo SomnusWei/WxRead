@@ -1,11 +1,12 @@
-"""阅读调度器：每天按随机时长随机间隔完成阅读计划。
+"""阅读调度器（v2 进度驱动版）。
 
-设计要点：
-1. 启动时确定今天目标：在 [min_hours, max_hours] 之间随机，分钟粒度（例如 9h47m）。
-2. 每次请求间隔在 [min_interval_sec, max_interval_sec] 之间随机（含 ±15% 抖动）。
-3. 每 ~20 次请求穿插一次稍长的"休息"（60-180 秒），模拟真实阅读疲劳。
-4. 每 ~10 分钟切换一次"书籍/章节"由 weread_api 内部随机，这里只控制节奏。
-5. 使用 QThread + 事件信号驱动 UI 状态同步。
+v2 改造：
+- 进度驱动选书：过滤 progress<100%，按进度降序，选第一本
+- 顺序选章：从 current_chapter_uid 开始，4~5 次后换章
+- 本地实时进度 + Skill 定期覆盖（每 30 分钟）
+- 实时通过 Qt 信号通知 UI 更新当前书/进度/章节/已读次数
+- 完成度判断：Skill 今日阅读时长 >= 目标分钟数
+- 防风控：启动延迟 30~90s + 间隔 30~45s±15% + 每 20 次长休息 60~180s + 失败冷却 30~60s
 """
 from __future__ import annotations
 
@@ -13,103 +14,93 @@ import datetime as dt
 import random
 import threading
 import time
-from dataclasses import dataclass, field
+from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
-from .config import ConfigStore
-from .weread_api import WeReadApi
-from .notifier import WxPusherNotifier
+from app.core.config import ConfigStore
+from app.core.local_db import LocalDB
+from app.core.notifier import WxPusherNotifier
+from app.core.skill_api import SkillAPI
+from app.core.weread_api import WeReadApi
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-
-@dataclass
-class DailyPlan:
-    date: str                   # YYYY-MM-DD
-    target_minutes: int         # 今日目标总分钟数
-    started_minutes: int = 0    # 已完成分钟数（本地估算值，Skill 为权威）
-    skill_baseline_sec: int = 0 # Skill 网关返回的今日阅读秒数基线
-    session_accum_sec: int = 0  # 本次启动后本地累加的阅读秒数
-    success_count: int = 0
-    fail_count: int = 0
-
-    @property
-    def completed_sec(self) -> int:
-        """已完成秒数 = max(Skill 基线 + 本地累加, 本地累计)。"""
-        skill_est = self.skill_baseline_sec + self.session_accum_sec
-        return max(skill_est, self.started_minutes * 60)
-
-    @property
-    def completed_minutes(self) -> int:
-        """已完成分钟数（向上取整）。"""
-        return (self.completed_sec + 59) // 60
-
-    @property
-    def remaining_minutes(self) -> int:
-        return max(0, self.target_minutes - self.completed_minutes)
+# 单次阅读成功后本地累加的阅读秒数（默认每次 ≈ 45 秒）
+READ_ONCE_SECONDS = 45
 
 
-class ReadingScheduler(QThread):
-    """后台阅读调度线程。
+class Scheduler(QThread):
+    """阅读调度器（进度驱动，实时通知 UI）。
 
-    信号：
-      state_changed(str)          -> 文案状态
-      progress(dict)              -> 今日任务概览
-      log(str)                    -> 普通日志
-      cookie_broken()             -> 登录态彻底失效
-      task_completed(int)         -> 今日完成的分钟数
+    信号（实时通知 UI 更新）：
+      state_changed(str)                  → 运行状态文字
+      log_emitted(str)                     → 工作日志（UI 批量追加）
+      progress(dict)                       → 任务概览（含 next_run_at/计数/书快照）
+      book_progress_updated(str, int, str, int) → (书名, 进度%, 章节标题, 本章已读次数)
+      current_book_changed(str, int)       → (书名, 进度%)
+      current_chapter_changed(str, int)    → (章节标题, chapter_uid)
+      reading_stats_updated(dict)          → 阅读统计字典
+      cookie_broken()                      → 登录态彻底失效
+      task_completed(int)                  → 今日完成分钟数
+      cookie_hard_invalid(str)             → 硬失效原因（UI 弹窗）
     """
 
     state_changed = Signal(str)
-    # progress 里新增：
-    #   next_run_at(float)   = time.time() 级别的单例时间戳（UI 用它做 1s 倒计时）
-    #   current_interval     = 本次计划间隔秒数（用于标签 & 兜底）
-    #   state                = 运行状态文字，让 UI 不需要来回比对
+    log_emitted = Signal(str)
     progress = Signal(dict)
-    log = Signal(str)
+    book_progress_updated = Signal(str, int, str, int)
+    current_book_changed = Signal(str, int)
+    current_chapter_changed = Signal(str, int)
+    reading_stats_updated = Signal(dict)
     cookie_broken = Signal()
-    task_completed = Signal(int)  # 实际完成分钟数
-    cookie_fail_reported = Signal()  # 登录态失效已推送（UI 同步红色"已失效"徽标）
-    cookie_hard_invalid = Signal(str)  # 登录态硬失效 → UI 禁用开始按钮 + 弹窗，payload=原因
+    task_completed = Signal(int)
+    cookie_hard_invalid = Signal(str)
 
     def __init__(
         self,
         api: WeReadApi,
+        skill_api: SkillAPI,
+        local_db: LocalDB,
         config: ConfigStore | None = None,
         notifier: WxPusherNotifier | None = None,
     ) -> None:
         super().__init__()
         self._api = api
+        self._skill = skill_api
+        self._db = local_db
         self._cfg = config or ConfigStore()
         self._notifier = notifier or WxPusherNotifier(self._cfg)
+
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
-        self._pause_event.set()  # 默认"放行"
-        self._cookie_fail_notified = False
-        self._daily_lock = threading.Lock()
-        self._daily: DailyPlan | None = None
-        # —— 登录态健康巡检（阅读过程中定期检测，不再只靠失败时被动发现）
-        self._health_lock = threading.Lock()
-        self._health_next_ts = 0.0  # 下次要跑 check_session 的时间戳
-        self._health_interval_sec = int((self._cfg.get("reading.health_check_min") or 12)) * 60  # 默认 12 分钟
-        self._health_fail_count = 0
-        # —— 倒计时共享状态（UI 拿到 next_run_at 做 1s tick）
-        self._state_lock = threading.Lock()
+        self._pause_event.set()  # 默认放行
+
+        # 当前阅读状态（线程安全）
+        self._state_lock = threading.RLock()
+        self._current_book: dict | None = None
+        self._current_chapter: dict | None = None
+        self._chapter_read_count = 0
+        self._success_count = 0
+        self._fail_count = 0
         self._current_state = "待机中"
-        # —— 连续 2 次 HTTP 200 空 body 检测：key=book_id，记录连续次数；≥2 时自动清缓存+重拉章节
-        self._consec_empty_body: dict[str, int] = {}
-        # —— Skill 网关基线相关：混合方案完成度检测
-        self._skill_refresh_interval_sec = 300  # 每 5 分钟刷新一次 Skill 基线
+        self._next_run_at = 0.0
+
+        # 健康巡检
+        self._health_next_ts = 0.0
+        self._health_interval_sec = int(
+            self._cfg.get("reading.health_check_min", 12)
+        ) * 60
+        self._health_fail_count = 0
+
+        # Skill 数据定期刷新（间隔动态从配置读取，不在 __init__ 缓存）
         self._last_skill_refresh_ts = 0.0
-        self._skill_success_refresh_count = 10  # 每 10 次成功阅读也会尝试刷新
-        self._skill_fallback_used = False  # Skill 失败时是否已降级为本地估算
-        # —— 改动3：接收 WeReadApi 的硬/软失效信号 ——
-        # cookie_invalid(severity, reason)：HARD → 硬停止；SOFT → 仅告警不停止
+
+        # 接收 WeReadApi 的硬/软失效信号
         self._api.cookie_invalid.connect(self._on_cookie_invalid)
 
-    # ---------------- controls ----------------
+    # ---------------- 控制 ----------------
     def stop(self) -> None:
         self._stop_event.set()
         self._pause_event.set()
@@ -128,25 +119,31 @@ class ReadingScheduler(QThread):
             self._current_state = text
         self.state_changed.emit(text)
 
-    # ---------------- main loop ----------------
+    def _emit_log(self, msg: str) -> None:
+        log.info(msg)
+        self.log_emitted.emit(msg)
+
+    # ---------------- 主循环 ----------------
     def run(self) -> None:  # noqa: D401
         log.info("调度器已启动")
         self._set_state("初始化中")
-        # 初始化健康巡检：启动后 3 分钟做第一次（避免启动高峰就跑一遍）
-        with self._health_lock:
-            self._health_next_ts = time.time() + max(60.0, float(self._cfg.get("reading.health_check_first_min") or 3) * 60)
-        # —— 启动即尝试：从书架拿一本"进度最高未读完"的书做默认当前书（状态页立刻显示书名/URL/进度）
-        try:
-            self._api.refresh_current_book_from_shelf()
-        except Exception as exc:  # noqa: BLE001
-            log.debug("启动时刷新当前书失败（正常：无登录态/书架空就跳过）：%s", exc)
-        # 启动先快速验证一次会话是否可用
+
+        # 健康巡检：启动后 3 分钟做第一次
+        with self._state_lock:
+            self._health_next_ts = time.time() + max(
+                60.0, float(self._cfg.get("reading.health_check_first_min", 3)) * 60
+            )
+
+        # 启动即检查登录态
         if not self._api.check_session():
-            self.log.emit("启动检测：当前登录态无效，正在尝试刷新...")
+            self._emit_log("启动检测：当前登录态无效，正在尝试刷新...")
             if not self._api.ensure_session():
                 self._set_state("登录态失效，等待扫码")
-                self._notify_cookie_fail()
-        # ===== P0-3 启动随机延迟（反机器指纹：避免点"开始阅读"立即秒级请求）=====
+                self._notify_cookie_fail("HARD_INVALID", "启动时登录态无效")
+                self.cookie_broken.emit()
+                return
+
+        # ===== 启动随机延迟（反机器指纹）=====
         reading_cfg = self._cfg.get("reading", {}) or {}
         try:
             s_min = float(reading_cfg.get("startup_delay_min_sec", 30))
@@ -156,479 +153,525 @@ class ReadingScheduler(QThread):
             startup_delay = random.uniform(s_min, s_max)
         except (ValueError, TypeError):
             startup_delay = random.uniform(30, 90)
-        log.info("⏱️ 启动随机延迟：%.1fs（%s~%ss），模拟真人进入阅读前的思考准备", startup_delay, s_min, s_max)
-        self.log.emit(
+        self._emit_log(
             f"⏱️ 启动随机延迟 {startup_delay:.0f}s（{s_min:.0f}~{s_max:.0f}s），"
             "模拟真人进入阅读前的准备"
         )
         self._set_state(f"启动准备中（{startup_delay:.0f}s）")
-        # 用分段 sleep，确保 stop/pause 可打断；每 200ms 检查一次 stop
-        _dl = startup_delay
-        while _dl > 0 and not self._stop_event.is_set():
-            chunk = min(0.2, _dl)
-            time.sleep(chunk)
-            _dl -= chunk
-        if self._stop_event.is_set():
+        if not self._interruptible_sleep(startup_delay):
             return
-        # 主循环：跨日期自动滚动到下一天计划
+
+        # 主循环
         while not self._stop_event.is_set():
-            # —— 每次回到循环入口都尝试一次"登录态健康巡检"（到期才会真的跑）
+            # 暂停检查
+            if not self._pause_event.is_set():
+                self._set_state("已暂停")
+                self._pause_event.wait()
+                if self._stop_event.is_set():
+                    return
+                self._set_state("运行中")
+
+            # ① 健康检查（每 12 分钟）
             self._maybe_run_health_check()
-            plan = self._ensure_daily_plan()
-            # —— 检查完成度：使用 Skill 混合方案 ——
-            completed_sec = plan.completed_sec
-            completed_min = plan.completed_minutes
-            remaining_min = plan.remaining_minutes
-            if completed_min >= plan.target_minutes:
-                log.info(
-                    "🎯 完成度检查：%d/%d 分钟（已达标）Skill基线=%ds 本地累加=%ds 本地估算=%dmin",
-                    completed_min, plan.target_minutes,
-                    plan.skill_baseline_sec, plan.session_accum_sec,
-                    plan.started_minutes,
+            if self._stop_event.is_set():
+                return
+
+            # ② 完成度检查（Skill 今日时长 >= 目标）
+            target_min = self._ensure_daily_plan()
+            today_sec = self._db.get_today_seconds()
+            today_min = today_sec // 60
+            if today_min >= target_min:
+                self._set_state("今日任务已完成")
+                self._emit_log(
+                    f"🎯 今日任务已完成！已读 {today_min}/{target_min} 分钟"
                 )
-                self._set_state("今日任务已完成，空闲中")
-                self.log.emit(
-                    f"🎯 今日任务已完成！已读 {completed_min}/{plan.target_minutes} 分钟"
-                    f"（Skill 基线 {plan.skill_baseline_sec}s + 本次累加 {plan.session_accum_sec}s）"
-                )
-                self._notify_daily_done(completed_min)
-                if not self._sleep_till_next_minute(plan.date):
+                self._notifier.notify_daily_done(today_min, target_min)
+                self.task_completed.emit(today_min)
+                # 等待下一天或用户停止
+                if not self._sleep_till_next_minute():
                     return
                 continue
-            else:
-                # 每 30 次成功打印一次详细完成度日志
-                if plan.success_count > 0 and plan.success_count % 30 == 0:
-                    log.info(
-                        "📊 完成度详情：%d/%d 分钟 (%d%%) | "
-                        "Skill基线=%ds 本次累加=%ds 本地估算=%dmin | "
-                        "剩余≈%dmin | 成功=%d 失败=%d",
-                        completed_min, plan.target_minutes,
-                        completed_min * 100 // max(1, plan.target_minutes),
-                        plan.skill_baseline_sec, plan.session_accum_sec,
-                        plan.started_minutes, remaining_min,
-                        plan.success_count, plan.fail_count,
-                    )
-            # —— 周期性刷新 Skill 基线 ——
-            self._maybe_refresh_skill_baseline(plan)
+
+            # ③ 检查书架是否全部 100%
+            if self._is_shelf_all_done():
+                self._set_state("书架已全部读完")
+                self._emit_log("📚 书架中所有书籍已读完（progress=100%）")
+                self.task_completed.emit(today_min)
+                if not self._sleep_till_next_minute():
+                    return
+                continue
+
+            # ④ 定期刷新 Skill 数据（每 30 分钟）
+            self._maybe_refresh_skill_data()
+            if self._stop_event.is_set():
+                return
+
+            # ⑤ 选书选章
+            if not self._select_book_and_chapter():
+                self._set_state("无可读书籍")
+                self._emit_log("⚠️ 无可读书籍（书架为空或无章节池）")
+                if not self._sleep_till_next_minute():
+                    return
+                continue
+
+            # ⑥ 执行单次阅读上报
             self._set_state("阅读中")
-            # 执行一次
-            ok = self._do_one_reading_step(plan)
-            # 进度上报
-            cfg = self._cfg.get("reading", {}) or {}
-            mn = max(5, int(cfg.get("min_interval_sec", 25)))
-            mx = max(mn, int(cfg.get("max_interval_sec", 45)))
-            base_interval = random.uniform(mn, mx)
-            # 每完成 ~20 次加一段较长休息（模拟疲劳停顿）
-            is_break = False
-            break_extra = 0.0
-            if plan.success_count > 0 and plan.success_count % 20 == 0:
-                is_break = True
-                break_extra = random.uniform(60, 180)
-            jitter = random.uniform(0.85, 1.15)
-            cur_interval = base_interval * jitter
-            if is_break:
-                cur_interval += break_extra
-            if not ok:
-                # 失败时"加 30~60s 额外冷却"，而不是硬下限 60s
-                fail_extra = random.uniform(30, 60)
-                cur_interval += fail_extra
+            ok = self._do_one_reading_step()
 
-            # —— 详细日志：间隔随机化过程 ——
-            parts = [
-                f"间隔={mn}~{mx}s",
-                f"基础={base_interval:.1f}s",
-                f"抖动×{jitter:.2f}",
-            ]
-            if is_break:
-                parts.append(f"休息+{break_extra:.0f}s")
-            if not ok:
-                parts.append(f"失败冷却+{fail_extra:.0f}s")
-            parts.append(f"→ 最终={cur_interval:.1f}s")
-            log.info("📏 阅读间隔：%s", " | ".join(parts))
-            if is_break:
-                self.log.emit(
-                    f"☕ 每 20 次长休息：+{break_extra:.0f}s（下一轮 ≈ {cur_interval:.1f}s）"
-                )
-            if not ok:
-                self.log.emit(
-                    f"⚠️ 本次阅读失败，额外冷却 {fail_extra:.0f}s（下一轮 ≈ {cur_interval:.1f}s）"
-                )
+            # ⑦ 章节切换检查（4~5 次后换章）
+            if ok:
+                self._check_chapter_switch()
+                # 100% 换书
+                self._check_book_switch()
 
-            # 用绝对时间戳驱动 UI 倒计时（UI 只需要 tick 1s + max(0,next_run_at-now)）
-            next_run_at = time.time() + float(cur_interval)
-            with self._state_lock:
-                state_text = self._current_state
-            # —— 带"当前书"快照，让状态页不必跨线程访问 API._book_lock
-            try:
-                book_snap = self._api.current_book()
-            except Exception:  # noqa: BLE001
-                book_snap = None
-            last_report_ts = int(getattr(self._api, "_last_read_ts", 0) or 0)
-
-            self.progress.emit(
-                {
-                    "date": plan.date,
-                    "target_minutes": plan.target_minutes,
-                    "started_minutes": plan.started_minutes,
-                    # —— Skill 混合方案新增字段 ——
-                    "completed_minutes": plan.completed_minutes,
-                    "completed_sec": plan.completed_sec,
-                    "skill_baseline_sec": plan.skill_baseline_sec,
-                    "session_accum_sec": plan.session_accum_sec,
-                    "skill_available": not self._skill_fallback_used,
-                    "success": plan.success_count,
-                    "fail": plan.fail_count,
-                    "current_interval": round(cur_interval, 1),
-                    "next_run_at": round(next_run_at, 3),
-                    "state": state_text,
-                    "book": book_snap,
-                    "last_report_ts": last_report_ts,
-                }
-            )
-
-            # 等待下一次
+            # ⑧ 计算下次间隔
+            cur_interval = self._calc_next_interval(ok)
+            self._next_run_at = time.time() + cur_interval
+            self._emit_progress(cur_interval, ok)
             if not self._interruptible_sleep(cur_interval):
                 return
 
         self._set_state("已停止")
         log.info("调度器已停止")
 
-    # ---------------- 登录态健康巡检（阅读过程中） ----------------
-    def _maybe_run_health_check(self) -> None:
-        """每次循环入口尝试；只有到达下一次健康检查时间戳才会真的发起 check_session。"""
-        now = time.time()
-        with self._health_lock:
-            if self._health_next_ts <= 0.0:
-                self._health_next_ts = now + max(180.0, float(self._cfg.get("reading.health_check_first_min") or 3) * 60)
-            if now < self._health_next_ts:
+    # ---------------- 选书选章 ----------------
+    # 封面/版权页等非正文标题黑名单
+    _SKIP_TITLES = {"封面", "版权信息", "编辑说明", "序", "序言", "前言",
+                    "目录", "书名页", "扉页", "版权页", "内容简介", "作者简介"}
+
+    @classmethod
+    def _is_skip_chapter(cls, chapter: dict) -> bool:
+        """判断是否为非正文章节（封面/版权页等），上报这些会被服务器拒绝。"""
+        if not isinstance(chapter, dict):
+            return False
+        title = str(chapter.get("title", "")).strip()
+        if title in cls._SKIP_TITLES:
+            return True
+        # 字数过少（< 50）大概率是扉页/版权页
+        try:
+            wc = int(chapter.get("wordCount", 0) or 0)
+        except (TypeError, ValueError):
+            wc = 0
+        if 0 < wc < 50:
+            return True
+        return False
+
+    def _first_content_chapter(self, book_id: str) -> dict | None:
+        """返回第一个正文章节（跳过封面/版权页）。"""
+        chapters = self._db.get_chapters(book_id)
+        for ch in chapters:
+            if not self._is_skip_chapter(ch):
+                return ch
+        # 全部都是非正文 → 返回第一章兜底
+        return chapters[0] if chapters else None
+
+    def _select_book_and_chapter(self) -> bool:
+        """进度驱动选书 + 顺序选章。"""
+        with self._state_lock:
+            # 已有当前书且进度 < 100% → 继续读
+            if (
+                self._current_book
+                and self._safe_progress(self._current_book) < 100
+                and self._current_chapter
+            ):
+                return True
+
+            # 选下一本：进度最高的未读完的书
+            book = self._db.select_next_book()
+            if not book:
+                self._current_book = None
+                self._current_chapter = None
+                return False
+
+            self._current_book = book
+            book_id = str(book.get("bookId"))
+            title = str(book.get("title", "未知"))
+            progress = self._safe_progress(book)
+            self._chapter_read_count = 0
+            self._emit_log(f"📖 切换书籍：{title}（进度 {progress}%）")
+            self.current_book_changed.emit(title, progress)
+
+            # 选到新书后实时拉一次 Skill 进度覆盖本地（避免旧进度不准）
+            new_progress = self._refresh_book_progress(book_id)
+            if new_progress is not None:
+                progress = new_progress
+                self.current_book_changed.emit(title, progress)
+
+            # 选起始章节：从 current_chapter_uid 开始
+            current_uid = book.get("current_chapter_uid")
+            chapter = None
+            if current_uid is not None:
+                chapter = self._db.get_chapter_by_uid(book_id, current_uid)
+            if not chapter:
+                # 回退到第一个正文章节（跳过封面/版权页）
+                chapter = self._first_content_chapter(book_id)
+            if not chapter:
+                # 无章节池 → 尝试拉取
+                self._emit_log(f"⚠️ {title} 无章节池，尝试用 Skill 拉取...")
+                chapters = self._skill.fetch_chapters(book_id)
+                if chapters:
+                    self._db.update_chapters(book_id, title, chapters)
+                    chapter = self._first_content_chapter(book_id)
+            if not chapter:
+                self._emit_log(f"❌ {title} 无可用章节，跳过此书")
+                # 标记为已读避免循环
+                self._db.update_book_progress(book_id, 100)
+                self._current_book = None
+                return False
+
+            self._current_chapter = chapter
+            ch_title = str(chapter.get("title", "未知"))
+            ch_uid = chapter.get("chapterUid", 0)
+            self._emit_log(f"📖 起始章节：{ch_title}（uid={ch_uid}）")
+            self.current_chapter_changed.emit(ch_title, ch_uid)
+            return True
+
+    def _check_chapter_switch(self) -> None:
+        """检查是否需要换章（4~5 次后）。"""
+        reading_cfg = self._cfg.get("reading", {}) or {}
+        try:
+            ch_max = int(reading_cfg.get("chapter_read_max", 5))
+        except (ValueError, TypeError):
+            ch_max = 5
+        with self._state_lock:
+            if self._chapter_read_count < ch_max:
                 return
-            # 占领这次窗口，其它分支（比如 pause/stop 过程中重入）不会重复跑
-            self._health_next_ts = now + max(180.0, float(self._health_interval_sec))
-        self.log.emit("🔍 登录态巡检中：自动检查 chapter_sync / shelf_sync / wr_skey 刷新")
-        ok = self._api.check_session()
-        if ok:
-            with self._health_lock:
-                self._health_fail_count = 0
-            self.log.emit("✅ 登录态巡检通过，下一轮 ≈ {} 分钟后".format(round(max(180, self._health_interval_sec) / 60, 1)))
+            if not self._current_book or not self._current_chapter:
+                return
+            book = self._current_book
+            cur_chapter = self._current_chapter
+
+        book_id = str(book.get("bookId"))
+        cur_uid = cur_chapter.get("chapterUid")
+        next_chapter = self._db.get_next_chapter(book_id, cur_uid)
+        # 跳过封面/版权页等非正文章节
+        while next_chapter and self._is_skip_chapter(next_chapter):
+            next_chapter = self._db.get_next_chapter(book_id, next_chapter.get("chapterUid"))
+        if not next_chapter:
+            # 已到最后一章 → 标记进度 100% 触发换书
+            self._emit_log(
+                f"📖 {book.get('title', '?')} 已读完最后一章，标记 100%"
+            )
+            self._db.update_book_progress(book_id, 100)
             return
-        # 失败：尝试自动续期
-        self.log.emit("⚠️ 巡检发现登录态异常，正在自动刷新 Cookie ...")
-        refreshed = self._api.ensure_session()
-        with self._health_lock:
-            if refreshed:
-                self._health_fail_count = 0
-                self.log.emit("✅ 巡检刷新 Cookie 成功，已恢复")
-                return
-            self._health_fail_count += 1
-            self._health_next_ts = now + 5 * 60  # 失败后缩短到 5 分钟后再试
-        self.log.emit(
-            "❌ 巡检刷新失败（本次失败计数 {}），已切换为主动告警模式".format(self._health_fail_count)
+
+        with self._state_lock:
+            self._current_chapter = next_chapter
+            self._chapter_read_count = 0
+        ch_title = str(next_chapter.get("title", "未知"))
+        ch_uid = next_chapter.get("chapterUid", 0)
+        self._emit_log(f"📖 切换章节：{ch_title}（uid={ch_uid}）")
+        self.current_chapter_changed.emit(ch_title, ch_uid)
+        # 更新 LocalDB 当前章节
+        self._db.update_book_progress(
+            book_id,
+            self._safe_progress(book),
+            chapter_uid=ch_uid,
+            chapter_title=ch_title,
         )
-        # 连续 2 次都救不回 → 推送 WxPusher（配置 notify_cookie_fail=true 才推）
-        if self._health_fail_count >= 2:
-            self._set_state("登录态失效，等待扫码")
-            self._notify_cookie_fail()
-            self.cookie_fail_reported.emit()
-        return
 
-    # ---------------- helpers ----------------
-    def _ensure_daily_plan(self) -> DailyPlan:
-        today = dt.date.today().isoformat()
-        with self._daily_lock:
-            if self._daily is None or self._daily.date != today:
-                cfg = self._cfg.get("reading", {}) or {}
-                mn = max(0, int(cfg.get("min_hours", 8)))
-                mx = max(mn, int(cfg.get("max_hours", 10)))
-                target_min = mn * 60
-                target_max = mx * 60
-                # —— 需求3：当天持久化，从 config 读今日目标 ——
-                persisted = cfg.get("daily_plan") or {}
-                persisted_date = str(persisted.get("date") or "").strip()
-                persisted_target = int(persisted.get("target_minutes") or 0)
-                is_new_day = (persisted_date != today) or (persisted_target <= 0)
-                if is_new_day:
-                    # 首次启动（或次日）→ 随机取新值并写回 config
-                    target = random.randint(target_min, target_max)
-                    self._cfg.set("reading.daily_plan", {
-                        "date": today,
-                        "target_minutes": target,
-                    })
-                    self._daily = DailyPlan(date=today, target_minutes=target)
-                    self._cookie_fail_notified = False
-                    self.log.emit(
-                        f"【{today}】今日阅读任务：{target // 60} 小时 {target % 60} 分钟"
-                    )
-                    # —— 首次创建计划时，立即尝试获取 Skill 基线 ——
-                    self._fetch_skill_baseline(self._daily)
-                    # WxPusher 推送只在首次取值时发送（避免重启重复推送）
-                    self._notifier.send_async(
-                        f"【微信读书助手】今日任务：{target // 60}h{target % 60:02d}m，开始执行。"
-                        f"{'（Skill 基线 ' + str(self._daily.skill_baseline_sec) + 's）' if self._daily.skill_baseline_sec else ''}",
-                        dedup_key=f"plan_{today}",
-                        dedup_window_sec=3600 * 23,
-                    )
-                else:
-                    # 当天重启 → 复用已持久化的目标值
-                    target = persisted_target
-                    self._daily = DailyPlan(date=today, target_minutes=target)
-                    self._cookie_fail_notified = False
-                    self.log.emit(
-                        f"【{today}】今日阅读任务（恢复）：{target // 60} 小时 {target % 60} 分钟"
-                    )
-                    # 恢复时也获取 Skill 基线
-                    self._fetch_skill_baseline(self._daily)
-            return self._daily
+    def _check_book_switch(self) -> None:
+        """检查是否需要换书（进度 100%）。"""
+        with self._state_lock:
+            if not self._current_book:
+                return
+            book = self._current_book
+        book_id = str(book.get("bookId"))
+        progress = self._safe_progress(book)
+        if progress < 100:
+            return
+        self._emit_log(
+            f"📖 {book.get('title', '?')} 进度已达 100%，准备换书"
+        )
+        # 清空当前书，下一轮 _select_book_and_chapter 会选下一本
+        with self._state_lock:
+            self._current_book = None
+            self._current_chapter = None
+            self._chapter_read_count = 0
 
-    def _do_one_reading_step(self, plan: DailyPlan) -> bool:
-        # P0-修复 rt 随机：传 None 让 weread_api 走 random.randint(25, 60)
-        # 原先固定传 now-30 导致 diff=30，rt 永远等于 30，强机器人指纹
-        last_time = None
-        # P1-4 换书判定：成功计数同步给 weread_api
-        try:
-            self._api.set_success_count(int(plan.success_count or 0))
-        except Exception as exc:  # noqa: BLE001
-            log.debug("set_success_count 失败（非致命）：%s", exc)
-        ok = self._api.read_once(last_time=last_time)
-        # ===== 连续 2 次 HTTP 200 空 body → 自动清缓存 + 重拉章节池 =====
-        try:
-            cb = self._api.current_book() or {}
-            bid = str(cb.get("book_id") or "").strip() or "__unknown__"
-        except Exception:  # noqa: BLE001
-            bid = "__unknown__"
-        is_empty = bool(getattr(self._api, "_last_read_empty_body", False))
-        if is_empty and not ok:
-            # 命中空 body → 计数器 +1
-            self._consec_empty_body[bid] = int(self._consec_empty_body.get(bid, 0)) + 1
-            log.info(
-                "scheduler：书籍 %s 命中空 body（本次连续第 %d 次）",
-                bid, self._consec_empty_body[bid],
-            )
-            if self._consec_empty_body[bid] >= 2:
-                self.log.emit(
-                    f"⚠️ 书籍 {bid[:20]} 连续 {self._consec_empty_body[bid]} 次返回空 body，"
-                    "自动丢弃旧章节池并重拉..."
-                )
-                log.warning(
-                    "书籍 %s 连续 %d 次空 body，自动重拉章节池",
-                    bid, self._consec_empty_body[bid],
-                )
-                try:
-                    # 后台不阻塞：先清 scoped，再 refresh_chapters_for_book（内部走 web 签名化 chapterInfos + 立即写盘）
-                    self._api.scoped_chapters.pop(bid, None)
-                    refreshed = self._api.refresh_chapters_for_book(bid)
-                    log.info("书籍 %s 自动重拉章节池结果：%s", bid, refreshed)
-                except Exception as _e:  # noqa: BLE001
-                    log.warning("书籍 %s 自动重拉章节池异常：%s", bid, _e)
-                finally:
-                    # 无论成功失败都重置计数器，避免下一轮一上来就又重刷
-                    self._consec_empty_body[bid] = 0
-        else:
-            # 成功 / 其它失败 → 计数器清零
-            self._consec_empty_body[bid] = 0
+    # ---------------- 单次阅读上报 ----------------
+    def _do_one_reading_step(self) -> bool:
+        """执行一次 read_once 上报。"""
+        with self._state_lock:
+            book = self._current_book
+            chapter = self._current_chapter
+        if not book or not chapter:
+            self._emit_log("⚠️ 无当前书/章节，跳过本次阅读")
+            return False
 
-        with self._daily_lock:
+        book_id = str(book.get("bookId"))
+        chapter_uid = str(chapter.get("chapterUid", ""))
+        title = str(book.get("title", "未知"))
+        ch_title = str(chapter.get("title", "未知"))
+
+        ok = self._api.read_once(book_id, chapter_uid)
+        with self._state_lock:
             if ok:
-                plan.success_count += 1
-                # —— 混合方案：同时累加本地估算分钟数 + 秒数（用于 Skill 估算）——
-                plan.started_minutes += 1  # 一次 30s 左右 ≈ 0.5 分钟，累计 +1 偏保守
-                plan.session_accum_sec += 30  # 每次成功阅读约 30 秒
+                self._success_count += 1
+                self._chapter_read_count += 1
+                # 本地累加进度（按章节比例微调）
+                self._increment_local_progress(book_id, title, ch_title)
+                # 本地累加今日阅读秒数
+                today_sec = self._db.add_today_seconds(READ_ONCE_SECONDS)
+                self._emit_log(
+                    f"✅ 阅读成功：{title} {ch_title}（第 {self._chapter_read_count} 次，"
+                    f"今日 {today_sec // 60} 分钟）"
+                )
             else:
-                plan.fail_count += 1
-        if ok:
-            completed = plan.completed_minutes
-            self.log.emit(
-                f"阅读进度：{completed}/{plan.target_minutes} 分钟 "
-                f"（{completed * 100 // max(1, plan.target_minutes)}%）"
-                f"{'（Skill 基线 +' if plan.skill_baseline_sec else ''}估算"
-            )
-        else:
-            # 若连续失败且登录态真的失效 → 通知
-            if not self._api.check_session():
-                self.log.emit("检测到登录态已失效，准备推送提醒")
-                self._notify_cookie_fail()
+                self._fail_count += 1
+                self._emit_log(f"❌ 阅读失败：{title} {ch_title}")
         return ok
 
-    def _notify_cookie_fail(self) -> None:
-        if self._cookie_fail_notified:
-            return
-        if not (self._cfg.get("push.notify_cookie_fail", True)):
-            return
-        self._cookie_fail_notified = True
-        self.cookie_broken.emit()
-        self._notifier.send_async(
-            "【微信读书助手】Cookie 已失效，请打开软件重新扫码登录，否则今日任务将无法完成。",
-            max_attempts=3,
-            dedup_key="cookie_fail",
-            dedup_window_sec=3600 * 4,
+    def _increment_local_progress(
+        self, book_id: str, title: str, ch_title: str
+    ) -> None:
+        """本地累加进度（按章节比例微调）+ 实时通知 UI。"""
+        chapters = self._db.get_chapters(book_id)
+        chapter_count = max(1, len(chapters))
+        # 每章在全书中的进度比例
+        delta = 100.0 / chapter_count
+        new_progress = self._db.increment_book_progress(book_id, delta)
+        with self._state_lock:
+            if self._current_book:
+                self._current_book["progress"] = new_progress
+        # 实时发射 UI 更新信号
+        self.book_progress_updated.emit(
+            title, new_progress, ch_title, self._chapter_read_count
         )
 
-    # ---------------- 改动3：cookie_invalid 信号接收槽 ----------------
-    def _on_cookie_invalid(self, severity: str, reason: str) -> None:
-        """接收 WeReadApi.cookie_invalid：区分 HARD（硬停止）/ SOFT（只告警不停止）。
-
-        触发路径：
-          - ensure_session() 锚点缺失（RK/ptcz 空）→ HARD
-          - _renew_wr_skey() 返回 HARD_INVALID（errCode=-2010/-2012 或跳登录页或含登录扫码文案）→ HARD
-          - renewal 成功但 check_session 仍失败 → HARD
-          - renewal 5xx/超时/网络异常 → SOFT（保持循环，冷却后重试）
-        """
-        log.warning("🔴 scheduler 收到 cookie_invalid severity=%s reason=%s", severity, reason)
-        if severity == "HARD_INVALID":
-            # —— 硬失效：停止阅读循环，不再做任何无效尝试 ——
-            self._set_state("登录态硬失效，必须重新扫码")
-            self.log.emit(f"🔴 登录态硬失效（原因：{reason}），已自动停止阅读循环，等待重新扫码")
-            # 推送：HARD 是关键事件，必须推送（独立 dedup key，不依赖 _cookie_fail_notified，
-            # 避免被先前 SOFT 推送短路；notifier 自带 4h dedup 防轰炸）
-            if self._cfg.get("push.notify_cookie_fail", True):
-                self._notifier.send_async(
-                    f"【微信读书助手】登录态硬失效（{reason}），必须打开软件重新扫码登录。今日任务暂停。",
-                    max_attempts=3,
-                    dedup_key="cookie_fail_hard",
-                    dedup_window_sec=3600 * 4,
-                )
-            # 标红 + 硬失效专用信号 → UI 弹窗 + 锁开始按钮
-            self.cookie_broken.emit()
-            self.cookie_hard_invalid.emit(reason)
-            # 停止调度器（下一轮循环回到入口时自会退出）
-            self._stop_event.set()
-        else:
-            # 软失效：仅告警不停止，保持循环，冷却后会再跑 ensure_session 再试
-            self.log.emit(f"⚠️ 登录刷新失败（软）：{reason}，稍后自动重试")
-            if not self._cookie_fail_notified and self._cfg.get("push.notify_cookie_fail", True):
-                self._cookie_fail_notified = True
-                self._notifier.send_async(
-                    f"【微信读书助手】登录刷新失败（{reason}），仍在重试；若持续出现请重新扫码。",
-                    max_attempts=2,
-                    dedup_key="cookie_fail_soft",
-                    dedup_window_sec=3600 * 4,
-                )
-            self.cookie_fail_reported.emit()
-
-    # ---------------- Skill 基线（混合方案完成度检测） ----------------
-    def _fetch_skill_baseline(self, plan: DailyPlan) -> None:
-        """获取 Skill 网关的今日阅读时长基线。
-
-        如果 Skill 不可用，降级为本地估算并记录警告。
-        """
-        log.info(
-            "🔄 _fetch_skill_baseline 开始：当前 Skill 基线=%ds 本次累加=%ds 本地估算=%dmin",
-            plan.skill_baseline_sec, plan.session_accum_sec, plan.started_minutes,
-        )
-        try:
-            summary = self._api.fetch_daily_reading_summary()
-            today_sec = summary.get("today_seconds")
-            log.info(
-                "🔄 _fetch_skill_baseline 返回：today_seconds=%s source=%s",
-                today_sec, summary.get("source"),
-            )
-            if today_sec is not None and isinstance(today_sec, (int, float)) and today_sec >= 0:
-                plan.skill_baseline_sec = int(today_sec)
-                self._last_skill_refresh_ts = time.time()
-                # 额外打印 4 项数据
-                log.info(
-                    "✅ Skill 统计完整：今日=%ds 本周=%ds 本月=%ds 总累计=%ds",
-                    today_sec,
-                    summary.get("week_seconds"),
-                    summary.get("month_seconds"),
-                    summary.get("total_seconds"),
-                )
-                if self._skill_fallback_used:
-                    self.log.emit(f"✅ Skill 基线已恢复：今日 {plan.skill_baseline_sec}s")
-                    self._skill_fallback_used = False
-                else:
-                    self.log.emit(f"📊 Skill 基线：今日已读 {plan.skill_baseline_sec}s")
-            else:
-                self._log_skill_fallback("Skill 返回今日时长为 None")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("_fetch_skill_baseline 异常：%s", exc)
-            self._log_skill_fallback(f"Skill 基线获取异常：{exc}")
-
-    def _maybe_refresh_skill_baseline(self, plan: DailyPlan) -> None:
-        """周期性刷新 Skill 基线（每 5 分钟或每 N 次成功阅读）。"""
+    # ---------------- 健康检查 ----------------
+    def _maybe_run_health_check(self) -> None:
         now = time.time()
-        elapsed = now - self._last_skill_refresh_ts
-        time_elapsed = elapsed >= self._skill_refresh_interval_sec
-        count_elapsed = (plan.success_count > 0 and plan.success_count % self._skill_success_refresh_count == 0)
-        if not (time_elapsed or count_elapsed):
+        if self._health_next_ts <= 0.0:
+            self._health_next_ts = now + max(
+                180.0,
+                float(self._cfg.get("reading.health_check_first_min", 3)) * 60,
+            )
+        if now < self._health_next_ts:
             return
-        reason = []
-        if time_elapsed:
-            reason.append(f"时间到（{elapsed:.0f}s ≥ {self._skill_refresh_interval_sec}s）")
-        if count_elapsed:
-            reason.append(f"成功次数到（{plan.success_count}）")
-        log.info("🔄 Skill 基线刷新触发：%s", " + ".join(reason))
+        self._health_next_ts = now + max(180.0, float(self._health_interval_sec))
+
+        self._emit_log("🔍 登录态巡检中...")
+        ok = self._api.check_session()
+        if ok:
+            with self._state_lock:
+                self._health_fail_count = 0
+            self._emit_log("✅ 登录态巡检通过")
+            return
+        self._emit_log("⚠️ 巡检发现登录态异常，正在刷新 Cookie...")
+        refreshed = self._api.ensure_session()
+        with self._state_lock:
+            if refreshed:
+                self._health_fail_count = 0
+                self._emit_log("✅ 巡检刷新 Cookie 成功")
+                return
+            self._health_fail_count += 1
+            self._health_next_ts = now + 5 * 60
+            fails = self._health_fail_count
+        self._emit_log(f"❌ 巡检刷新失败（第 {fails} 次）")
+        if fails >= 2:
+            self._set_state("登录态失效，等待扫码")
+            self._notify_cookie_fail("SOFT_FAIL", "连续 2 次巡检刷新失败")
+            self.cookie_broken.emit()
+
+    # ---------------- Skill 数据定期刷新 ----------------
+    def _refresh_book_progress(self, book_id: str) -> int | None:
+        """实时拉一次 Skill 进度覆盖本地，返回新进度或 None。"""
         try:
-            summary = self._api.fetch_daily_reading_summary()
-            today_sec = summary.get("today_seconds")
-            log.info(
-                "🔄 Skill 刷新返回：today=%ds source=%s 旧基线=%ds",
-                today_sec if today_sec else "None",
-                summary.get("source"), plan.skill_baseline_sec,
-            )
-            if today_sec is not None and isinstance(today_sec, (int, float)) and today_sec >= 0:
-                old_baseline = plan.skill_baseline_sec
-                plan.skill_baseline_sec = int(today_sec)
-                plan.session_accum_sec = 0  # 刷新后归零，从新基线开始累加
-                self._last_skill_refresh_ts = now
-                log.info(
-                    "📊 Skill 基线刷新完成：%ds → %ds（Δ=%+d），本次累加归零",
-                    old_baseline, plan.skill_baseline_sec,
-                    plan.skill_baseline_sec - old_baseline,
-                )
-                self.log.emit(
-                    f"📊 Skill 基线刷新：今日 {plan.skill_baseline_sec}s"
-                    f"（{plan.completed_minutes}/{plan.target_minutes} 分钟）"
-                )
-                self._skill_fallback_used = False
-            else:
-                log.warning("Skill 刷新返回 None，保持旧基线 %ds", plan.skill_baseline_sec)
-                self._log_skill_fallback("Skill 刷新返回 None")
+            progress_data = self._skill.fetch_progress(book_id)
+            if not progress_data:
+                return None
+            percent = progress_data.get("percent")
+            if percent is None:
+                return None
+            try:
+                new_progress = int(float(percent))
+            except (TypeError, ValueError):
+                return None
+            self._db.update_book_progress(book_id, new_progress)
+            with self._state_lock:
+                if self._current_book:
+                    self._current_book["progress"] = new_progress
+            self._emit_log(f"📊 Skill 进度刷新：{new_progress}%")
+            return new_progress
         except Exception as exc:  # noqa: BLE001
-            log.warning("Skill 刷新异常：%s", exc)
-            self._log_skill_fallback(f"Skill 刷新异常：{exc}")
+            self._emit_log(f"⚠️ Skill 进度刷新失败：{exc}")
+            return None
 
-    def _log_skill_fallback(self, reason: str) -> None:
-        """Skill 不可用时记录降级日志（只记录一次）。"""
-        if not self._skill_fallback_used:
-            self._skill_fallback_used = True
-            self.log.emit(
-                f"⚠️ Skill 网关不可用（{reason}），"
-                f"完成度检测降级为本地估算模式"
-            )
-
-    def _notify_daily_done(self, minutes: int) -> None:
-        if not (self._cfg.get("push.notify_daily_done", True)):
+    def _maybe_refresh_skill_data(self) -> None:
+        now = time.time()
+        # 动态读取配置，设置页改了立即生效（无需重启调度器）
+        try:
+            interval_sec = int(self._cfg.get("skill.refresh_interval_min", 30)) * 60
+        except (TypeError, ValueError):
+            interval_sec = 30 * 60
+        if now - self._last_skill_refresh_ts < interval_sec:
             return
-        today = dt.date.today().isoformat()
-        self._notifier.send_async(
-            f"【微信读书助手】{today} 任务已完成，共约 {minutes // 60} 小时 {minutes % 60:02d} 分钟。",
-            dedup_key=f"daily_{today}",
-            dedup_window_sec=3600 * 23,
-        )
-        self.task_completed.emit(minutes)
+        self._last_skill_refresh_ts = now
+        self._emit_log("📊 刷新 Skill 数据（统计 + 进度）...")
+        try:
+            stats = self._skill.fetch_reading_stats()
+            if stats:
+                # 适配 LocalDB 字段名
+                local_stats = {
+                    "today_seconds": stats.get("today_seconds") or 0,
+                    "weekly_seconds": stats.get("week_seconds") or 0,
+                    "monthly_seconds": stats.get("month_seconds") or 0,
+                    "total_seconds": stats.get("total_seconds") or 0,
+                }
+                self._db.update_reading_stats(local_stats)
+                self.reading_stats_updated.emit(local_stats)
+                self._emit_log(
+                    f"📊 Skill 统计刷新：今日 {local_stats['today_seconds'] // 60} 分钟"
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._emit_log(f"⚠️ Skill 统计刷新失败：{exc}")
 
-    def _sleep_till_next_minute(self, plan_date: str) -> bool:
-        """在今天任务结束后，小睡 60 秒等待日期滚动。"""
-        total = 0
-        while total < 60 and not self._stop_event.is_set():
-            if dt.date.today().isoformat() != plan_date:
-                return True
-            self._pause_event.wait(timeout=2)
-            self._check_pause()
-            total += 2
-        return not self._stop_event.is_set()
+        # 刷新当前书进度（复用 _refresh_book_progress）
+        with self._state_lock:
+            book = self._current_book
+        if book:
+            book_id = str(book.get("bookId"))
+            self._refresh_book_progress(book_id)
+
+    # ---------------- 完成度 / 书架检查 ----------------
+    def _ensure_daily_plan(self) -> int:
+        """获取或生成今日目标分钟数。"""
+        from datetime import date
+
+        today = date.today().isoformat()
+        daily_plan = self._cfg.get("daily_plan", {}) or {}
+        persisted_date = str(daily_plan.get("date") or "")
+        persisted_target = int(daily_plan.get("target_minutes") or 0)
+        if persisted_date == today and persisted_target > 0:
+            return persisted_target
+
+        reading_cfg = self._cfg.get("reading", {}) or {}
+        try:
+            mn_h = float(reading_cfg.get("min_hours", 1.5))
+            mx_h = float(reading_cfg.get("max_hours", 3.0))
+        except (ValueError, TypeError):
+            mn_h, mx_h = 1.5, 3.0
+        mn_min = int(mn_h * 60)
+        mx_min = int(mx_h * 60)
+        if mx_min < mn_min:
+            mx_min = mn_min
+        target = random.randint(mn_min, mx_min)
+        self._cfg.set("daily_plan", {"date": today, "target_minutes": target})
+        self._emit_log(f"🎯 今日目标：{target} 分钟（{mn_h}~{mx_h} 小时随机）")
+        self._notifier.notify_daily_start(target)
+        return target
+
+    def _is_shelf_all_done(self) -> bool:
+        unread = self._db.get_unread_books()
+        return not unread
+
+    # ---------------- 间隔计算 ----------------
+    def _calc_next_interval(self, ok: bool) -> float:
+        reading_cfg = self._cfg.get("reading", {}) or {}
+        try:
+            mn = max(5, int(reading_cfg.get("min_interval_sec", 30)))
+            mx = max(mn, int(reading_cfg.get("max_interval_sec", 45)))
+        except (ValueError, TypeError):
+            mn, mx = 30, 45
+        base = random.uniform(mn, mx)
+        jitter = random.uniform(0.85, 1.15)
+        cur = base * jitter
+        # 每 N 次长休息（频率从配置动态读取）
+        with self._state_lock:
+            success = self._success_count
+        try:
+            rest_every = int(reading_cfg.get("long_rest_every", 20))
+        except (ValueError, TypeError):
+            rest_every = 20
+        if rest_every > 0 and success > 0 and success % rest_every == 0:
+            try:
+                rest_min = int(reading_cfg.get("long_rest_min_sec", 60))
+                rest_max = int(reading_cfg.get("long_rest_max_sec", 180))
+            except (ValueError, TypeError):
+                rest_min, rest_max = 60, 180
+            extra = random.uniform(rest_min, rest_max)
+            cur += extra
+            self._emit_log(f"☕ 每 {rest_every} 次长休息：+{extra:.0f}s")
+        if not ok:
+            try:
+                cd_min = int(reading_cfg.get("fail_cooldown_min_sec", 30))
+                cd_max = int(reading_cfg.get("fail_cooldown_max_sec", 60))
+            except (ValueError, TypeError):
+                cd_min, cd_max = 30, 60
+            extra = random.uniform(cd_min, cd_max)
+            cur += extra
+            self._emit_log(f"⚠️ 失败冷却：+{extra:.0f}s")
+        return cur
+
+    def _emit_progress(self, cur_interval: float, ok: bool) -> None:
+        with self._state_lock:
+            book = dict(self._current_book) if self._current_book else None
+            chapter = (
+                dict(self._current_chapter) if self._current_chapter else None
+            )
+            success = self._success_count
+            fail = self._fail_count
+            state = self._current_state
+        self.progress.emit({
+            "target_minutes": self._cfg.get("daily_plan.target_minutes", 0),
+            "today_seconds": self._db.get_today_seconds(),
+            "success": success,
+            "fail": fail,
+            "current_interval": round(cur_interval, 1),
+            "next_run_at": round(self._next_run_at, 3),
+            "state": state,
+            "book": book,
+            "chapter": chapter,
+            "chapter_read_count": self._chapter_read_count,
+            "ok": ok,
+        })
+
+    # ---------------- 工具 ----------------
+    @staticmethod
+    def _safe_progress(book: dict) -> int:
+        try:
+            return int(book.get("progress", 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _interruptible_sleep(self, seconds: float) -> bool:
-        """可被 stop/pause 打断的 sleep，返回 False 表示收到 stop。"""
+        """可被 stop/pause 打断的 sleep。返回 False 表示被 stop 打断。"""
         end = time.time() + seconds
         while time.time() < end:
             if self._stop_event.is_set():
                 return False
-            self._pause_event.wait(timeout=0.5)
-            self._check_pause()
-        return True
+            if not self._pause_event.is_set():
+                # 暂停中：等待恢复
+                self._pause_event.wait(timeout=0.5)
+                if self._stop_event.is_set():
+                    return False
+                continue
+            chunk = min(0.2, end - time.time())
+            if chunk <= 0:
+                break
+            time.sleep(chunk)
+        return not self._stop_event.is_set()
 
-    def _check_pause(self) -> None:
-        # 如果被 pause 了就一直等恢复
-        while not self._pause_event.is_set() and not self._stop_event.is_set():
-            self._pause_event.wait(timeout=0.5)
+    def _sleep_till_next_minute(self) -> bool:
+        """睡到下一分钟边界（用于完成/书架全 100% 后等待）。"""
+        now = dt.datetime.now()
+        next_min = (now + dt.timedelta(minutes=1)).replace(
+            second=0, microsecond=0
+        )
+        wait_sec = (next_min - now).total_seconds() + 1
+        return self._interruptible_sleep(wait_sec)
+
+    # ---------------- 信号处理 ----------------
+    def _on_cookie_invalid(self, severity: str, reason: str) -> None:
+        log.warning("收到 Cookie 失效信号：severity=%s reason=%s", severity, reason)
+        self._notify_cookie_fail(severity, reason)
+        if severity == "HARD_INVALID":
+            self._set_state("登录态硬失效，等待扫码")
+            self.cookie_hard_invalid.emit(reason)
+            self.cookie_broken.emit()
+            # 设置 stop 让主循环退出
+            self._stop_event.set()
+
+    def _notify_cookie_fail(self, severity: str, reason: str) -> None:
+        self._notifier.notify_cookie_fail(severity, reason)

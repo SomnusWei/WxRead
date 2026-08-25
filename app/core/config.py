@@ -30,9 +30,9 @@ def get_log_dir() -> Path:
 CONFIG_PATH = get_app_dir() / "config.json"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "cookies": {},          # 登录后从浏览器提取（向后兼容的简化 dict）
-    "cookies_raw": [],      # 登录后 cookies 的完整列表 [{name,value,domain,path,secure,httpOnly,sameSite}]
-    "headers": {            # 默认请求头（登录后也会从浏览器请求中补充）
+    "cookies": {},          # 登录后从浏览器提取（简化 dict {name: value}）
+    "cookies_raw": [],      # 登录后 cookies 的完整列表 [{name,value,domain,...}]
+    "headers": {            # 默认请求头
         "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "user-agent": (
@@ -41,9 +41,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ),
         "referer": "https://weread.qq.com/",
         "origin": "https://weread.qq.com",
-        # 关键技术点.txt 硬性要求：Sentry Baggage 监控追踪头
-        # （和抓包时看到的浏览器一致，否则部分签名噪声源/反作弊指纹不通过）
-        # 实际值在 WeReadApi._augment_headers_baggage() 中按采集到的 _qimei_uuid42 / qimei36 动态覆写。
         "baggage": (
             "sentry-public_key=9e103f84d02c4b05a318c0a2d72d3e3f,"
             "sentry-trace_id=00000000000000000000000000000000,"
@@ -52,49 +49,44 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ),
     },
     "reading": {
-        "min_hours": 1.5,          # 每日最少小时数（风控建议：1.5~3h，避免 >6h 单日高危）
-        "max_hours": 3,            # 每日最多小时数（风控建议：>6h 平台开始对超长段打折不计）
-        "min_interval_sec": 30,    # 单次 /read 请求后等待下限（风控建议：30~45s，真人平均翻页节奏）
-        "max_interval_sec": 45,    # 单次 /read 请求后等待上限
-        "daily_random_hour_start": 0,   # 每天随机开始小时（0-23），0=启用就跑/按计划跑
-        "health_check_first_min": 3,    # 调度器启动后首次登录态巡检间隔（分钟）
-        "health_check_min": 12,          # 之后每多少分钟一次登录态巡检
-        # ===== 启动随机延迟（机器指纹伪装）=====
-        "startup_delay_min_sec": 30,     # 点击开始后首次阅读前随机等待下限
-        "startup_delay_max_sec": 90,     # 点击开始后首次阅读前随机等待上限
-        # ===== 风控：书籍/章节多样性 =====
-        "switch_book_every_min": 20,     # 阅读多少次后换一本书，0=不换
-        "switch_book_every_max": 40,     # 换书区间上限（在 [min,max] 随机换书点）
-        "same_chapter_max_reuse": 5,     # 同一章节最多连续使用多少次，超过强制换章
-        # ===== CDP 模式：书架跳读配置 =====
-        "shelf_books": [],               # CDP 登录获取的用户书架 [{bookId, title, ...}]
-        "chapter_pools": {},             # CDP 登录获取的章节池 {book_id: [chapter_uid, ...]}
-        "max_shelf_books_for_chapters": 5,  # 章节池构建时取前 N 本书
-        "book_switch_recent_exclude": 3,     # 换书时排除最近 N 本
-        "chapter_switch_recent_exclude": 5,  # 换章时排除最近 N 章
-        # 今日目标当天持久化：当天首次启动随机取值后写入，当天多次启动复用，次日重取
-        "daily_plan": {"date": "", "target_minutes": 0},
-        # ===== 自动化抓取工作流配置（保留兼容）=====
-        "capture_timeout_sec": 15,        # 单次抓取超时秒数
-        "workflow_retry_count": 2,       # 抓取失败重试次数
-        "santi_book_url": "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2a",
-        "santi_chapter_url": "https://weread.qq.com/web/reader/ce032b305a9bc1ce0b0dd2ak92c3210025c92cc22753209",
-    },
-    "push": {
-        "wxpusher_spt": "",        # WxPusher 极简推送 SPT
-        "notify_cookie_fail": True,
-        "notify_daily_done": True,
-    },
-    "app": {
-        "auto_start": False,       # 开机自启
-        "minimize_to_tray": True,  # 关闭按钮最小化到托盘
-        "start_minimized": False,  # 启动直接进托盘
-        "start_maximized": True,   # 启动后窗口默认最大化
+        "min_hours": 1.5,              # 每日最少阅读时长（小时）
+        "max_hours": 3.0,              # 每日最多阅读时长（小时）
+        "min_interval_sec": 30,        # 单页停留下限（秒）
+        "max_interval_sec": 45,        # 单页停留上限（秒）
+        "chapter_read_min": 4,         # 单章最少阅读次数
+        "chapter_read_max": 5,         # 单章最多阅读次数
+        "startup_delay_min_sec": 15,   # 启动随机延迟下限
+        "startup_delay_max_sec": 25,   # 启动随机延迟上限
+        "health_check_first_min": 3,   # 首次健康巡检间隔（分钟）
+        "health_check_min": 12,        # 之后每多少分钟一次巡检
+        "long_rest_every": 20,         # 每 N 次阅读长休息
+        "long_rest_min_sec": 60,       # 长休息下限
+        "long_rest_max_sec": 180,      # 长休息上限
+        "fail_cooldown_min_sec": 30,   # 失败冷却下限
+        "fail_cooldown_max_sec": 60,   # 失败冷却上限
     },
     "skill": {
-        "api_key": "",                # WEREAD_API_KEY (wrk-xxxxxxxx)，申请：https://weread.qq.com/r/weread-skills
-        "version": "1.0.5",          # Skill 版本号
-        "summary_cache_ttl": 180,    # 阅读统计缓存秒数（默认 3 分钟）
+        "api_key": "",                 # WEREAD_API_KEY (wrk-xxxxxxxx)
+        "version": "1.0.5",            # Skill 版本号
+        "summary_cache_ttl": 180,      # 阅读统计缓存秒数（默认 3 分钟）
+        "refresh_interval_min": 30,    # Skill 数据刷新间隔（分钟）
+    },
+    "push": {
+        "wxpusher_spt": "",
+        "notify_daily_start": True,    # 每日首次开始
+        "notify_cookie_fail": True,    # Cookie 失效通知
+        "notify_daily_done": True,     # 任务完成发送
+        "notify_login_success": False,  # 登录成功通知
+    },
+    "app": {
+        "auto_start": False,          # 开机自启
+        "minimize_to_tray": True,      # 关闭按钮最小化到托盘
+        "start_minimized": False,      # 启动直接进托盘
+        "start_maximized": True,       # 启动后窗口默认最大化
+    },
+    "daily_plan": {
+        "date": "",                    # 日期键 YYYY-MM-DD
+        "target_minutes": 0,           # 当日随机目标（分钟）
     },
 }
 
@@ -195,6 +187,26 @@ class ConfigStore:
             node.update(patch)
             if auto_save:
                 self._save_unlocked()
+
+    # ---------- Cookie 便捷方法 ----------
+    def get_cookies_dict(self) -> dict[str, str]:
+        """返回 {name: value} 格式的 Cookie 字典。"""
+        with self._lock:
+            cookies = self._data.get("cookies", {})
+            return deepcopy(cookies) if isinstance(cookies, dict) else {}
+
+    def get_cookies_raw(self) -> list[dict]:
+        """返回 CDP 抓取的完整 Cookie 列表。"""
+        with self._lock:
+            raw = self._data.get("cookies_raw", [])
+            return deepcopy(raw) if isinstance(raw, list) else []
+
+    def clear_cookies(self) -> None:
+        """清空所有 Cookie 数据并保存。"""
+        with self._lock:
+            self._data["cookies"] = {}
+            self._data["cookies_raw"] = []
+            self._save_unlocked()
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

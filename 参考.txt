@@ -1,0 +1,40 @@
+2. 如何在内置浏览器中自动抓取登录 Cookie？
+既然 Skill API 无法满足需求，你仍需通过抓取 Cookie 来模拟阅读请求。在 PC 端软件中集成内置浏览器（如 CEF、Webview2 等）抓取 Cookie，推荐以下技术方案：
+方案一：监听网络请求拦截（最准确）
+通过内置浏览器的网络层拦截功能，捕获发往 weread.qq.com 的请求，直接从请求头（Request Headers）中提取完整的 Cookie 字符串（包含 rk、ptcz 等字段）。
+技术实现参考：例如在 CEF 框架中，可以实现 CefRequestHandler 或 CefResourceRequestHandler 接口，在 OnBeforeResourceLoad 或 OnResourceRedirect 回调中读取请求头；在 Webview2 中，可以通过监听 WebResourceRequested 事件来获取。
+方案二：通过 Cookie 管理器直接读取（最便捷）
+大多数内置浏览器内核都提供了全局的 Cookie 存储管理器。当用户在内置浏览器中扫码登录成功后，你可以直接通过 Cookie 管理器按域名（weread.qq.com）查询并提取所有 Cookie。
+技术实现参考：在 CEF 中，可以使用 CefCookieManager 的 VisitAllCookies 或 VisitUrlCookies 方法；在 Webview2 中，可以通过 CoreWebView2.CookieManager.GetCookiesAsync 方法获取。
+💡 进阶开发建议：解决 Cookie 过期问题
+微信读书的 Cookie 存在定期失效的问题（通常为一到两个月），这会导致你的自动阅读软件在运行一段时间后失效。在开发时，建议加入以下机制：
+自动续期机制：在代码中定期（例如每天）向微信读书的 renew 接口（https://weread.qq.com/web/login/renewal）发送请求，以自动刷新并获取新的 Cookie 值。
+状态检测：在每次发起阅读请求前，检查返回的状态码或字段（如 succ 字段），若发现登录态失效，及时提示用户重新扫码登录。
+在开发 PC 端软件时，通过内置浏览器抓取 Cookie 失败是非常常见的痛点。这通常是因为微信读书的登录机制中，部分关键 Cookie（如 rk、ptcz）被标记为了 HttpOnly 属性。
+核心原因分析：
+如果你的代码尝试通过执行 JavaScript（例如 document.cookie）来获取，必然会失败，因为浏览器的安全策略禁止前端脚本读取 HttpOnly 的 Cookie。此外，如果网络请求拦截的时机不对，或者跨域请求被浏览器拦截，也会导致抓取不到。
+针对你的情况，建议按照以下三个维度进行排查和修复：
+1. 优先尝试：使用 Cookie 管理器直接读取（绕过 HttpOnly 限制）
+既然网络请求拦截（方案一）失败，强烈建议切换到方案二（Cookie 管理器）。这是底层读取方式，不受前端 JS 安全策略限制，能获取包括 HttpOnly 在内的所有 Cookie。
+Webview2 示例 (C#)：
+csharp
+
+
+
+var cookies = await webView.CoreWebView2.CookieManager.GetCookiesAsync("https://weread.qq.com");
+foreach (var cookie in cookies)
+{
+    Console.WriteLine($"{cookie.Name} = {cookie.Value}");
+}
+CEF 示例 (C++)：
+使用 CefCookieManager::GetGlobalManager()->VisitUrlCookies() 方法。
+2. 排查方案一：网络请求拦截失败的原因
+如果你必须使用网络拦截方案，请检查以下细节：
+拦截时机：微信读书扫码登录成功后，通常会触发一次重定向（302）或特定的登录接口（如 web/login）。你需要确保拦截的是登录成功后的首次请求，而不是登录页本身的请求。
+请求过滤：不要只拦截 weread.qq.com 的文档请求，微信的登录态可能是在请求某个 API 或 JS 资源时带上的。建议监听所有发往 *.qq.com 的请求。
+CEF 拦截点：确保你使用的是 OnBeforeResourceLoad 而不是 OnResourceLoadComplete，因为有些请求头在发送前会被修改。
+3. 兜底方案：使用浏览器扩展辅助
+如果你的内置浏览器环境难以直接获取，可以退而求其次，采用类似 CookieCloud 插件的思路：
+在内置浏览器中加载一个轻量级的扩展（如基于 WebExtensions API）。
+利用 browser.cookies.getAll({ domain: "weread.qq.com" }) 方法，在用户点击登录成功后，由扩展主动抓取 Cookie 并通过本地 HTTP 接口或本地存储暴露给你的 PC 主程序。
+
