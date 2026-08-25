@@ -86,3 +86,16 @@ CDP重构方案.md
 现有官方数据卡从Skill获取数据的核心.md
 微信读书自动阅读开发指南-bookId与chapterUid获取.md
 项目计划.txt
+
+# ===== 启动 / smoke 临时追踪日志 =====
+start_trace*.log
+
+# ===== release/：只保留 release_note-v*.md（文档），大二进制不进 git =====
+# onedir 展开目录（数百 MB 到 GB 级）
+release/WxReadAssistant-*-full/
+# 完整安装包 zip
+release/WxReadAssistant-*-full.zip
+# sha1 校验清单（二进制辅助）
+release/WxReadAssistant-*-full.sha1.txt
+# 增量补丁 zip
+release/patch-*.zip

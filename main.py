@@ -128,7 +128,14 @@ def main() -> int:
     from app.utils.logger import setup_logging
     setup_logging()
     log = __import__("app.utils.logger", fromlist=["get_logger"]).get_logger(__name__)
-    log.info("WxReadAssistant v2.0 启动")
+
+    # 记录启动版本/build（打包后也能通过日志追溯二进制）
+    from app.ui.icon_store import APP_VERSION, app_version_display
+    log.info(
+        "===== WxReadAssistant v%s 启动 =====",
+        app_version_display(),
+    )
+    log.info("APP_VERSION=%s ; APP_BUILD_ID will be injected by build_release.py", APP_VERSION)
 
     # 构造主窗口（Phase 8 替换为真正的 MainWindow）
     try:

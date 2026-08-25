@@ -121,9 +121,12 @@ WxRead/
 ├── main.py                    # 入口（单例 + --minimized）
 ├── WxReadAssistant.spec       # PyInstaller 打包配置
 ├── requirements.txt
+├── scripts/
+│   └── build_release.py       # 一键构建：full.zip + 增量补丁 + release_note
 ├── _weread_skills_104/        # Skill 1.0.4 协议文档
 ├── weread_skill_latest/       # Skill 最新协议文档
-└── dist/                      # 打包产物（EXE，.gitignore 忽略）
+├── dist/                      # 打包 onedir 产物（WxReadAssistant/，.gitignore 忽略）
+└── release/                   # 发布区（full.zip / patch / sha1 清单 / release_note）
 ```
 
 ## 快速开始
@@ -150,12 +153,172 @@ python main.py
 python main.py --minimized
 ```
 
-### 打包 EXE
+### 🚢 发布 & 安装（正式用户）
+
+所有正式二进制都放 `release/` 目录，**大二进制（onedir 目录 / full.zip / patch.zip / sha1）不进入 git 历史**（已加入 `.gitignore`），仅 `release_note-vX.Y.Z.md` 版本说明会随源码一起 commit。
+
+> **📦 当前 v2.2.0 状态**：本版是「发布管线首次落地」的基线版本，已产出 `WxReadAssistant-v2.2.0-full.zip` 完整包；因 release 目录尚未归档 v2.1.0 full 目录，**v2.2.0 暂无增量补丁**。
+> 用户请直接下载 full.zip 解压即用；**从下一版 v2.2.1 起**，把 `release/WxReadAssistant-v2.2.0-full/` 目录保留在本机，构建时 `--previous 2.2.0` 即可自动生成 `patch-v2.2.1-from-v2.2.0.zip`。
+
+#### 产物清单（scripts/build_release.py 自动生成）
+
+```
+release/
+├── WxReadAssistant-vX.Y.Z-full/               # onedir 完整目录（可直接运行 / 分发）
+├── WxReadAssistant-vX.Y.Z-full.zip            # 完整安装包（新手）
+├── WxReadAssistant-vX.Y.Z-full.sha1.txt       # 完整包 sha1 清单（校验一致性）
+├── patch-vX.Y.Z-from-vA.B.C.zip               # 增量补丁（旧用户）
+│   ├── WxReadAssistant/                       #   替换目录（与旧版 onedir 合并）
+│   ├── apply_patch.bat                        #   双击应用（自动备份+覆盖+清理）
+│   ├── patch_meta.txt                         #   删除清单（D 行 = 需要删除的旧文件）
+│   └── README-补丁使用说明.md
+└── release_note-vX.Y.Z.md                     #   版本说明 + CHANGELOG + 校验清单
+```
+
+#### 1. 开发者：构建新发布版
 
 ```bash
+# 首次/单版次构建：产出 full.zip + release_note
+python scripts\build_release.py --version 2.2.0
+
+# 构建下一版，并基于 2.2.0 生成 增量补丁 zip
+python scripts\build_release.py --version 2.2.1 --previous 2.2.0
+```
+
+脚本会依次执行：**语法检查 → 版本号 & build_id 写入 icon_store.py → smoke 启动 → PyInstaller onedir → full.zip 归档 + sha1 清单 → （对比 --previous 生成 patch）→ release_note**。
+
+#### 1.5 开发者：如何生成下一版的增量补丁（build_release.py 实操步骤）
+
+> **核心原则**：每次发布完一个版本，都要在本机 `release/` 下**保留上一版的 onedir 展开目录**作为差分基线；
+> 缺了它只能发 full.zip，无法生成小体积 patch.zip。
+
+**① 发布 v2.2.0 时先拿到基线目录（这一步你已完成）**
+```powershell
+cd e:\item\wxread
+python scripts\build_release.py --version 2.2.0
+# 完成后 release/ 会出现：
+#   release/WxReadAssistant-v2.2.0-full/     ← 这个目录千万别删！它就是 v2.2.1 的差分基线
+#   release/WxReadAssistant-v2.2.0-full.zip
+#   release/WxReadAssistant-v2.2.0-full.sha1.txt
+#   release/release_note-v2.2.0.md
+```
+
+**② 做完新功能/修复 bug，准备发 v2.2.1（带增量补丁）**
+```powershell
+cd e:\item\wxread
+# --version  写新版本号
+# --previous 写上一版的版本号（会去找 release/WxReadAssistant-v2.2.0-full/ 做差分）
+python scripts\build_release.py --version 2.2.1 --previous 2.2.0
+```
+
+**③ 脚本对补丁具体会做什么**
+1. 用 PyInstaller 正常构建 v2.2.1 的 onedir 目录；
+2. 遍历对比 `release/WxReadAssistant-v2.2.0-full/` 与 新 onedir：
+   - **A（新增）/ M（修改）** → 直接复制进 `patch-v2.2.1-from-v2.2.0.zip` 的 `WxReadAssistant/` 子目录，用户覆盖即可；
+   - **D（删除）** → 把相对路径写入 `patch_meta.txt`（每行以 `D ` 开头），由 `apply_patch.bat` 读后删除；
+3. 把 `apply_patch.bat` + `README-补丁使用说明.md` 一同塞入 patch zip。
+
+最终 `release/` 新增 5 个产物：
+```
+release/
+├── WxReadAssistant-v2.2.1-full/           ← 新版 onedir（又成为 v2.2.2 的基线）
+├── WxReadAssistant-v2.2.1-full.zip        ← 完整包
+├── WxReadAssistant-v2.2.1-full.sha1.txt
+├── patch-v2.2.1-from-v2.2.0.zip           ← 增量补丁（用户双击 apply_patch.bat 升级）
+└── release_note-v2.2.1.md
+```
+
+**④ 常见出错与解决**
+
+| 报错 / 提示 | 原因 | 解决 |
+|-------------|------|------|
+| `⚠️ 未找到上一版目录 release\WxReadAssistant-v2.2.0-full，跳过增量补丁` | `--previous` 指定的基线目录不在 release/ | 把上一版的 onedir 展开目录（注意是目录不是 zip）解压/复制到 `release/WxReadAssistant-vOLD-full/` 再重跑；或直接把 `dist/WxReadAssistant/` 手动改名后挪过去 |
+| `patch_meta.txt` 里删除条目过多 | 上一版基线目录内容可能不是**原版 onedir**，混入了用户配置/日志等杂项 | 重新解压一份原版 `WxReadAssistant-vOLD-full.zip` 的内容作为基线，不要用已运行过、产生了 `local_db.json` 等文件的目录 |
+| 用户双击 `apply_patch.bat` 提示「进程仍在运行」 | WxReadAssistant.exe（含托盘）未退出 | 右键托盘图标 → 退出；或任务管理器杀掉 `WxReadAssistant.exe` 再打补丁 |
+
+**⑤ apply_patch.bat 的保证（给你/用户双重安心）**
+- ✅ 进程占位检查：EXE 仍在运行 → 直接报错退出，绝不覆盖半开文件；
+- ✅ 自动备份：旧版目录复制到 `_backup_vOLD_时间戳/`，打坏了手动改回目录名就能回滚；
+- ✅ 不碰用户数据：**完全不读写** `%APPDATA%\WxReadAssistant\`（Cookie、`config.json`、`local_db.json`、`chapter_cache.json`、日志）；
+- ✅ 删除清单：只删 `patch_meta.txt` 中 `D ` 开头列出的旧文件，不扫盘不乱删。
+
+#### 2. 终端用户：首次安装（完整包）
+
+1. 下载 `WxReadAssistant-vX.Y.Z-full.zip`，解压到例如 `C:\Program Files\WxReadAssistant\`。
+2. 进入 `WxReadAssistant\` 子目录，双击 `WxReadAssistant.exe` 启动。
+3. 主页 → 「📷 扫码登录」按提示使用 Chrome CDP 扫码获取 Cookie。
+4. （可选）进入「⚙️ 配置中心」填入 **Skill API Key** / **WxPusher Token**。
+
+#### 3. 终端用户：补丁升级（推荐后续更新都走它）
+
+> 补丁包内部自带 `apply_patch.bat` + 中文说明，**不触碰** `%APPDATA%\WxReadAssistant\` 下的 Cookie / 配置 / 本地数据库。
+
+1. 退出 WxReadAssistant（含托盘 → 右键 → 退出）。
+2. 下载 `patch-vNEW-from-vOLD.zip`。
+3. 解压到你**安装目录的父级**（保证解压后 `apply_patch.bat` 与 `WxReadAssistant\` 在同一目录）。
+4. 双击 `apply_patch.bat`（或右键「以管理员身份运行」）。
+5. 脚本依次：**备份旧版 → 覆盖新文件 → 删除旧文件清单 → 回滚提示**。
+6. 启动主程序后，通过「窗口标题 / 主界面右下版本胶囊 / 配置中心标题旁」任意一处确认版次是否升级。
+
+### 打包 EXE（原生 PyInstaller）
+
+```bash
+# 请优先使用 scripts/build_release.py，它会处理版本号/补丁等交付细节。
+# 裸打包仅作备用：
 python -m PyInstaller WxReadAssistant.spec --noconfirm
 # 产物：dist/WxReadAssistant/WxReadAssistant.exe
 ```
+
+## 版本 & 校验
+
+- **版本号源**：`app/ui/icon_store.py::APP_VERSION`（打包脚本会自动改写）
+- **Build ID**：`app/ui/icon_store.py::APP_BUILD_ID` = `<git short sha> · <YYYYMMDD>`
+- **显示位置**：窗口标题 / 托盘 ToolTip / 主界面日志区右下胶囊 / 「⚙️ 配置中心」标题旁小胶囊 / 启动日志 banner。
+- **一致性校验**：`release/WxReadAssistant-vX.Y.Z-full.sha1.txt` 列出每个 onedir 文件的 sha1。
+
+## CHANGELOG
+
+### v2.2.0 — 2026-08-25
+
+#### 🎨 主界面（整板非卡 · Paper Studio）
+- 阅读统计 4 项取消「4 独立白卡」，重新设计为**一张整板通栏**：
+  - 外框仅 1 条 `#E5E5DF` 细边 + 圆角 12（白底 `#FFFFFF`）
+  - 内部 4 段**等宽**（Grid 4 列 `stretch=1`）+ **段间距 18px**（`horizontalSpacing=18`）
+  - 每段统一行预算：标题 28 / 数值 54 / aux 18 / 条 12（含底留 8），行高由 `setRowMinimumHeight` 硬写 + `setRowStretch=0` 禁用弹性，根治 Windows Fusion 高 DPI 下「数值/标题全行消失或裁下半」。
+  - 字号节奏（与非卡整板视觉匹配）：标题 18px 墨黑 / 数值 36px 微信蓝 `#307CFF` / aux 12px muted / 进度 4px 无边框贴底留 8。
+
+#### ⚙️ 配置中心
+- 布局：行 0 三列（📖/🔑/📢）；行 1 两列（💻/🧹，🧹 跨 col1+col2 合并避免右下留空）。
+- 删除独立「🎯 说明」组框，6 条建议拆为 inline `💡 ...` 放在对应组框底部。
+- SpinBox 上下箭头 Bug（高 DPI 黑方块）**根治**：`_ArrowTextSpinBoxStyle(QProxyStyle)` 覆写 `drawComplexControl(CC_SpinBox)`，`super` 画框后用 JetBrains Mono 8pt 粗体以字符方式绘制「▲/▼」——完全绕开 Fusion `border-triangle` 渲染坏路径。
+
+#### 🧭 版本可见性（解决「用户拿到同名旧二进制无法分辨」痛点）
+- 新增 `app_version_display()` → 统一返回 `"{APP_VERSION} · {APP_BUILD_ID}"`，应用到：
+  1. 窗口标题（`WxReadAssistant v...`）
+  2. 托盘 ToolTip / 托盘激活消息 / 最小化消息
+  3. 主界面日志面板右下 胶囊
+  4. 「⚙️ 配置中心」标题 + 返回按钮之间的小胶囊
+  5. 启动日志 banner（`===== WxReadAssistant vX 启动 =====`）
+- `scripts/build_release.py` 每次构建前**覆盖写入** `APP_VERSION` 与 `APP_BUILD_ID`（`git sha · YYYYMMDD`）。
+
+#### 🚢 发布与补丁分发（本次交付核心）
+- 新增 `scripts/build_release.py`：一键 **full.zip** + **增量 patch.zip**（基于 `--previous` 做 A/M/D 差分：A/M 覆盖，D 写入 `patch_meta.txt` → `apply_patch.bat` 读后删除）。
+- 补丁 zip 内嵌 `apply_patch.bat`：
+  - 进程占位检查（若 WxReadAssistant.exe 仍运行 → 报错退出）
+  - 旧版备份 → `_backup_vOLD_时间戳/`（失败可回滚）
+  - robocopy 覆盖 → 删除清单中的旧文件
+  - 保证**完全不动** `%APPDATA%\WxReadAssistant\`（Cookie / 配置 / 本地 DB / 日志）。
+- `release/` 目录统一管理：full 目录、full.zip、sha1 清单、patch、release_note；`.gitignore` 已避免把大二进制推送进 git。
+- **补丁基线约定**：每次发布后请在本机**保留** `release/WxReadAssistant-vX.Y.Z-full/` 目录；下一次构建 `--previous X.Y.Z` 就能直接差分出增量补丁，无需再重跑 600MB+ full.zip 的完整分发。
+- v2.2.0 本身是该机制的「首个基线版」：仅产出 full.zip（255MB），增量补丁从 v2.2.1 开始可用。
+
+### v2.1.0 — 2026-07（历史基线，首次引入「米白纸 Paper Studio」+ 夜读星辰开关移除）
+- Header 左 Logo「📖 微信读书助手」 + 右日期胶囊 / Cookie 状态。
+- 三列比例 3:4:4：阅读状态 / 当前阅读 / 藏书楼操作。
+- 藏书楼操作：3×2 Grid（登录/书架｜获取数据/刷新统计｜刷新进度/配置中心），移除重复 Cookie 控件。
+- 中列「当前阅读」册页米黄底：`#FBF3DE` + 米黄描边 `#E6D7B0`。
+- 取消「夜读星辰」双主题：QSS 主题切换接口保留但恒应用 LIGHT（米白纸 Paper Studio）。
+- QSS 配色令牌：`paper #F9F9F5 / card #FFFFFF / border #E5E5DF / ink #1F2937 / ok #2D9D3C / gold #D99B2A / danger #D14343 / buff #FBF3DE / buff-bd #E6D7B0`。
 
 ## 配置说明
 
@@ -172,6 +335,8 @@ python -m PyInstaller WxReadAssistant.spec --noconfirm
 | Skill | API Key | （在设置页填入） |
 | 推送 | WxPusher 开关 / Token | 可选 |
 | 系统 | 开机自启 / 最小化到托盘 | 可选 |
+
+> 各设置的 inline 提示位于「⚙️ 配置中心」对应组框底部，建议首次使用先浏览。
 
 ## 关键设计
 
