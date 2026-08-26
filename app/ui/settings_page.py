@@ -464,7 +464,7 @@ class SettingsPage(QWidget):
 
         # ── 重置今日目标 ──
         reset_row = QHBoxLayout()
-        reset_label = QLabel("重置今日已完成时长")
+        reset_label = QLabel("重置今日目标")
         self._btn_reset_today = QPushButton(" 重 置 ")
         self._btn_reset_today.setProperty("role", "secondary")
         self._btn_reset_today.setMinimumHeight(38)
@@ -472,7 +472,7 @@ class SettingsPage(QWidget):
         reset_row.addWidget(reset_label, 1)
         reset_row.addWidget(self._btn_reset_today)
         data_layout.addLayout(reset_row)
-        reset_hint = QLabel("说明：今日已读时长归零，重新开始任务")
+        reset_hint = QLabel("说明：清除今日目标，下次开始时重新随机")
         reset_hint.setProperty("class", "muted")
         data_layout.addWidget(reset_hint)
 
@@ -604,20 +604,20 @@ class SettingsPage(QWidget):
             self._chk_autostart.blockSignals(False)
 
     def _on_reset_today(self) -> None:
-        """重置今日已完成时长（today_seconds 归零）。"""
+        """重置今日目标（清除 daily_plan，下次启动时重新随机）。"""
         reply = QMessageBox.question(
             self,
             "确认重置今日目标",
-            "确定要将今日已完成时长归零吗？\n\n归零后调度器会重新开始今日阅读任务。",
+            "确定要清除今日目标吗？\n\n清除后下次开始阅读时会重新随机一个新目标。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
         try:
-            self._db.reset_today_seconds()
-            log.info("用户手动重置今日已完成时长 → today_seconds=0")
-            QMessageBox.information(self, "成功", "今日已读时长已归零 ✅")
+            self._cfg.set("daily_plan", {"date": "", "target_minutes": 0})
+            log.info("用户手动重置今日目标 → daily_plan 已清除")
+            QMessageBox.information(self, "成功", "今日目标已清除，下次开始时重新随机 ✅")
         except Exception as exc:  # noqa: BLE001
             log.error("重置今日目标失败：%s", exc)
             QMessageBox.critical(self, "错误", f"重置失败：{exc}")
