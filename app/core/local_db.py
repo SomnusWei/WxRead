@@ -9,7 +9,7 @@ import json
 import os
 import threading
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +86,7 @@ class LocalDB:
             "shelf": {"books": [], "total_count": 0},
             "reading_stats": {
                 "today_seconds": 0,
+                "today_date": "",          # YYYY-MM-DD，跨天重置 today_seconds 用
                 "weekly_seconds": 0,
                 "monthly_seconds": 0,
                 "total_seconds": 0,
@@ -239,34 +240,75 @@ class LocalDB:
             cur = self._db.get("reading_stats", {})
             if not isinstance(cur, dict):
                 cur = {}
+            today_iso = date.today().isoformat()
+            is_new_day = str(cur.get("today_date", "")) != today_iso
+            if is_new_day:
+                cur["today_date"] = today_iso
+                cur["today_seconds"] = 0
+                # 跨天时丢弃外部传入的 today_seconds，防止 Skill
+                # 缓存把昨天的值写回本地
+                stats = {k: v for k, v in stats.items()
+                         if k != "today_seconds"}
+            # today_seconds 取较大值（本地累加 vs Skill 服务端统计，
+            # 取更全的；避免 Skill 缓存延迟覆盖掉本地实时累加值）
+            if "today_seconds" in stats:
+                incoming = stats.pop("today_seconds")
+                try:
+                    cur_sec = int(cur.get("today_seconds", 0))
+                except (TypeError, ValueError):
+                    cur_sec = 0
+                try:
+                    inc_sec = int(incoming)
+                except (TypeError, ValueError):
+                    inc_sec = 0
+                cur["today_seconds"] = max(cur_sec, inc_sec)
             cur.update(stats)
+            cur["today_date"] = today_iso
             cur["updated_at"] = _now_iso()
             self._db["reading_stats"] = cur
             self._save_db()
 
     def get_today_seconds(self) -> int:
-        stats = self.get_reading_stats()
-        try:
-            return int(stats.get("today_seconds", 0))
-        except (TypeError, ValueError):
-            return 0
+        today_iso = date.today().isoformat()
+        with self._lock:
+            cur = self._db.get("reading_stats", {})
+            if not isinstance(cur, dict):
+                return 0
+            # 跨天重置：日期不匹配时 today_seconds 归零并持久化
+            if str(cur.get("today_date", "")) != today_iso:
+                cur["today_date"] = today_iso
+                cur["today_seconds"] = 0
+                cur["updated_at"] = _now_iso()
+                self._db["reading_stats"] = cur
+                self._save_db()
+                return 0
+            try:
+                return int(cur.get("today_seconds", 0))
+            except (TypeError, ValueError):
+                return 0
 
     def add_today_seconds(self, delta_sec: int) -> int:
         """本地累加今日阅读秒数（read_once 成功后调用）。"""
+        today_iso = date.today().isoformat()
         with self._lock:
             cur = self._db.get("reading_stats", {})
             if not isinstance(cur, dict):
                 cur = {}
+            # 跨天重置：日期不匹配时 today_seconds 归零
+            if str(cur.get("today_date", "")) != today_iso:
+                cur["today_date"] = today_iso
+                cur["today_seconds"] = 0
             try:
-                today = int(cur.get("today_seconds", 0))
+                sec = int(cur.get("today_seconds", 0))
             except (TypeError, ValueError):
-                today = 0
-            today = max(0, today + max(0, int(delta_sec)))
-            cur["today_seconds"] = today
+                sec = 0
+            sec = max(0, sec + max(0, int(delta_sec)))
+            cur["today_seconds"] = sec
+            cur["today_date"] = today_iso
             cur["updated_at"] = _now_iso()
             self._db["reading_stats"] = cur
             self._save_db()
-            return today
+            return sec
 
     # ---------- 章节池 ----------
     def get_chapters(self, book_id: str) -> list[dict]:
