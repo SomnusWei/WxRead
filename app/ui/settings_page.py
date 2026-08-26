@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.config import ConfigStore
+from app.core.local_db import LocalDB
 from app.core.skill_api import SkillAPI
 from app.core.weread_api import WeReadApi
 from app.ui.icon_store import (
@@ -144,12 +145,14 @@ class SettingsPage(QWidget):
         config: ConfigStore,
         api: WeReadApi,
         skill: SkillAPI,
+        db: LocalDB,
         main_window: QWidget | None = None,
     ) -> None:
         super().__init__()
         self._cfg = config
         self._api = api
         self._skill = skill
+        self._db = db
         self._main_window = main_window
         self._checker: _ApiKeyChecker | None = None
         self._theme: str = "light"
@@ -459,6 +462,20 @@ class SettingsPage(QWidget):
         hint.setProperty("class", "muted")
         data_layout.addWidget(hint)
 
+        # ── 重置今日目标 ──
+        reset_row = QHBoxLayout()
+        reset_label = QLabel("重置今日已完成时长")
+        self._btn_reset_today = QPushButton(" 重 置 ")
+        self._btn_reset_today.setProperty("role", "secondary")
+        self._btn_reset_today.setMinimumHeight(38)
+        self._btn_reset_today.clicked.connect(self._on_reset_today)
+        reset_row.addWidget(reset_label, 1)
+        reset_row.addWidget(self._btn_reset_today)
+        data_layout.addLayout(reset_row)
+        reset_hint = QLabel("说明：今日已读时长归零，重新开始任务")
+        reset_hint.setProperty("class", "muted")
+        data_layout.addWidget(reset_hint)
+
         # Tip #6：调度器即时拉取
         tip = QLabel("💡 其他书籍被调度器选中时会即时拉取，无需手动刷新章节。")
         tip.setWordWrap(True)
@@ -585,6 +602,25 @@ class SettingsPage(QWidget):
             self._chk_autostart.blockSignals(True)
             self._chk_autostart.setChecked(is_autostart_enabled())
             self._chk_autostart.blockSignals(False)
+
+    def _on_reset_today(self) -> None:
+        """重置今日已完成时长（today_seconds 归零）。"""
+        reply = QMessageBox.question(
+            self,
+            "确认重置今日目标",
+            "确定要将今日已完成时长归零吗？\n\n归零后调度器会重新开始今日阅读任务。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._db.reset_today_seconds()
+            log.info("用户手动重置今日已完成时长 → today_seconds=0")
+            QMessageBox.information(self, "成功", "今日已读时长已归零 ✅")
+        except Exception as exc:  # noqa: BLE001
+            log.error("重置今日目标失败：%s", exc)
+            QMessageBox.critical(self, "错误", f"重置失败：{exc}")
 
     def _on_clean_cookie(self) -> None:
         reply = QMessageBox.question(

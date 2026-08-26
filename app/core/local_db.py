@@ -287,6 +287,20 @@ class LocalDB:
             except (TypeError, ValueError):
                 return 0
 
+    def reset_today_seconds(self) -> int:
+        """手动重置今日已完成时长为 0（绕过 update_reading_stats 的 max 策略）。"""
+        today_iso = date.today().isoformat()
+        with self._lock:
+            cur = self._db.get("reading_stats", {})
+            if not isinstance(cur, dict):
+                cur = {}
+            cur["today_date"] = today_iso
+            cur["today_seconds"] = 0
+            cur["updated_at"] = _now_iso()
+            self._db["reading_stats"] = cur
+            self._save_db()
+            return 0
+
     def add_today_seconds(self, delta_sec: int) -> int:
         """本地累加今日阅读秒数（read_once 成功后调用）。"""
         today_iso = date.today().isoformat()

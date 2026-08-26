@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
                 config=self._config,
                 api=self._api,
                 skill=self._skill,
+                db=self._db,
                 main_window=self,
             )
             log.info("[MainWindow] 已加载 SettingsPage")
