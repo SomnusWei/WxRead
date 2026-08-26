@@ -21,8 +21,8 @@ from PySide6.QtGui import (
 )
 
 
-APP_VERSION = "2.2.1"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
-APP_BUILD_ID = "f3e04b70 · 20260826"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
+APP_VERSION = "2.2.2"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
+APP_BUILD_ID = "2c05b95f · 20260826"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
 
 
 def app_version_display() -> str:
