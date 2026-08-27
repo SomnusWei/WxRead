@@ -379,7 +379,20 @@ class CDPLoginDialog(QDialog):
         api: WeReadApi,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        # 关键：parent=None + WindowType.Tool（与「查看报告」按钮完全一致），
+        # 彻底避免 Windows 下点击扫码登录时主窗口「先最小化再弹起」的闪烁。
+        # 注：Window + parent=None 在某些 DPI/系统主题下仍会触发模态层主窗隐藏，
+        # 而 Tool 标志明确告知 Windows：这是工具窗口，主窗是独立可交互的。
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint,
+        )
+        # 保留用户传入的 parent 引用（用于消息框定位、QWidget 层级相对），不参与 Qt 父子所有权
+        self._caller_ref = parent
         self._config = config
         self._api = api
         self._worker: CDPWorker | None = None

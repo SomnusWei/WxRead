@@ -273,6 +273,131 @@ class SkillAPI:
         )
         return result
 
+    # ---------- 报告数据聚合（yao-weread-skill 契约）----------
+    def fetch_weread_report(self, *, timeout: int = 30) -> dict:
+        """一次性调用 Skill 拉取 yao-weread-skill 格式的完整报告数据。
+
+        尝试顺序：
+          1) /weread/report      — 典型 yao-weread-skill 生成报告的端点
+          2) /weread/report-data — 备用命名
+          3) /report/weread      — 备用命名 2
+
+        熔断规则：
+          - 4xx / 499：说明 Skill 端鉴权/限流/不存在该命名，不再尝试下一端点，
+            避免 3 个端点连续打满触发风控。
+          - 网络异常 / 5xx：继续尝试下一端点（容错）。
+
+        返回：dict（与 report_aggregator 的契约字段兼容）。
+        当 API Key 未配置或调用失败时返回空 dict {}，由上层退回到 LocalDB 聚合。
+        """
+        endpoints = ["/weread/report", "/weread/report-data", "/report/weread"]
+        api_key = str(self._cfg.get("skill.api_key") or "").strip()
+        if not api_key:
+            log.info("[Skill] API Key 未配置，跳过 weread-report 一次性拉取（退回本地聚合）")
+            return {}
+
+        last_status = [0]  # 用可变对象闭包承载最近一次 HTTP 状态
+
+        def _status_from_none(_last_val: int) -> bool:
+            """_call 返回 None 时，判断是否触发熔断（最近状态码是 4xx/499）。"""
+            return 400 <= _last_val <= 499
+
+        for idx, ep in enumerate(endpoints):
+            # 4xx 间错峰：第一个端点失败 4xx，第二个延迟 800ms，第三个 1500ms
+            if idx > 0 and last_status[0] >= 400:
+                backoff = (idx - 1) * 700 + 800  # idx=1 → 800ms, idx=2 → 1500ms
+                time.sleep(backoff / 1000.0)
+            try:
+                # 记录原始 status：_call 内部吞了 status，需要在 pre/post hook 抓；
+                # 这里退化为：若 _call 返回 None 且本次是 4xx/499，
+                # 只能通过日志间接推断；更直接：直接走 _raw_call（复制最小逻辑）。
+                data = self._call_raw_for_report(ep, timeout=timeout, _status_out=last_status)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[Skill] %s 调用异常：%s", ep, exc)
+                continue  # 网络/IO 异常：不熔断，下一端点继续
+            # 熔断：4xx / 499（含 401/403）直接跳，不再试备用命名
+            if 400 <= last_status[0] <= 499:
+                log.warning(
+                    "[Skill] %s 返回 HTTP %d，触发 4xx 熔断——备用命名端点不再请求",
+                    ep, last_status[0],
+                )
+                break
+            if not data or not isinstance(data, dict):
+                continue
+            # 有任意核心字段就认为是合法报告响应
+            if any(k in data for k in ("kpi", "reader_portrait", "monthly",
+                                       "shelf_pie", "categories", "weekly_rhythm")):
+                log.info("[Skill] 报告接口命中：%s（字段：%s）",
+                         ep, sorted([k for k in data.keys() if not k.startswith("_")])[:10])
+                return data
+            # 兼容：data 包装层
+            inner = data.get("data") or data.get("report")
+            if isinstance(inner, dict) and any(k in inner for k in (
+                "kpi", "reader_portrait", "monthly", "shelf_pie",
+            )):
+                log.info("[Skill] 报告接口命中（data 包装）：%s", ep)
+                return inner
+            # 即使没命中契约字段，若 books/shelf/privateCount 等书架统计字段存在，
+            # 仍认为是部分有效，交给上层 merge 作 shelf_pie 增强：
+            if any(k in data for k in (
+                "books", "shelf", "privateCount", "publicCount",
+                "private_count", "public_count", "bookCount",
+            )):
+                log.info("[Skill] 报告接口命中（部分书架字段）：%s", ep)
+                return data
+        log.info("[Skill] 所有 weread-report 端点未命中，退回 LocalDB 确定性聚合")
+        return {}
+
+    # -------- 报告专用最小"原始"调用：既能读 status_code，又能复用 session/鉴权 --------
+    def _call_raw_for_report(
+        self, api_name: str, *, timeout: int, _status_out: list[int],
+    ) -> dict | None:
+        """fetch_weread_report 专用：行为与 _call 一致，但把 HTTP 状态写入
+        _status_out[0]，供 4xx 熔断判定使用。避免改公共 _call 签名影响其他调用方。"""
+        api_key = str(self._cfg.get("skill.api_key") or "").strip()
+        if not api_key:
+            _status_out[0] = 401
+            return None
+        skill_version = str(self._cfg.get("skill.version") or "1.0.5")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {"api_name": api_name, "skill_version": skill_version}
+        try:
+            t0 = time.time()
+            r = self._session.post(
+                SKILL_GATEWAY_URL, headers=headers, json=payload, timeout=timeout,
+            )
+            elapsed = (time.time() - t0) * 1000
+            _status_out[0] = int(r.status_code)
+            log.info(
+                "🔄 Skill %s 响应：HTTP=%d time=%.0fms",
+                api_name, r.status_code, elapsed,
+            )
+            if r.status_code == 499:
+                log.warning("Skill %s 触发 499 限流", api_name)
+                return None
+            if r.status_code in (401, 403):
+                log.warning("Skill %s 鉴权失败（HTTP %d）", api_name, r.status_code)
+                return None
+            if 400 <= r.status_code < 500:
+                log.warning("Skill %s 客户端错误 HTTP=%s", api_name, r.status_code)
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("errcode", 0) != 0:
+                log.warning(
+                    "Skill %s 调用失败：errcode=%s msg=%s",
+                    api_name, data.get("errcode"), data.get("errmsg"),
+                )
+                return None
+            return data if isinstance(data, dict) else None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Skill %s 请求异常：%s", api_name, exc)
+            # 异常：不写 4xx，让上层继续尝试备用端点
+            return None
+
     # ---------- 验证 ----------
     def verify_api_key(self, *, timeout: int = 10) -> tuple[bool, str]:
         """验证 API Key 是否有效。

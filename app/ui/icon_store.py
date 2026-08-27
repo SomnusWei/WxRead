@@ -21,8 +21,8 @@ from PySide6.QtGui import (
 )
 
 
-APP_VERSION = "2.2.3"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
-APP_BUILD_ID = "5841c835 · 20260826"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
+APP_VERSION = "2.2.4"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
+APP_BUILD_ID = "1e18de88 · 20260827"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
 
 
 def app_version_display() -> str:
@@ -602,6 +602,66 @@ def icon_refresh_progress(size: int = 18, theme: str = "light") -> QIcon:
         "42%",
     )
 
+    p.end()
+    return QIcon(pix)
+
+
+def icon_report(size: int = 18, theme: str = "light") -> QIcon:
+    """查看报告：打开的卷轴纸（米黄纸 + 朱砂丝带 + 右上 3 根彩色数据柱）。"""
+    c = _colors(theme)
+    s = size
+    pix, p = _round_icon_pixmap(
+        size, bg_color=c["card"], border_color=c["muted"], pen_color=c["ink"]
+    )
+    paper = QColor(c["paper"])
+    paper_line = QColor("#E5E5DF" if theme == "light" else "#444b5a")
+    ink = c["ink"]
+
+    # 卷轴纸：两横书脊（左右） + 纸面
+    x0, y0 = s * 0.15, s * 0.22
+    bw = s * 0.62
+    bh = s * 0.56
+    # 纸面
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(paper))
+    p.drawRoundedRect(QRectF(x0, y0, bw, bh), s * 0.05, s * 0.05)
+    # 纸边框
+    p.setPen(QPen(paper_line, max(1, int(s * 0.022))))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(x0, y0, bw, bh), s * 0.05, s * 0.05)
+
+    # 文字横线 3 条
+    p.setPen(QPen(QColor(c["muted"]), max(1, int(s * 0.018))))
+    for i in range(3):
+        ty = y0 + bh * (0.25 + 0.2 * i)
+        p.drawLine(QPointF(x0 + bw * 0.14, ty), QPointF(x0 + bw * 0.88, ty))
+
+    # 朱砂红丝带：左侧竖丝带盖在纸边
+    rx = x0
+    ry1 = y0 - s * 0.04
+    ry2 = y0 + bh + s * 0.04
+    rw = s * 0.10
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c["danger"])))
+    p.drawRoundedRect(QRectF(rx - rw * 0.5, ry1, rw, ry2 - ry1), s * 0.02, s * 0.02)
+
+    # 右上 3 根数据柱
+    bx0 = x0 + bw - s * 0.22
+    by0 = y0 + s * 0.06
+    bw_small = s * 0.045
+    gap_small = s * 0.025
+    colors = [QColor(c["ok"]), QColor(c["gold"]), QColor(c["danger"])]
+    heights = [s * 0.10, s * 0.18, s * 0.26]
+    for i, (col, h) in enumerate(zip(colors, heights)):
+        x = bx0 + i * (bw_small + gap_small)
+        y = by0 + (max(heights) - h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(col))
+        p.drawRoundedRect(QRectF(x, y, bw_small, h), s * 0.015, s * 0.015)
+
+    # 右下一颗装饰金珠点
+    p.setBrush(QBrush(QColor(c["gold"])))
+    p.drawEllipse(QPointF(x0 + bw - s * 0.08, y0 + bh - s * 0.08), s * 0.028, s * 0.028)
     p.end()
     return QIcon(pix)
 

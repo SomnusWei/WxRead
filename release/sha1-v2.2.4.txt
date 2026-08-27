@@ -1,0 +1,6 @@
+# WxReadAssistant v2.2.4 发布包校验
+# path = sha1                                    size_B = size(字节)   size_MB
+
+WxReadAssistant-v2.2.4-full.zip = 32be66360e46772d4d9dfc4fcaca541486625a4b   267878691 B = 255.5 MB
+patch-v2.2.4-from-v2.2.3.zip = b4377c1496a21953adf6ddad510a280184bc8467   6281863 B = 6.0 MB
+WxReadAssistant-v2.2.4-full.sha1.txt = 6603677b2518580717c43d0fdae9bfa2119c1b47   480510 B = 0.5 MB

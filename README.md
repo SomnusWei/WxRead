@@ -15,6 +15,7 @@
 | **进度驱动选书选章** | 按进度排序优先选进度最高且 <100% 的书；单章阅读 4~5 次后换章；100% 换书；跳过封面/版权页（uid 1~33） |
 | **混合完成度检测** | 本地实时累加阅读秒数 + 每 30 分钟 Skill 覆盖校正双保险，精准判断当日达标 |
 | **阅读统计 4 项** | 通过 `/readdata/detail` 获取今日 / 本周 / 本月 / 总累计 4 项权威时长 |
+| **可视化报告** | 聚合 LocalDB + Skill 数据，弹出报告页：读者画像 / 书架归一化饼图（进度+可见性双维度）/ 阅读趋势线 / 月度热力图 / 20 条阅读高光，纯 QPainter 绘制无额外依赖 |
 | **风控规避** | 随机书籍/章节切换、±15% 间隔抖动、每 N 次成功插入长休息、动态 `baggage`/`sentry-trace` 请求头 |
 | **WxPusher 推送** | 每日任务开始/完成、Cookie 失效、Skill 登录成功等事件推送 |
 | **开机自启 + 托盘** | 注册表写入自启项，支持 `--minimized` 启动即最小化到托盘，单例防多开 |
@@ -95,6 +96,7 @@
 | `/book/chapterinfo` | 获取指定书籍的章节池 |
 | `/book/getprogress` | 获取阅读进度 |
 | `/readdata/detail` | 获取阅读统计（日 / 周 / 月 / 总） |
+| `/weread/report` | 获取微信读书报告聚合数据（书架构成 / 阅读高光等，4xx 时自动熔断退回本地） |
 
 ## 项目结构
 
@@ -105,7 +107,8 @@ WxRead/
 │   │   ├── config.py          # 全局配置（%APPDATA%/WxReadAssistant/config.json）
 │   │   ├── scheduler.py       # 进度驱动阅读调度器
 │   │   ├── weread_api.py      # 微信读书阅读上报 + 签名算法
-│   │   ├── skill_api.py       # Skill 网关调用（书架/章节/进度/统计）
+│   │   ├── skill_api.py       # Skill 网关调用（书架/章节/进度/统计/报告）
+│   │   ├── report_aggregator.py # 报告数据聚合（LocalDB + Skill → 16 字段统一结构）
 │   │   ├── local_db.py        # 本地数据库（书架/进度/章节池持久化）
 │   │   └── notifier.py        # WxPusher 推送
 │   ├── ui/
@@ -113,6 +116,7 @@ WxRead/
 │   │   ├── main_window.py     # 主窗口（组装各模块 + 托盘）
 │   │   ├── settings_page.py   # 设置页（时长/间隔/Skill Key/推送/系统）
 │   │   ├── shelf_dialog.py    # 书架查看对话框
+│   │   ├── report_dialog.py   # 可视化报告对话框（QPainter 图表 · 纯绘制无依赖）
 │   │   ├── cdp_login_dialog.py# CDP 扫码登录对话框
 │   │   └── styles.py          # 全局 QSS 样式
 │   └── utils/
@@ -157,8 +161,7 @@ python main.py --minimized
 
 所有正式二进制都放 `release/` 目录，**大二进制（onedir 目录 / full.zip / patch.zip / sha1）不进入 git 历史**（已加入 `.gitignore`），仅 `release_note-vX.Y.Z.md` 版本说明会随源码一起 commit。
 
-> **📦 当前 v2.2.0 状态**：本版是「发布管线首次落地」的基线版本，已产出 `WxReadAssistant-v2.2.0-full.zip` 完整包；因 release 目录尚未归档 v2.1.0 full 目录，**v2.2.0 暂无增量补丁**。
-> 用户请直接下载 full.zip 解压即用；**从下一版 v2.2.1 起**，把 `release/WxReadAssistant-v2.2.0-full/` 目录保留在本机，构建时 `--previous 2.2.0` 即可自动生成 `patch-v2.2.1-from-v2.2.0.zip`。
+> **📦 当前 v2.2.4**：完整包 `WxReadAssistant-v2.2.4-full.zip`（255 MB）+ 增量补丁 `patch-v2.2.4-from-v2.2.3.zip`（6 MB）已产出。新用户下载 full.zip 解压即用；v2.2.3 用户可下载 patch.zip 双击 `apply_patch.bat` 升级。
 
 #### 产物清单（scripts/build_release.py 自动生成）
 
@@ -277,6 +280,37 @@ python -m PyInstaller WxReadAssistant.spec --noconfirm
 - **一致性校验**：`release/WxReadAssistant-vX.Y.Z-full.sha1.txt` 列出每个 onedir 文件的 sha1。
 
 ## CHANGELOG
+
+### v2.2.4 — 2026-08-27
+
+#### 📊 可视化报告页面（新功能）
+- 新增 `app/core/report_aggregator.py`：聚合 LocalDB + yao-weread-skill 数据，输出 16 字段统一报告结构；Skill 不可用时退回 LocalDB 确定性聚合。
+- 新增 `app/ui/report_dialog.py`：纯 QPainter 绘制的可视化报告页，包含：
+  - 读者画像 banner（总书数 / 已读 / 在读 / 今日时长 / 连续天数）
+  - 书架归一化饼图（**进度维度**：已完成/在读/未读 + **可见性维度**：私密书/公开书，双正交维度合计=藏书总数，杜绝重复计数）
+  - 阅读趋势线（近 30 日每日时长折线）
+  - 月度热力图（GitHub 风格贡献图）
+  - 20 条阅读高光摘要
+- 主界面藏书楼操作区新增「查看报告」按钮（4×2 Grid），点击弹出报告对话框，主窗口不最小化。
+- `skill_api.py` 新增 `fetch_weread_report()` 方法，499/4xx 自动熔断停止后续端点请求。
+
+#### 🐛 Bug 修复
+- **stop()→再 start() 卡在启动延迟**：`scheduler.py::run()` 入口未 `_stop_event.clear()`，导致重入时线程立即 return；已补充 `_stop_event` / `_pause_event` / 计数器 / 当前书 / skill_refresh_ts 全状态复位。
+- **Skill 统计刷新 KeyError 'today_seconds'**：`local_db.py::update_reading_stats` 原地 `stats.pop()` 修改了调用方字典，导致后续访问失败；已改为先 `dict(stats)` 拷贝再操作。
+- **扫码登录主窗口闪烁**：`CDPLoginDialog` 设为独立顶层窗口（parent=None + WindowType.Tool），与「查看报告」行为一致。
+- **启动延时无倒计时**：改为 250ms 步长循环，每秒发射状态信号更新 UI 倒计时。
+- **调度器暂停事件语义反转**：`_pause_event.set()`=运行态（非暂停），主循环条件从 `if self._pause_event.is_set()` 改为 `if not self._pause_event.is_set()`。
+
+### v2.2.3 — 2026-08-26
+- 修复「重置今日目标」按钮功能错误：原逻辑清除的是已完成时长（today_seconds），改为清除 `daily_plan` 字段（真正重置目标）。
+
+### v2.2.2 — 2026-08-26
+- 配置中心新增「重置今日目标」按钮，方便手动清除当日目标重新随机。
+- `LocalDB` 新增 `reset_today_seconds()` 方法。
+
+### v2.2.1 — 2026-08-25
+- 修复跨天后 `today_seconds` 未重置导致误发「已完成」消息 + 自动停止任务。
+- 新增 `today_date` 字段，`get_today_seconds()` 检测跨天时自动归零。
 
 ### v2.2.0 — 2026-08-25
 

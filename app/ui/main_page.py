@@ -55,6 +55,7 @@ from app.ui.icon_store import (
     icon_pause,
     icon_refresh_progress,
     icon_refresh_stats,
+    icon_report,
     icon_shelf,
     icon_start,
     icon_stop,
@@ -639,10 +640,11 @@ class MainPage(QWidget):
 
         v.addWidget(self._make_deco_title("🔘  藏  书  楼  操  作"))
 
-        # 3×2 操作网格（按用户指定顺序，两列均分宽度 stretch=1）
+        # 3×2 操作网格（按用户指定顺序，两列均分宽度 stretch=1）→ 升级 4×2
         #   行 1：扫码登录 · 查看书架
         #   行 2：获取数据 · 刷新统计
-        #   行 3：刷新进度 · 配置中心
+        #   行 3：刷新进度 · 查看报告     ← 新增：可视化报告
+        #   行 4：配置中心                ← 合并为 2 列宽度
         g = QGridLayout()
         g.setSpacing(8)
         g.setHorizontalSpacing(8)
@@ -678,6 +680,14 @@ class MainPage(QWidget):
         self._btn_refresh_progress.setMinimumHeight(42)
         self._btn_refresh_progress.clicked.connect(self._on_refresh_progress)
 
+        # 查看报告按钮
+        self._btn_report = QPushButton(" 查看报告")
+        self._btn_report.setProperty("role", "secondary")
+        self._btn_report.setIconSize(QSize(20, 20))
+        self._btn_report.setMinimumHeight(42)
+        self._btn_report.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_report.clicked.connect(self._on_open_report)
+
         self._btn_settings = QPushButton(" 配置中心")   # 原名：设置
         self._btn_settings.setProperty("role", "secondary")
         self._btn_settings.setIconSize(QSize(20, 20))
@@ -686,7 +696,8 @@ class MainPage(QWidget):
 
         for b in (
             self._btn_login, self._btn_shelf, self._btn_fetch,
-            self._btn_refresh_stats, self._btn_refresh_progress, self._btn_settings,
+            self._btn_refresh_stats, self._btn_refresh_progress,
+            self._btn_report, self._btn_settings,
         ):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -696,9 +707,11 @@ class MainPage(QWidget):
         # 行 2：获取数据 / 刷新统计
         g.addWidget(self._btn_fetch,            1, 0)
         g.addWidget(self._btn_refresh_stats,    1, 1)
-        # 行 3：刷新进度 / 配置中心
+        # 行 3：刷新进度 / 查看报告
         g.addWidget(self._btn_refresh_progress, 2, 0)
-        g.addWidget(self._btn_settings,         2, 1)
+        g.addWidget(self._btn_report,           2, 1)
+        # 行 4：配置中心（合并两列，视觉主按钮宽度）
+        g.addWidget(self._btn_settings,         3, 0, 1, 2)
         # 两列均分宽度（防止主按钮 primary 视觉拉伸不均）
         g.setColumnStretch(0, 1)
         g.setColumnStretch(1, 1)
@@ -842,6 +855,7 @@ class MainPage(QWidget):
         self._btn_fetch.setIcon(icon_fetch(22, t))
         self._btn_refresh_stats.setIcon(icon_refresh_stats(22, t))
         self._btn_refresh_progress.setIcon(icon_refresh_progress(22, t))
+        self._btn_report.setIcon(icon_report(22, t))
         self._btn_settings.setIcon(icon_config_center(22, t))
         self._btn_start.setIcon(icon_start(24, t))
         self._btn_pause.setIcon(icon_pause(24, t))
@@ -1207,6 +1221,25 @@ class MainPage(QWidget):
         except ImportError:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self, "提示", "书架查看对话框（后续版本实现）")
+
+    def _on_open_report(self) -> None:
+        """打开可视化报告对话框。
+
+        关键：使用 Qt.WindowType.Tool 标志，使报告窗口独立于主窗口最小化。
+        数据：优先一次性聚合 yao-weread-skill（通过 SkillAPI.fetch_weread_report），
+        缺失字段退回到 LocalDB + 确定性抽样。
+        """
+        from PySide6.QtWidgets import QMessageBox
+        from app.core.report_aggregator import ReportAggregator
+        from app.ui.report_dialog import ReportDialog
+
+        try:
+            agg = ReportAggregator(self._db, self._cfg, skill_api=self._skill)
+            dlg = ReportDialog(agg, parent=self)
+            dlg.exec()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("打开报告对话框失败")
+            QMessageBox.critical(self, "错误", f"打开报告失败：{exc}")
 
     def _on_fetch_data(self) -> None:
         self._btn_fetch.setEnabled(False)

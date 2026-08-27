@@ -245,24 +245,29 @@ class LocalDB:
             if is_new_day:
                 cur["today_date"] = today_iso
                 cur["today_seconds"] = 0
+            # 先拷贝一份再处理：绝对不能原地修改调用方传进来的
+            # dict——scheduler/FetchThread 会在调用后再用硬下标读取
+            # local_stats['today_seconds']，pop 会把 caller 字典掏坏
+            # 造成 KeyError（参见 2026-08-27 复现的 stack）。
+            incoming = dict(stats or {})
+            if is_new_day:
                 # 跨天时丢弃外部传入的 today_seconds，防止 Skill
                 # 缓存把昨天的值写回本地
-                stats = {k: v for k, v in stats.items()
-                         if k != "today_seconds"}
+                incoming.pop("today_seconds", None)
             # today_seconds 取较大值（本地累加 vs Skill 服务端统计，
             # 取更全的；避免 Skill 缓存延迟覆盖掉本地实时累加值）
-            if "today_seconds" in stats:
-                incoming = stats.pop("today_seconds")
+            if "today_seconds" in incoming:
+                val = incoming.pop("today_seconds")
                 try:
                     cur_sec = int(cur.get("today_seconds", 0))
                 except (TypeError, ValueError):
                     cur_sec = 0
                 try:
-                    inc_sec = int(incoming)
+                    inc_sec = int(val)
                 except (TypeError, ValueError):
                     inc_sec = 0
                 cur["today_seconds"] = max(cur_sec, inc_sec)
-            cur.update(stats)
+            cur.update(incoming)
             cur["today_date"] = today_iso
             cur["updated_at"] = _now_iso()
             self._db["reading_stats"] = cur

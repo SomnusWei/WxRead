@@ -125,6 +125,20 @@ class Scheduler(QThread):
 
     # ---------------- 主循环 ----------------
     def run(self) -> None:  # noqa: D401
+        # --- 同实例复用的「再启动」防御：
+        # UI 层 stop() 后直接在同一 Scheduler 对象上再次 start()，
+        # QThread.finished 后允许重入 run()，但 threading.Event 的
+        # set/clear 状态跨 run() 保留，必须手动复位到"放行/未停止"
+        # 的初始约定，否则倒计时 / 主循环守卫会立即 return。
+        self._stop_event.clear()
+        if not self._pause_event.is_set():
+            self._pause_event.set()   # 默认放行（运行态）
+        self._last_skill_refresh_ts = 0.0
+        self._success_count = 0
+        self._fail_count = 0
+        self._chapter_read_count = 0
+        self._next_run_at = 0.0
+
         log.info("调度器已启动")
         self._set_state("初始化中")
 
@@ -133,6 +147,8 @@ class Scheduler(QThread):
             self._health_next_ts = time.time() + max(
                 60.0, float(self._cfg.get("reading.health_check_first_min", 3)) * 60
             )
+            self._current_book = None
+            self._current_chapter = None
 
         # 启动即检查登录态
         if not self._api.check_session():
@@ -143,7 +159,7 @@ class Scheduler(QThread):
                 self.cookie_broken.emit()
                 return
 
-        # ===== 启动随机延迟（反机器指纹）=====
+        # ===== 启动随机延迟（反机器指纹）· 每秒刷倒计时 =====
         reading_cfg = self._cfg.get("reading", {}) or {}
         try:
             s_min = float(reading_cfg.get("startup_delay_min_sec", 30))
@@ -157,15 +173,44 @@ class Scheduler(QThread):
             f"⏱️ 启动随机延迟 {startup_delay:.0f}s（{s_min:.0f}~{s_max:.0f}s），"
             "模拟真人进入阅读前的准备"
         )
-        self._set_state(f"启动准备中（{startup_delay:.0f}s）")
-        if not self._interruptible_sleep(startup_delay):
-            return
+        # 暂停语义（全文件统一）：
+        #   _pause_event.set()   → 放行 / 运行中
+        #   _pause_event.clear() → 阻塞 / 暂停中
+        # 倒计时阶段：set() 时推进倒计时；clear() 时挂起冻结，等待 resume() 恢复
+        remaining = float(startup_delay)
+        last_emitted_tick = -1
+        while remaining > 0:
+            if self._stop_event.is_set():
+                return
+            if self._pause_event.is_set():
+                # ← 运行态：正常扣减倒计时
+                tick = int(remaining + 0.5)
+                if tick != last_emitted_tick:
+                    self._set_state(f"启动准备中（{tick}s）")
+                    last_emitted_tick = tick
+                chunk = min(0.25, remaining)
+                if chunk <= 0:
+                    break
+                if not self._interruptible_sleep(chunk):
+                    return
+                remaining -= chunk
+            else:
+                # ← 暂停态：不扣倒计时，等待用户恢复
+                self._set_state("已暂停（启动倒计时冻结）")
+                self._pause_event.wait(timeout=0.5)
+                if self._stop_event.is_set():
+                    return
 
         # 主循环
         while not self._stop_event.is_set():
-            # 暂停检查
+            # ⚠️ 暂停语义：本项目 _pause_event 与"常见约定"相反——
+            #    set()   = 内部标记"放行 / 运行中"
+            #    clear() = 内部标记"阻塞 / 暂停中"
+            # 这样写的历史原因：pause()/resume()/倒计时/_interruptible_sleep
+            # 四处都按同一反语义工作，主循环这里必须保持一致。
             if not self._pause_event.is_set():
                 self._set_state("已暂停")
+                # wait() 会阻塞到被外部 set()（即 resume()）
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     return
@@ -636,13 +681,18 @@ class Scheduler(QThread):
             return 0
 
     def _interruptible_sleep(self, seconds: float) -> bool:
-        """可被 stop/pause 打断的 sleep。返回 False 表示被 stop 打断。"""
+        """可被 stop/pause 打断的 sleep。返回 False 表示被 stop 打断。
+
+        暂停语义（全文件统一）：
+          _pause_event.set()   → 放行 / 运行中 → 正常 sleep
+          _pause_event.clear() → 阻塞 / 暂停中 → 挂起 wait 等待恢复
+        """
         end = time.time() + seconds
         while time.time() < end:
             if self._stop_event.is_set():
                 return False
             if not self._pause_event.is_set():
-                # 暂停中：等待恢复
+                # ← 暂停态（clear）：阻塞等待外部 resume() 调用 set() 恢复
                 self._pause_event.wait(timeout=0.5)
                 if self._stop_event.is_set():
                     return False
