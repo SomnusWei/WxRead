@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from app.core.config import ConfigStore
 from app.core.local_db import LocalDB
+from app.core.notifier import format_duration
 from app.core.skill_api import SkillAPI
 from app.core.weread_api import WeReadApi
 from app.ui.icon_store import (
@@ -230,6 +231,11 @@ class SettingsPage(QWidget):
         data_box = self._build_data_box()
         # 合并 col1 + col2，视觉宽度 ≈ 两倍 💻，避免右下留空
         grid.addWidget(data_box, 1, 1, 1, 2)
+
+        # --- row 2 : 🔑 授权管理（跨 3 列，本地激活）---
+        grid.setRowStretch(2, 0)
+        license_box = self._build_license_box()
+        grid.addWidget(license_box, 2, 0, 1, 3)
 
         root.addLayout(grid, 1)
 
@@ -442,6 +448,100 @@ class SettingsPage(QWidget):
         sys_layout.addWidget(tip)
         sys_layout.addStretch(1)
         return sys_box
+
+    def _build_license_box(self) -> QGroupBox:
+        """🔑 授权管理：试用期状态 + 本地注册码激活（无网络校验）。"""
+        from PySide6.QtGui import QFont
+
+        license_box = QGroupBox("🔑  授权管理")
+        v = QVBoxLayout(license_box)
+        v.setSpacing(8)
+        v.setContentsMargins(14, 20, 14, 12)
+
+        # 状态行
+        self._lbl_license_status = QLabel(" ")
+        sf = QFont()
+        sf.setBold(True)
+        self._lbl_license_status.setFont(sf)
+        v.addWidget(self._lbl_license_status)
+
+        # 输入行：注册码 + 激活按钮
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._inp_license = QLineEdit()
+        self._inp_license.setInputMask("NNNN-NNNN-NNNN-NNNN")
+        self._inp_license.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mono = QFont("Consolas")
+        mono.setPointSize(11)
+        mono.setBold(True)
+        self._inp_license.setFont(mono)
+        self._inp_license.setPlaceholderText("输入注册码 XXXX-XXXX-XXXX-XXXX")
+        self._inp_license.setFixedWidth(260)
+        self._inp_license.textChanged.connect(self._on_license_input_changed)
+        row.addWidget(self._inp_license)
+
+        self._btn_license = QPushButton(" 激活 ")
+        self._btn_license.setProperty("role", "primary")
+        self._btn_license.setMinimumHeight(34)
+        self._btn_license.setEnabled(False)
+        self._btn_license.clicked.connect(self._on_activate_license)
+        row.addWidget(self._btn_license)
+
+        self._lbl_license_feedback = QLabel(" ")
+        row.addWidget(self._lbl_license_feedback, 1)
+        v.addLayout(row)
+
+        note = QLabel("注册码由开发者提供，本地校验、全程无需联网；激活状态与本机数据绑定。")
+        note.setStyleSheet("color:#9CA3AF;font-size:11px;")
+        v.addWidget(note)
+
+        self.refresh_license_status()
+        return license_box
+
+    def refresh_license_status(self) -> None:
+        """刷新授权状态显示（进入页面/激活成功后调用）。"""
+        from app.core.licensing import get_status
+
+        try:
+            st = get_status(self._db)
+        except Exception:  # noqa: BLE001 — 状态读取失败不阻塞配置页
+            self._lbl_license_status.setText("⚠️ 授权状态读取失败")
+            self._lbl_license_status.setStyleSheet("color:#DC2626;")
+            return
+        if st["licensed"]:
+            self._lbl_license_status.setText(f"✅ 已激活：{st['masked_code']}（永久授权）")
+            self._lbl_license_status.setStyleSheet("color:#16A34A;")
+        elif st["expired"]:
+            self._lbl_license_status.setText(
+                f"❌ 免费试用已结束（首次启动 {st['first_run_iso']}），请输入注册码激活"
+            )
+            self._lbl_license_status.setStyleSheet("color:#DC2626;")
+        else:
+            self._lbl_license_status.setText(
+                f"⏳ 试用期剩余 {format_duration(st['minutes_left'])}"
+                f"（首次启动 {st['first_run_iso']}）"
+            )
+            self._lbl_license_status.setStyleSheet("color:#B45309;")
+
+    def _on_license_input_changed(self, text: str) -> None:
+        if len(text.replace(" ", "").replace("-", "")) >= 16:
+            self._btn_license.setEnabled(True)
+        else:
+            self._btn_license.setEnabled(False)
+
+    def _on_activate_license(self) -> None:
+        from app.core.licensing import activate
+
+        ok, msg = activate(self._inp_license.text(), self._db)
+        if ok:
+            self._lbl_license_feedback.setStyleSheet("color:#16A34A;font-weight:bold;")
+            self._lbl_license_feedback.setText(f"🎉 {msg}")
+            self._inp_license.clear()
+            self._btn_license.setEnabled(False)
+            self.refresh_license_status()
+        else:
+            self._lbl_license_feedback.setStyleSheet("color:#DC2626;")
+            self._lbl_license_feedback.setText(f"❌ {msg}")
 
     def _build_data_box(self) -> QGroupBox:
         data_box = QGroupBox("🧹  数据维护")

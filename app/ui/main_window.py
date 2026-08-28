@@ -128,6 +128,9 @@ class MainWindow(QMainWindow):
         if self._main_page is not None and hasattr(self._main_page, "theme_changed"):
             self._main_page.theme_changed.connect(self.apply_theme)
 
+        # 授权门禁：主窗口出现后延时 0.8s 检查试用状态（过期才弹窗）
+        QTimer.singleShot(800, self.check_license_on_start)
+
     def _create_main_page(self) -> QWidget:
         try:
             from app.ui.main_page import MainPage  # noqa: WPS433
@@ -233,6 +236,34 @@ class MainWindow(QMainWindow):
     def show_settings_page(self) -> None:
         if self._stack:
             self._stack.setCurrentIndex(1)
+        # 进入配置中心时刷新授权状态（试用期倒计时/激活结果）
+        if self._settings_page is not None and hasattr(self._settings_page, "refresh_license_status"):
+            try:
+                self._settings_page.refresh_license_status()  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ==================================================================
+    # 授权门禁（本地试用/激活，纯离线）
+    # ==================================================================
+    def check_license_on_start(self) -> None:
+        """启动后延时检查：试用过期则弹激活窗（不阻塞主窗口）。"""
+        try:
+            from app.core.licensing import get_status
+
+            st = get_status(self._db)
+        except Exception:  # noqa: BLE001 — 授权检查失败不阻塞启动
+            log.warning("[MainWindow] 授权状态检查失败（忽略）")
+            return
+        if st.get("expired"):
+            log.info("[MainWindow] 试用已过期，弹出激活窗口")
+            self.prompt_license()
+
+    def prompt_license(self) -> None:
+        from app.ui.license_dialog import LicenseDialog
+
+        dlg = LicenseDialog(self._db, self)
+        dlg.exec()
 
     # ==================================================================
     # 系统托盘

@@ -379,11 +379,33 @@ class LocalDB:
                 return False
             return bool(entry.get("chapters"))
 
+    # ---------- 授权 ----------
+    def get_license(self) -> dict[str, Any]:
+        """返回授权段（深拷贝；不存在时返回空 dict）。"""
+        with self._lock:
+            lic = self._db.get("license")
+            return deepcopy(lic) if isinstance(lic, dict) else {}
+
+    def set_license(self, patch: dict[str, Any]) -> None:
+        """合并写入授权段并落盘。"""
+        with self._lock:
+            lic = self._db.setdefault("license", {})
+            if not isinstance(lic, dict):
+                lic = self._db["license"] = {}
+            lic.update(deepcopy(patch))
+            self._save_db()
+
     # ---------- 维护 ----------
     def clear_all(self) -> None:
-        """清空所有本地数据（清除 Cookie 时一并调用）。"""
+        """清空所有本地数据（清除 Cookie 时一并调用）。
+
+        注意：license 段必须保留——清 Cookie 不应导致已激活状态丢失。
+        """
         with self._lock:
+            license_kept = self._db.get("license")
             self._db = self._empty_db()
+            if isinstance(license_kept, dict) and license_kept:
+                self._db["license"] = deepcopy(license_kept)
             self._cache = {}
             self._save_db()
             self._save_cache()

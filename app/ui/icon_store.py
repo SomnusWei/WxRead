@@ -21,8 +21,8 @@ from PySide6.QtGui import (
 )
 
 
-APP_VERSION = "2.2.4"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
-APP_BUILD_ID = "1e18de88 · 20260827"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
+APP_VERSION = "2.2.6"       # 与 主界面 版本号 label 同步；打包脚本会自动改写本值
+APP_BUILD_ID = "56d62021 · 20260828"   # 打包脚本 build_release.py 会写入实际 git short sha / build-timestamp
 
 
 def app_version_display() -> str:
@@ -207,7 +207,7 @@ def make_app_icon(size: int = 64, *, detailed: bool = True) -> QIcon:
 
     # 7) 封面中央白字斜体 W（主视觉）
     text = "W"
-    p.setPen(Qt.PenStyle.NoPen)
+    p.setPen(QPen(QColor("#FFFFFF")))
     p.setBrush(QBrush(QColor("#FFFFFF")))
     f = QFont()
     f.setFamily("Georgia")

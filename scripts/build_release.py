@@ -21,7 +21,10 @@ r"""WxReadAssistant 一键打包 & 补丁分发脚本。
   6. 若传 --previous：和 release/WxReadAssistant-v{PREVIOUS}-full 做 diff，
      只打包变更/新增文件 → release/patch-v{VERSION}-from-v{PREVIOUS}.zip
      并同步生成 apply_patch.bat（双击即可覆盖更新，用户数据目录不动）
-  7. 生成 release_note-v{VERSION}.md
+  7. 调用 Inno Setup（ISCC.exe）构建 Windows 安装包
+     → release/WxReadAssistant-v{VERSION}-setup.exe（含全部依赖，双击安装）
+     未安装 Inno Setup 时自动跳过（winget install JRSoftware.InnoSetup）
+  8. 生成 release_note-v{VERSION}.md
 """
 from __future__ import annotations
 
@@ -86,7 +89,7 @@ def git_short_sha() -> str:
 # 1. 语法检查
 # =====================================================================
 def syntax_check() -> None:
-    print("[1/7] 语法检查 …")
+    print("[1/8] 语法检查 …")
     target_files = [
         ROOT / "main.py",
         *list((ROOT / "app").rglob("*.py")),
@@ -104,7 +107,7 @@ def syntax_check() -> None:
 # =====================================================================
 def _rewrite_icon_store(version: str, build_id: str) -> None:
     """改写 icon_store.py 里的 APP_VERSION / APP_BUILD_ID（按名按字面量精确替换）。"""
-    print(f"[2/7] 写入版本号 APP_VERSION={version}  APP_BUILD_ID={build_id}")
+    print(f"[2/8] 写入版本号 APP_VERSION={version}  APP_BUILD_ID={build_id}")
     src = ICON_STORE.read_text(encoding="utf-8")
 
     def _repl_version(m: re.Match) -> str:
@@ -138,7 +141,7 @@ def _rewrite_icon_store(version: str, build_id: str) -> None:
 # 3. PyInstaller 构建 onedir
 # =====================================================================
 def pyinstaller_build() -> None:
-    print("[3/7] PyInstaller onedir 构建 …（耗时约 3~6 分钟）")
+    print("[3/8] PyInstaller onedir 构建 …（耗时约 3~6 分钟）")
     if not SPEC_FILE.exists():
         raise SystemExit(f"[FAIL] 未找到 spec 文件：{SPEC_FILE}")
     # 清理上次 dist/WxReadAssistant 确保干净
@@ -165,7 +168,7 @@ def pyinstaller_build() -> None:
 # 4. 拷贝 → release/WxReadAssistant-vX.Y.Z-full
 # =====================================================================
 def stage_full(version: str) -> Path:
-    print(f"[4/7] 发布区归档 full 目录（版本 {version}）…")
+    print(f"[4/8] 发布区归档 full 目录（版本 {version}）…")
     RELEASE_DIR.mkdir(parents=True, exist_ok=True)
     full_dir = RELEASE_DIR / f"WxReadAssistant-v{version}-full"
     if full_dir.exists():
@@ -178,7 +181,7 @@ def stage_full(version: str) -> Path:
 # 5. 打包 full.zip + 写 sha1 清单
 # =====================================================================
 def zip_full(version: str, full_dir: Path) -> Path:
-    print(f"[5/7] 压缩 full 包 → release/WxReadAssistant-v{version}-full.zip …")
+    print(f"[5/8] 压缩 full 包 → release/WxReadAssistant-v{version}-full.zip …")
     zip_path = RELEASE_DIR / f"WxReadAssistant-v{version}-full.zip"
     manifest_lines = [
         f"# WxReadAssistant v{version}  完整安装包",
@@ -213,11 +216,11 @@ def make_patch(version: str, previous: str, full_dir: Path) -> Path | None:
     prev_full = RELEASE_DIR / f"WxReadAssistant-v{previous}-full"
     if not prev_full.exists():
         print(
-            f"[6/7] ⚠️  未找到上一版目录 {prev_full}，跳过增量补丁。"
+            f"[6/8] ⚠️  未找到上一版目录 {prev_full}，跳过增量补丁。"
             f"请先把 v{previous} full 目录归档到 release/ 下再运行。"
         )
         return None
-    print(f"[6/7] 计算差异并生成 patch-v{version}-from-v{previous}.zip …")
+    print(f"[6/8] 计算差异并生成 patch-v{version}-from-v{previous}.zip …")
     prev = {p.relative_to(prev_full): p for p in prev_full.rglob("*") if p.is_file()}
     curr = {p.relative_to(full_dir): p for p in full_dir.rglob("*") if p.is_file()}
 
@@ -383,10 +386,68 @@ exit /B 0
 
 
 # =====================================================================
-# 7. release_note 自动生成
+# 7. Inno Setup 安装包（setup.exe，含全部依赖）
 # =====================================================================
-def write_release_note(version: str, previous: str | None, full_zip: Path) -> Path:
-    print(f"[7/7] 生成 release_note-v{version}.md …")
+ISCC_CANDIDATES = [
+    Path(os.environ.get("ISCC_EXE", "")) if os.environ.get("ISCC_EXE") else None,
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 6" / "ISCC.exe"
+    if os.environ.get("LOCALAPPDATA") else None,
+    Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
+    Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
+]
+
+
+def find_iscc() -> Path | None:
+    for p in ISCC_CANDIDATES:
+        try:
+            if p and p.is_file():
+                return p
+        except OSError:
+            continue
+    which = shutil.which("ISCC")
+    return Path(which) if which else None
+
+
+def build_installer(version: str, full_dir: Path) -> Path | None:
+    iss_file = ROOT / "installer" / "wxread_assistant.iss"
+    if not iss_file.exists():
+        print(f"[7/8] ⚠️  未找到 {iss_file}，跳过安装包构建。")
+        return None
+    iscc = find_iscc()
+    if iscc is None:
+        print(
+            "[7/8] ⚠️  未找到 Inno Setup（ISCC.exe），跳过安装包构建。\n"
+            "       安装后重试：winget install --id JRSoftware.InnoSetup -e"
+        )
+        return None
+    print(f"[7/8] Inno Setup 构建安装包（{iscc}）…")
+    run([
+        str(iscc),
+        f"/DAppVersion={version}",
+        f"/DDistDir={full_dir}",
+        f"/DOutputDir={RELEASE_DIR}",
+        str(iss_file),
+    ])
+    setup_exe = RELEASE_DIR / f"WxReadAssistant-v{version}-setup.exe"
+    if not setup_exe.exists():
+        raise SystemExit(f"[FAIL] ISCC 完成但未找到产物 {setup_exe}")
+    # setup.exe 的 sha1 清单（便于发布时校验）
+    sha1_path = RELEASE_DIR / f"WxReadAssistant-v{version}-setup.sha1.txt"
+    sha1_path.write_text(
+        f"{sha1_file(setup_exe)}  {setup_exe.name}\n", encoding="utf-8"
+    )
+    size_mb = setup_exe.stat().st_size / 1024 / 1024
+    print(f"   ✓ {setup_exe.name}  大小 ≈ {size_mb:.0f} MB")
+    return setup_exe
+
+
+# =====================================================================
+# 8. release_note 自动生成
+# =====================================================================
+def write_release_note(
+    version: str, previous: str | None, full_zip: Path, setup_exe: Path | None
+) -> Path:
+    print(f"[8/8] 生成 release_note-v{version}.md …")
     build_date = _dt.datetime.now().strftime("%Y-%m-%d")
     lines = [
         f"# 📦 WxReadAssistant v{version} — Release Note",
@@ -394,18 +455,36 @@ def write_release_note(version: str, previous: str | None, full_zip: Path) -> Pa
         "",
         "## 下载地址",
         "",
-        f"| 文件 | 说明 |",
+        "| 文件 | 说明 |",
         "|------|------|",
-        f"| `WxReadAssistant-v{version}-full.zip` | 完整安装包（**首次安装** 或 **从任意旧版本升级** 解压即用） |",
+        (
+            f"| `WxReadAssistant-v{version}-setup.exe` | **Windows 安装包（推荐）**："
+            "双击安装，含全部依赖，自动创建开始菜单/桌面快捷方式，自带卸载器 |"
+        ) if setup_exe else (
+            "| `WxReadAssistant-v{v}-setup.exe` | （本次未构建安装包：需安装 "
+            "[Inno Setup](https://jrsoftware.org/isinfo.php) 后重新打包） |".format(v=version)
+        ),
+        f"| `WxReadAssistant-v{version}-full.zip` | 完整免安装包（解压即用） |",
         (
             f"| `patch-v{version}-from-v{previous}.zip` | **增量补丁**（"
             f"只适用于 v{previous} → v{version}，体积更小，见 README「补丁升级」） |"
-        ) if previous else (
+        ) if previous and (RELEASE_DIR / f"patch-v{version}-from-v{previous}.zip").exists() else (
             "| — | —（本次未提供增量补丁，如需请指定 `--previous` 重新构建） |"
         ),
         "",
         "## 首次安装步骤",
         "",
+        "### 方式一：安装包（推荐）",
+        "",
+        f"1. 双击 `WxReadAssistant-v{version}-setup.exe`，按向导完成安装（默认安装到 "
+        "`C:\\Program Files\\WxReadAssistant\\`，非管理员可选仅为本机当前用户安装）。",
+        "2. 从开始菜单 / 桌面快捷方式启动 `WxReadAssistant`。",
+        "3. 首次使用：主页 → 「📷 扫码登录」→ 按提示扫码获取 Cookie。",
+        "4. 配置：进入「⚙️ 配置中心」填入 **Skill API Key**（可选，用于官方阅读统计回写）。",
+        "5. 卸载：Windows「设置 → 应用」或开始菜单卸载项；`%APPDATA%\\WxReadAssistant` "
+        "用户数据（配置/进度/缓存）不会被删除。",
+        "",
+        "### 方式二：免安装 zip",
         "1. 解压 `WxReadAssistant-vX.Y.Z-full.zip` 到任意目录（建议 `C:\\Program Files\\WxReadAssistant\\`）。",
         "2. 进入子目录 `WxReadAssistant\\`，双击 `WxReadAssistant.exe` 启动。",
         "3. 首次使用：主页 → 「📷 扫码登录」→ 按提示扫码获取 Cookie。",
@@ -482,13 +561,13 @@ def main() -> None:
     build_stamp = _dt.datetime.now().strftime("%Y%m%d")
     build_id = f"{git_short_sha()} · {build_stamp}"
 
-    # 步骤 1~7
+    # 步骤 1~8
     syntax_check()                                     # 1
     _rewrite_icon_store(args.version, build_id)        # 2
 
     # 2.5 可选 smoke（MainPage + SettingsPage 构造）
     if not args.skip_smoke:
-        print("[2.5/7] 启动烟雾（MainWindow 构造 + apply_theme）…")
+        print("[2.5/8] 启动烟雾（MainWindow 构造 + apply_theme）…")
         subprocess.run([
             sys.executable, "-c",
             "import sys; sys.path.insert(0, '.'); "
@@ -505,9 +584,10 @@ def main() -> None:
     full_dir = stage_full(args.version)             # 4
     full_zip = zip_full(args.version, full_dir)     # 5
     make_patch(args.version, args.previous, full_dir) if args.previous else (
-        print("[6/7] (未提供 --previous，跳过增量补丁)")
+        print("[6/8] (未提供 --previous，跳过增量补丁)")
     )                                               # 6
-    write_release_note(args.version, args.previous, full_zip)  # 7
+    setup_exe = build_installer(args.version, full_dir)  # 7
+    write_release_note(args.version, args.previous, full_zip, setup_exe)  # 8
 
     print("\n🎉 构建完成 → 产物位于 release/")
     for p in sorted(RELEASE_DIR.glob(f"*{args.version}*")):

@@ -99,3 +99,8 @@ release/WxReadAssistant-*-full.zip
 release/WxReadAssistant-*-full.sha1.txt
 # 增量补丁 zip
 release/patch-*.zip
+# Windows 安装器（setup.exe + 校验）
+release/WxReadAssistant-*-setup.exe
+release/WxReadAssistant-*-setup.sha1.txt
+release/WxReadAssistant-*-iconfix-*.exe
+release/WxReadAssistant-*-iconfix-*.sha1.txt

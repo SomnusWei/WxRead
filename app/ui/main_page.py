@@ -1165,6 +1165,18 @@ class MainPage(QWidget):
     # 按钮槽
     # ------------------------------------------------------------------
     def _on_start(self) -> None:
+        # 授权门禁：试用期结束且未激活时禁止开始阅读（本地校验，无网络）
+        from app.core.licensing import get_status
+
+        st = get_status(self._db)
+        if st.get("expired"):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "试用已结束",
+                "12 小时免费试用期已结束。\n请到「⚙️ 配置中心 → 🔑 授权管理」输入注册码激活后再开始阅读。",
+            )
+            return
         cookies = self._cfg.get_cookies_dict()
         wr_skey = cookies.get("wr_skey", "")
         if not wr_skey or len(str(wr_skey)) < 8:

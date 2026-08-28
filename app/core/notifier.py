@@ -23,6 +23,20 @@ from app.utils.logger import get_logger
 log = get_logger(__name__)
 
 
+def format_duration(minutes: int) -> str:
+    """把分钟数格式化为「X小时Y分钟」形式（用户可读）。
+
+    规则：492 → 8小时12分钟；480 → 8小时；12 → 12分钟；0 → 0分钟
+    """
+    minutes = max(0, int(minutes))
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h}小时{m}分钟"
+    if h:
+        return f"{h}小时"
+    return f"{m}分钟"
+
+
 class WxPusherNotifier:
     """WxPusher 推送器（v2 多规则版）。"""
 
@@ -66,7 +80,7 @@ class WxPusherNotifier:
         content = (
             f"📚 微信读书助手已启动\n"
             f"📅 日期：{date.today().isoformat()}\n"
-            f"🎯 今日目标：{target_minutes} 分钟"
+            f"🎯 今日目标：{format_duration(target_minutes)}"
         )
         self.send_async(content, dedup_key=dedup, dedup_window_sec=86400)
 
@@ -93,8 +107,8 @@ class WxPusherNotifier:
         content = (
             f"✅ 今日阅读目标已完成\n"
             f"📅 日期：{date.today().isoformat()}\n"
-            f"📊 今日已读：{today_minutes} 分钟\n"
-            f"🎯 目标：{target_minutes} 分钟"
+            f"📊 今日已读：{format_duration(today_minutes)}\n"
+            f"🎯 目标：{format_duration(target_minutes)}"
         )
         self.send_async(content, dedup_key=dedup, dedup_window_sec=86400)
 

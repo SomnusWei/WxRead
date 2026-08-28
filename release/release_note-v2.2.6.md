@@ -1,15 +1,25 @@
-# 📦 WxReadAssistant v2.2.0 — Release Note
-> 打包日期：2026-08-25  ·  构建 SHA：2ebecf10
+# 📦 WxReadAssistant v2.2.6 — Release Note
+> 打包日期：2026-08-28  ·  构建 SHA：56d62021
 
 ## 下载地址
 
 | 文件 | 说明 |
 |------|------|
-| `WxReadAssistant-v2.2.0-full.zip` | 完整安装包（**首次安装** 或 **从任意旧版本升级**，解压即用） |
-| `patch-v2.2.0-from-v2.1.0.zip` | **本版暂未提供**（需将 v2.1.0 full 目录归档到 release/ 后重跑 `build_release.py --previous 2.1.0` 生成；v2.2.0 作为发布管线基线，从 v2.2.1 起默认带补丁） |
+| `WxReadAssistant-v2.2.6-setup.exe` | **Windows 安装包（推荐）**：双击安装，含全部依赖，自动创建开始菜单/桌面快捷方式，自带卸载器 |
+| `WxReadAssistant-v2.2.6-full.zip` | 完整免安装包（解压即用） |
+| — | —（本次未提供增量补丁，v2.2.5 及更早用户直接使用安装包 `setup.exe` 原地升级即可） |
 
 ## 首次安装步骤
 
+### 方式一：安装包（推荐）
+
+1. 双击 `WxReadAssistant-v2.2.6-setup.exe`，按向导完成安装（默认安装到 `C:\Program Files\WxReadAssistant\`，非管理员可选仅为本机当前用户安装）。
+2. 从开始菜单 / 桌面快捷方式启动 `WxReadAssistant`。
+3. 首次使用：主页 → 「📷 扫码登录」→ 按提示扫码获取 Cookie。
+4. 配置：进入「⚙️ 配置中心」填入 **Skill API Key**（可选，用于官方阅读统计回写）。
+5. 卸载：Windows「设置 → 应用」或开始菜单卸载项；`%APPDATA%\WxReadAssistant` 用户数据（配置/进度/缓存）不会被删除。
+
+### 方式二：免安装 zip
 1. 解压 `WxReadAssistant-vX.Y.Z-full.zip` 到任意目录（建议 `C:\Program Files\WxReadAssistant\`）。
 2. 进入子目录 `WxReadAssistant\`，双击 `WxReadAssistant.exe` 启动。
 3. 首次使用：主页 → 「📷 扫码登录」→ 按提示扫码获取 Cookie。
@@ -22,9 +32,9 @@
 3. 双击 `apply_patch.bat`（或右键「以管理员身份运行」）。
 4. 脚本会自动备份旧版 → 覆盖新文件 → 清理旧文件。
 5. 重启 `WxReadAssistant.exe`，进入「⚙️ 配置中心」顶部或主界面右下版本胶囊，
-   确认显示 `v2.2.0`。
+   确认显示 `v2.2.6`。
 
-## v2.2.0 CHANGELOG（与 v2.1.0 对比）
+## v2.2.6 CHANGELOG（与 v2.2.5 对比）
 
 ### 🎨 主界面（米白纸 Paper Studio）
 
@@ -57,4 +67,4 @@
 - [ ] 配置中心 → 6 个 GroupBox 底部均有 1 条 inline 说明；SpinBox 箭头非黑方块。
 - [ ] 点击「停止 / 开始」按钮，日志追加 OK，阅读统计 4 段行高无裁字。
 
-> 完整 sha1 清单见 `WxReadAssistant-v2.2.0`-full.sha1.txt
+> 完整 sha1 清单见 `WxReadAssistant-v2.2.6`-full.sha1.txt
