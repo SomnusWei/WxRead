@@ -92,6 +92,9 @@ class LocalDB:
                 "total_seconds": 0,
                 "updated_at": "",
             },
+            # 永久跳过的书（套装 / 公众号等不支持自动阅读的 bookId）
+            # 结构：{bookId: {"reason": str, "title": str, "marked_at": iso字符串}}
+            "blacklist": {},
         }
 
     # ---------- 书架 ----------
@@ -134,15 +137,56 @@ class LocalDB:
                         "current_chapter_title",
                         "record_reading_time",
                         "last_read_time",
+                        "blacklisted",
+                        "blacklist_reason",
                     ):
                         if k in old and k not in base:
                             base[k] = old[k]
                 merged.append(base)
+            # 顶层 blacklist 中的书，确保条目仍带黑名单标记（以黑名单 reason 为准）
+            blacklist = self._db.get("blacklist", {})
+            if not isinstance(blacklist, dict):
+                blacklist = {}
+            for base in merged:
+                entry = blacklist.get(str(base.get("bookId")))
+                if isinstance(entry, dict):
+                    base["blacklisted"] = True
+                    base["blacklist_reason"] = entry.get("reason", "")
             self._db["shelf"] = {
                 "books": merged,
                 "total_count": total_count if total_count is not None else len(merged),
             }
             self._db["last_sync_time"] = _now_iso()
+            self._save_db()
+
+    def is_book_blacklisted(self, book_id: str) -> bool:
+        """该书是否已被永久跳过。"""
+        with self._lock:
+            blacklist = self._db.get("blacklist", {})
+            if not isinstance(blacklist, dict):
+                return False
+            return str(book_id) in blacklist
+
+    def mark_book_blacklisted(self, book_id: str, reason: str, title: str = "") -> None:
+        """永久跳过该书：写入顶层 blacklist，并在书架对应条目上打
+        blacklisted=True / blacklist_reason 字段，最后落盘。已存在则覆盖。"""
+        bid = str(book_id or "").strip()
+        if not bid or bid.lower() == "none":
+            return
+        with self._lock:
+            blacklist = self._db.get("blacklist", {})
+            if not isinstance(blacklist, dict):
+                blacklist = self._db["blacklist"] = {}
+            blacklist[bid] = {
+                "reason": reason,
+                "title": title,
+                "marked_at": _now_iso(),
+            }
+            for book in self._db.get("shelf", {}).get("books", []):
+                if str(book.get("bookId")) == bid:
+                    book["blacklisted"] = True
+                    book["blacklist_reason"] = reason
+                    break
             self._save_db()
 
     def get_book(self, book_id: str) -> dict | None:
@@ -210,10 +254,23 @@ class LocalDB:
 
     # ---------- 选书选章 ----------
     def get_unread_books(self) -> list[dict]:
-        """返回进度 < 100% 的书，按进度降序（优先读进度高的）。"""
+        """返回进度 < 100% 的书，按进度降序（优先读进度高的）。
+
+        永久跳过（顶层 blacklist 或条目 blacklisted=True）的书不返回。
+        """
         with self._lock:
             books = self.get_shelf()
-        unread = [b for b in books if self._safe_progress(b) < 100]
+            blacklist = self._db.get("blacklist", {})
+            if not isinstance(blacklist, dict):
+                blacklist = {}
+            blacklist_ids = {str(bid) for bid in blacklist}
+        unread = [
+            b
+            for b in books
+            if self._safe_progress(b) < 100
+            and str(b.get("bookId")) not in blacklist_ids
+            and not b.get("blacklisted")
+        ]
         unread.sort(key=lambda b: self._safe_progress(b), reverse=True)
         return unread
 
@@ -254,19 +311,20 @@ class LocalDB:
                 # 跨天时丢弃外部传入的 today_seconds，防止 Skill
                 # 缓存把昨天的值写回本地
                 incoming.pop("today_seconds", None)
-            # today_seconds 取较大值（本地累加 vs Skill 服务端统计，
-            # 取更全的；避免 Skill 缓存延迟覆盖掉本地实时累加值）
+            # today_seconds 以 Skill 服务端统计为权威基线：
+            # 本地每次成功固定 +45s 只是估算，系统性高于服务端口径，
+            # 用 max() 会让误差永远无法被纠正（官方 36m、本地 49m 时界面纹丝不动）。
+            # 规则：Skill 值 > 0 → 覆盖为基线，之后 add_today_seconds 继续累加；
+            # Skill 值为 0/缺失（该项请求失败或当天确实无统计）→ 保留本地值，
+            # 避免延迟/故障把真实进度清零。
             if "today_seconds" in incoming:
                 val = incoming.pop("today_seconds")
-                try:
-                    cur_sec = int(cur.get("today_seconds", 0))
-                except (TypeError, ValueError):
-                    cur_sec = 0
                 try:
                     inc_sec = int(val)
                 except (TypeError, ValueError):
                     inc_sec = 0
-                cur["today_seconds"] = max(cur_sec, inc_sec)
+                if inc_sec > 0:
+                    cur["today_seconds"] = inc_sec
             cur.update(incoming)
             cur["today_date"] = today_iso
             cur["updated_at"] = _now_iso()
@@ -293,7 +351,7 @@ class LocalDB:
                 return 0
 
     def reset_today_seconds(self) -> int:
-        """手动重置今日已完成时长为 0（绕过 update_reading_stats 的 max 策略）。"""
+        """手动重置今日已完成时长为 0。"""
         today_iso = date.today().isoformat()
         with self._lock:
             cur = self._db.get("reading_stats", {})

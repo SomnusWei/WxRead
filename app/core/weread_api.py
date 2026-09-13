@@ -157,6 +157,12 @@ class WeReadApi(QObject):
         self._lock = threading.RLock()
         self._session = requests.Session()
         self._last_read_ts: int = 0
+        # 最近一次 read 上报的结果分类，供调度器做风控判定：
+        # ok / empty_200（软风控特征：HTTP 200 + 空 body/{}）/
+        # errcode_xxx / bad_response / http_error / network /
+        # internal_error（本地构造异常）/ session_invalid
+        self.last_read_kind: str = ""
+        self.last_read_detail: str = ""
         self._update_from_config()
 
     # ---------- 基础：与 config 同步 ----------
@@ -641,6 +647,8 @@ class WeReadApi(QObject):
             True 表示成功（succ=1）
         """
         if not self.ensure_session():
+            self.last_read_kind = "session_invalid"
+            self.last_read_detail = "ensure_session 未通过"
             return False
         self._augment_headers_baggage()
         try:
@@ -650,6 +658,9 @@ class WeReadApi(QObject):
         except Exception as exc:  # noqa: BLE001
             log.warning("read_once payload 构造异常：%s", exc)
             self.warning.emit(f"read_once payload 构造异常：{exc}")
+            # 必须显式置位，否则 read_once 会残留上一次的 kind 造成误分类
+            self.last_read_kind = "internal_error"
+            self.last_read_detail = str(exc)[:120]
             return False
 
         json_ct = {"Content-Type": "application/json;charset=UTF-8"}
@@ -667,16 +678,24 @@ class WeReadApi(QObject):
                 try:
                     body = resp.json()
                 except ValueError:
+                    self.last_read_kind = "bad_response"
+                    self.last_read_detail = (resp.text or "")[:120]
                     return resp.status_code, None, resp.text[:400]
                 return resp.status_code, body if isinstance(body, dict) else {"_raw": body}, ""
             except requests.RequestException as exc:
                 log.warning("read 请求失败：%s", exc)
                 self.warning.emit(f"read 请求失败：{exc}")
+                self.last_read_kind = (
+                    "http_error" if isinstance(exc, requests.HTTPError) else "network"
+                )
+                self.last_read_detail = str(exc)[:120]
                 return 0, None, str(exc)
 
         status, body, txt = _do_post(payload)
 
         if isinstance(body, dict) and body.get("succ") == 1 and "synckey" in body:
+            self.last_read_kind = "ok"
+            self.last_read_detail = ""
             log.info(
                 "✅ read_once 成功：succ=1 synckey=%s b=%s c=%s rt=%d",
                 str(body.get("synckey"))[:16],
@@ -687,13 +706,35 @@ class WeReadApi(QObject):
             return True
         if isinstance(body, dict) and body.get("succ") == 1:
             # 有 succ 但无 synckey：服务端已接受但同步状态缺失
+            self.last_read_kind = "ok"
+            self.last_read_detail = ""
             log.info("read 成功但无 synckey：body keys=%s", list(body.keys())[:10])
             return True
 
+        # 失败分类（供调度器识别软风控）：
+        #   200 + 空 {} / 空 body → empty_200（服务端静默丢弃的典型风控响应）
+        #   dict 带 errCode      → errcode_xxx
+        #   其他非 JSON 文本      → bad_response（_do_post 已标记）
+        if isinstance(body, dict):
+            if not body:
+                self.last_read_kind = "empty_200"
+                self.last_read_detail = "HTTP 200 空响应体 {}"
+            elif "errCode" in body:
+                code = body.get("errCode")
+                self.last_read_kind = f"errcode_{code}"
+                self.last_read_detail = str(body.get("errMsg") or body)[:120]
+            else:
+                self.last_read_kind = "unexpected"
+                self.last_read_detail = str(body)[:120]
+        elif not txt:
+            self.last_read_kind = "empty_200"
+            self.last_read_detail = f"HTTP {status} 空响应体"
+
         # 失败
         log.warning(
-            "read 返回失败：HTTP=%s body=%s",
-            status, str(body)[:300] if body else txt[:200],
+            "read 返回失败：HTTP=%s kind=%s body=%s",
+            status, self.last_read_kind,
+            str(body)[:300] if body else txt[:200],
         )
         snippet = str(body)[:80] if body else (txt[:80] or "(空)")
         self.warning.emit(f"read 返回异常：HTTP={status} body={snippet}")

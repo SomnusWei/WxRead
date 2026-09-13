@@ -1000,20 +1000,33 @@ class MainPage(QWidget):
         self._kpi_labels["month"].setText(self._fmt_hm(month_sec))
         self._kpi_labels["total"].setText(self._fmt_hm(total_sec))
 
-        # 目标值：今日 120 分钟
-        TARGET_MIN = 120
-        today_min = today_sec // 60
-        today_pct = max(0, min(100, (today_min * 100 // TARGET_MIN)))
-        self._kpi_bars["today"].setValue(today_pct)
-        self._set_kpi_progress_tone(self._kpi_bars["today"], today_pct, 100)
-        self._kpi_aux["today"].setText(
-            f"目标 {TARGET_MIN} 分钟 · 完成 {today_pct}%"
-        )
+        # 目标值：取调度器当天生成的 daily_plan（与「阅读状态-今日目标」同源），
+        # 不能再硬编码 120，否则卡片与状态区两个目标互相矛盾
+        try:
+            target_min = int(self._cfg.get("daily_plan.target_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            target_min = 0
+        if target_min <= 0:
+            # 调度器尚未启动/当天计划还没生成
+            self._kpi_bars["today"].setValue(0)
+            self._set_kpi_progress_tone(self._kpi_bars["today"], 0, 100)
+            self._kpi_aux["today"].setText("目标待生成 · 启动阅读后自动设定")
+        else:
+            today_min = today_sec // 60
+            today_pct = max(0, min(100, (today_min * 100 // target_min)))
+            self._kpi_bars["today"].setValue(today_pct)
+            self._set_kpi_progress_tone(self._kpi_bars["today"], today_pct, 100)
+            self._kpi_aux["today"].setText(
+                f"目标 {target_min} 分钟 · 完成 {today_pct}%"
+            )
 
-        # 本周：参考 7d * TARGET_MIN = 840m
+        # 本周：参考 7d * 当日目标
         week_min = week_sec // 60
-        week_target = 7 * TARGET_MIN
-        week_pct = max(0, min(100, week_min * 100 // max(1, week_target)))
+        week_target = 7 * target_min
+        if week_target > 0:
+            week_pct = max(0, min(100, week_min * 100 // week_target))
+        else:
+            week_pct = 0
         week_avg = week_min // 7 if week_min > 0 else 0
         self._kpi_bars["week"].setValue(week_pct)
         self._set_kpi_progress_tone(self._kpi_bars["week"], week_pct, 100)
@@ -1021,10 +1034,13 @@ class MainPage(QWidget):
             f"日均 {week_avg} 分钟 · 参考进度 {week_pct}%"
         )
 
-        # 本月：参考 30d * TARGET_MIN = 3600m
+        # 本月：参考 30d * 当日目标
         month_min = month_sec // 60
-        month_target = 30 * TARGET_MIN
-        month_pct = max(0, min(100, month_min * 100 // max(1, month_target)))
+        month_target = 30 * target_min
+        if month_target > 0:
+            month_pct = max(0, min(100, month_min * 100 // month_target))
+        else:
+            month_pct = 0
         import datetime as _dt
         days_active = max(1, _dt.datetime.now().day)
         month_avg = month_min // days_active if month_min > 0 else 0
@@ -1034,12 +1050,14 @@ class MainPage(QWidget):
             f"{days_active} 天活跃 · 日均 {month_avg} 分钟 · {month_pct}%"
         )
 
-        # 累计
+        # 累计参考：一年目标 365 * 当日目标
         total_min = total_sec // 60
         total_h = total_min // 60
-        # 累计参考：一年目标 365 * TARGET_MIN
-        total_ref = 365 * TARGET_MIN
-        total_pct = max(0, min(100, total_min * 100 // max(1, total_ref)))
+        total_ref = 365 * target_min
+        if total_ref > 0:
+            total_pct = max(0, min(100, total_min * 100 // total_ref))
+        else:
+            total_pct = 0
         total_avg = total_min // 365 if total_min > 0 else 0
         self._kpi_bars["total"].setValue(total_pct)
         self._set_kpi_progress_tone(self._kpi_bars["total"], total_pct, 100)
@@ -1089,6 +1107,9 @@ class MainPage(QWidget):
         book = info.get("book")
         if isinstance(book, dict) and book.get("bookId"):
             self._current_book_id = str(book.get("bookId"))
+        # 卡片「今日阅读」与状态区共用同一数据源，每轮上报后同步刷新，
+        # 避免卡片只在 30 分钟 Skill 统计推送时才更新（此前两边分钟数不一致）
+        self._refresh_reading_stats()
 
     def _on_book_progress(
         self, title: str, progress: int, chapter_title: str, chapter_count: int

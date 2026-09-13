@@ -66,10 +66,33 @@ def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
 
 def sha1_file(path: Path) -> str:
     h = hashlib.sha1()
-    with path.open("rb") as f:
+    with _open_retry(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _open_retry(path: Path, mode: str, attempts: int = 6):
+    """open() 带重试：杀软实时扫描可能在文件刚生成后短时间锁定（WinError 32/拒绝访问）。"""
+    import time as _time
+
+    last_exc: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            return open(path, mode)
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            if i == attempts:
+                break
+            _time.sleep(2 * i)
+    raise last_exc  # type: ignore[misc]
+
+
+def _zip_add_file(zf: zipfile.ZipFile, src: Path, arcname: str) -> None:
+    """向 zip 写入文件（读盘带重试，规避杀软短暂锁文件）。"""
+    with _open_retry(src, "rb") as f:
+        data = f.read()
+    zf.writestr(arcname, data)
 
 
 def git_short_sha() -> str:
@@ -173,8 +196,31 @@ def stage_full(version: str) -> Path:
     full_dir = RELEASE_DIR / f"WxReadAssistant-v{version}-full"
     if full_dir.exists():
         shutil.rmtree(full_dir, ignore_errors=True)
-    shutil.copytree(DIST_DIR, full_dir)
+    # 复制时 Windows Defender 等可能短暂锁定新生成的 DLL（WinError 32），
+    # 用带重试的 copytree，避免整个构建在归档步骤前功尽弃
+    _copytree_with_retry(DIST_DIR, full_dir)
     return full_dir
+
+
+def _copytree_with_retry(src: Path, dst: Path, attempts: int = 5) -> None:
+    import time as _time
+
+    for i in range(1, attempts + 1):
+        try:
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            return
+        except shutil.Error as exc:
+            locked = [
+                e for e in (exc.args[0] if exc.args else [])
+                if len(e) >= 3 and "WinError 32" in str(e[2])
+            ]
+            if not locked or i == attempts:
+                raise
+            print(
+                f"   ⚠️ 复制遇到 {len(locked)} 个文件被占用（杀软扫描?），"
+                f"第 {i}/{attempts} 次重试：{Path(str(locked[0][0])).name}"
+            )
+            _time.sleep(3 * i)
 
 
 # =====================================================================
@@ -194,7 +240,7 @@ def zip_full(version: str, full_dir: Path) -> Path:
             if not p.is_file():
                 continue
             arcname = Path("WxReadAssistant") / p.relative_to(full_dir)
-            zf.write(p, arcname=str(arcname))
+            _zip_add_file(zf, p, str(arcname))
             try:
                 manifest_lines.append(
                     f"{arcname.as_posix()} = {sha1_file(p)}"
@@ -236,7 +282,21 @@ def make_patch(version: str, previous: str, full_dir: Path) -> Path | None:
         elif sha1_file(p) != sha1_file(q):
             changed_or_new.append((rel, "M"))
 
-    deleted = [rel for rel in prev.keys() if rel not in curr]
+    # 安装目录基准会比 PyInstaller 产物多出 Inno 卸载器等安装期文件，
+    # 它们不属于应用本体，补丁绝不能删除（否则用户无法卸载/升级）
+    _DELETE_IGNORE = ("unins000", "unins001", "unins002")
+
+    def _is_installer_artifact(rel: Path) -> bool:
+        stem = rel.name.lower()
+        return (
+            any(stem.startswith(p) for p in _DELETE_IGNORE)
+            and rel.suffix.lower() in {".exe", ".dat", ".msg"}
+        )
+
+    deleted = [
+        rel for rel in prev.keys()
+        if rel not in curr and not _is_installer_artifact(rel)
+    ]
 
     zip_path = RELEASE_DIR / f"patch-v{version}-from-v{previous}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -244,7 +304,7 @@ def make_patch(version: str, previous: str, full_dir: Path) -> Path | None:
         for rel, _flag in changed_or_new:
             src = full_dir / rel
             arcname = Path("WxReadAssistant") / rel
-            zf.write(src, arcname=str(arcname))
+            _zip_add_file(zf, src, str(arcname))
         # 2) 写入 patch_meta.txt（供 apply_patch.bat 判断是否需要删除旧文件）
         meta = [
             f"patch_from=v{previous}",
@@ -502,36 +562,46 @@ def write_release_note(
         "",
         "## v""" + version + r""" CHANGELOG（与 v""" + (previous or "?.?.?") + r""" 对比）""",
         "",
-        "### 🎨 主界面（米白纸 Paper Studio）",
+        "### 📊 今日阅读统计修复",
         "",
-        "- 阅读统计 4 项取消「独立卡片」，改为**一整张整板**通栏 + 4 段间距 18px + 严格等宽；",
-        "  4 段内容：标题 18px 墨黑 / 数值 36px 微信蓝 / aux 12px muted / 4px 进度条贴底留 8px。",
-        "- 根因修复：之前卡内 VBox + MinimumExpanding/stretch(1) 会在 Windows Fusion 高 DPI 下",
-        "  错误收缩 QLabel sizeHint → 标题/数值全行消失，本轮**全部改 Grid 硬预算**。",
-        "- Header：左侧「📖 微信读书助手」Logo + 右日期胶囊 / Cookie 状态点 / Cookie 胶囊。",
-        "- 版本号由「Cookie 旁」迁移到工作日志面板右下（小胶囊），窗口标题 / 托盘 ToolTip / 托盘",
-        "  消息 / 配置中心标题旁也同步展示完整版本号（含 build_id）。",
+        "- 修复统计卡片「目标」硬编码 120 分钟、与阅读状态区「今日目标」（按设置页",
+        "  配置时长区间每日随机生成）互相矛盾的问题：卡片目标改为与调度器当天计划同源，",
+        "  周/月/年参考进度同步按当日目标计算。",
+        "- 修复 Skill 官方统计刷新后（日志 today=36m）界面今日阅读不更新的问题：",
+        "  旧逻辑对今日时长取「本地估算 vs 官方」较大值，本地每次固定 +45 秒系统性",
+        "  虚高且永远无法被官方数据纠正；现改为官方数据为权威基线定期校准、随后继续",
+        "  实时累加（官方暂时返回 0 时保留本地值，不会误清零），校准时日志明示",
+        "  「已按微信读书官方数据校准上调/下调」。",
+        "- 统计卡片改为每轮上报后实时刷新，卡片分钟数与「已完成」不再出现差值。",
         "",
-        "### ⚙️ 配置中心",
+        "### 🛡️ 阅读风控自动防线",
         "",
-        "- 2×3 Grid → 行 0：📖/🔑/📢；行 1：💻 系统（1 列） + 🧹 数据（**跨 col1+col2**）；",
-        "  删除独立的「🎯 说明」组框，6 条建议**拆分到对应组框底部**作为 💡 inline tips。",
-        "- 修复 SpinBox 上下箭头在高 DPI 渲染为「黑方块」Bug：使用 QProxyStyle 直接绘制",
-        "  ▲/▼ 字符（JetBrains Mono 8pt 粗）。",
+        "- read 上报结果精细分类（空响应/错误码/网络异常/登录态失效等 8 类），失败日志",
+        "  直接附带类型，排查不再靠猜。",
+        "- 登录态正常但阅读接口连续 3 次返回空响应（HTTP 200 空 body，服务端静默丢弃的",
+        "  软风控特征）→ 自动判定风控并**立即停止一切上报**，避免持续重试加重处罚。",
+        "- 风控冷却指数退避：60 → 120 → 240 分钟逐档翻倍（360 分钟封顶），冷却结束自动",
+        "  试探，成功一次即自动恢复；冷却倒计时在主界面实时可见，支持暂停/停止。",
+        "- 新增「🚨 阅读风控通知」WxPusher 推送（默认开启，可在配置中心关闭）：命中风控",
+        "  立刻微信提醒；同类告警 3 小时最多一条，限频记录持久化，重启程序也不会重复轰炸。",
         "",
-        "### 🚢 发布流程",
+        "### 📚 套装书/公众号书自动跳过",
         "",
-        "- 新增 `scripts/build_release.py`：一键 **版本号写入** → **PyInstaller onedir** →",
-        "  **full.zip 归档** → **增量 patch 打包** → **release_note 生成**。",
-        "- 所有 EXE 会把 **构建 SHA + 日期** 写入 `app/ui/icon_store.py::APP_BUILD_ID`，",
-        "  主界面 / 日志 / 配置中心都可见，避免用户拿到同名旧二进制。",
+        "- 遇到 CB_/MP_ 等非数字 bookId 的套装书、公众号合集（章节实为多本子书，无法自动",
+        "  上报）时，自动**永久拉黑并立即换书**，不再整夜卡死在同一本失败重试。",
+        "- 黑名单持久化在本地数据库：重启程序、书架重新同步后标记都不丢失。",
+        "",
+        "### 🔧 稳定性",
+        "",
+        "- 阅读上报增加最外层异常兜底，任何意外异常都不会再静默终止调度线程。",
+        "- 登录态失效不计入阅读风控连击，统一走原有扫码恢复流程，避免误报误冷却。",
         "",
         "### ✅ 校验清单",
         "",
-        "- [ ] 首次安装：exe 启动无报错；扫码登录后状态点变绿。",
-        "- [ ] 补丁升级：应用后窗口标题 / 版本胶囊显示新版次。",
-        "- [ ] 配置中心 → 6 个 GroupBox 底部均有 1 条 inline 说明；SpinBox 箭头非黑方块。",
-        "- [ ] 点击「停止 / 开始」按钮，日志追加 OK，阅读统计 4 段行高无裁字。",
+        "- [ ] 覆盖安装 / 补丁升级后，版本胶囊显示 v" + version + "。",
+        "- [ ] 配置中心 → WxPusher 推送区可见「阅读风控通知」开关。",
+        "- [ ] 选到套装书时日志出现「🚫 永久跳过并换书」，随后自动切到普通书。",
+        "- [ ] 连续失败触发后状态显示「风控冷却中（剩余约 X 分钟）」，冷却期间无任何上报。",
         "",
         f"> 完整 sha1 清单见 `{full_zip.with_suffix('').name.replace('-full','')}`-full.sha1.txt",
         "",

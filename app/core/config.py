@@ -65,6 +65,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fail_cooldown_min_sec": 30,   # 失败冷却下限
         "fail_cooldown_max_sec": 60,   # 失败冷却上限
     },
+    "risk": {
+        # read 端点软风控：HTTP 200 + 空 {}（succ 字段缺失），连续 N 次即判定
+        "empty_read_threshold": 3,
+        # 登录态正常但 read 连续失败（任意原因）超过此次数 → 通用失败告警
+        "fail_streak_threshold": 8,
+        # 命中风控后自动冷却（停止一切阅读上报）的基准时长/退避上限（分钟）
+        "soft_cooldown_min": 60,
+        "cooldown_max_min": 360,
+        # 同类风控推送的最小间隔（分钟）；时间戳持久化，重启后限频仍生效
+        "alert_cooldown_min": 180,
+    },
     "skill": {
         "api_key": "",                 # WEREAD_API_KEY (wrk-xxxxxxxx)
         "version": "1.0.5",            # Skill 版本号
@@ -77,6 +88,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "notify_cookie_fail": True,    # Cookie 失效通知
         "notify_daily_done": True,     # 任务完成发送
         "notify_login_success": False,  # 登录成功通知
+        "notify_risk_control": True,   # 阅读风控通知（软风控/连续失败，自动冷却）
     },
     "app": {
         "auto_start": False,          # 开机自启
@@ -88,6 +100,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "date": "",                    # 日期键 YYYY-MM-DD
         "target_minutes": 0,           # 当日随机目标（分钟）
     },
+    "risk_alerts": {},                 # 风控告警限频时间戳（{kind: ts}，持久化）
 }
 
 

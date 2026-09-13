@@ -94,6 +94,12 @@ class Scheduler(QThread):
         ) * 60
         self._health_fail_count = 0
 
+        # read 接口风控检测（empty_200 = HTTP 200 空 body 的静默丢弃）
+        self._empty_read_streak = 0   # 连续空响应次数
+        self._fail_streak = 0         # 连续失败次数（任意原因）
+        self._risk_pause_until = 0.0  # 风控冷却截止时间戳（此前不发起任何上报）
+        self._risk_cooldown_level = 0  # 冷却退避档数（反复命中逐档翻倍）
+
         # Skill 数据定期刷新（间隔动态从配置读取，不在 __init__ 缓存）
         self._last_skill_refresh_ts = 0.0
 
@@ -138,6 +144,11 @@ class Scheduler(QThread):
         self._fail_count = 0
         self._chapter_read_count = 0
         self._next_run_at = 0.0
+        # 风控状态内存复位（推送限频时间戳持久化在 config，重启后仍生效）
+        self._empty_read_streak = 0
+        self._fail_streak = 0
+        self._risk_pause_until = 0.0
+        self._risk_cooldown_level = 0
 
         log.info("调度器已启动")
         self._set_state("初始化中")
@@ -216,6 +227,12 @@ class Scheduler(QThread):
                     return
                 self._set_state("运行中")
 
+            # ⓪ 风控冷却中：不发起任何上报/巡检，倒计时可被暂停/停止打断
+            if time.time() < self._risk_pause_until:
+                if not self._tick_risk_cooldown():
+                    return
+                continue
+
             # ① 健康检查（每 12 分钟）
             self._maybe_run_health_check()
             if self._stop_event.is_set():
@@ -270,6 +287,12 @@ class Scheduler(QThread):
                 self._check_book_switch()
 
             # ⑧ 计算下次间隔
+            if time.time() < self._risk_pause_until:
+                # 本轮已命中风控冷却：跳过常规间隔（含失败冷却），
+                # 直接 continue 由循环顶部守卫接管倒计时
+                self._next_run_at = self._risk_pause_until
+                self._emit_progress(0, ok)
+                continue
             cur_interval = self._calc_next_interval(ok)
             self._next_run_at = time.time() + cur_interval
             self._emit_progress(cur_interval, ok)
@@ -310,6 +333,12 @@ class Scheduler(QThread):
         # 全部都是非正文 → 返回第一章兜底
         return chapters[0] if chapters else None
 
+    @staticmethod
+    def _is_unsupported_book(book_id: str) -> bool:
+        """非数字 bookId（CB_ 套装 / MP_ 公众号等）无法通过 /web/book/read 上报，必须跳过。"""
+        bid = str(book_id or "").strip()
+        return bool(bid) and not bid.isdigit()
+
     def _select_book_and_chapter(self) -> bool:
         """进度驱动选书 + 顺序选章。"""
         with self._state_lock:
@@ -319,16 +348,55 @@ class Scheduler(QThread):
                 and self._safe_progress(self._current_book) < 100
                 and self._current_chapter
             ):
-                return True
+                book_id = str(self._current_book.get("bookId"))
+                if self._is_unsupported_book(book_id):
+                    # 当前书是套装/不支持类型：永久拉黑、清空状态后落入下方重新选书
+                    title = str(self._current_book.get("title", "未知"))
+                    self._emit_log(
+                        f"🚫 {title}（bookId={book_id}）为套装/不支持类型，永久跳过并换书"
+                    )
+                    self._db.mark_book_blacklisted(
+                        book_id,
+                        "非数字 bookId（套装/公众号等不支持自动阅读）",
+                        title,
+                    )
+                    self._current_book = None
+                    self._current_chapter = None
+                    self._chapter_read_count = 0
+                else:
+                    return True
 
-            # 选下一本：进度最高的未读完的书
-            book = self._db.select_next_book()
-            if not book:
+            # 选下一本：进度最高的未读完的书（有界循环跳过套装等不支持类型）
+            max_picks = max(1, len(self._db.get_shelf()))
+            book = None
+            for _ in range(max_picks):
+                candidate = self._db.select_next_book()
+                if candidate is None:
+                    self._current_book = None
+                    self._current_chapter = None
+                    return False
+                candidate_id = str(candidate.get("bookId"))
+                if self._is_unsupported_book(candidate_id):
+                    candidate_title = str(candidate.get("title", "未知"))
+                    self._emit_log(
+                        f"🚫 {candidate_title}（bookId={str(candidate_id)[:24]}）"
+                        "为套装/不支持类型，永久跳过并换书"
+                    )
+                    self._db.mark_book_blacklisted(
+                        candidate_id,
+                        "非数字 bookId（套装/公众号等不支持自动阅读）",
+                        candidate_title,
+                    )
+                    continue
+                book = candidate
+                self._current_book = book
+                break
+            else:
+                # 理论上不会走到：所有候选都被拉黑
                 self._current_book = None
                 self._current_chapter = None
                 return False
 
-            self._current_book = book
             book_id = str(book.get("bookId"))
             title = str(book.get("title", "未知"))
             progress = self._safe_progress(book)
@@ -449,11 +517,25 @@ class Scheduler(QThread):
         title = str(book.get("title", "未知"))
         ch_title = str(chapter.get("title", "未知"))
 
-        ok = self._api.read_once(book_id, chapter_uid)
+        try:
+            ok = self._api.read_once(book_id, chapter_uid)
+        except Exception as exc:  # noqa: BLE001
+            # 最外层兜底：read_once 内部未预期的异常绝不能杀死调度线程
+            log.exception("read_once 未预期异常：%s", exc)
+            self._api.last_read_kind = "network"
+            self._api.last_read_detail = str(exc)[:120]
+            ok = False
+        kind = self._api.last_read_kind or "unknown"
         with self._state_lock:
             if ok:
+                recovered = self._fail_streak > 0 or self._risk_cooldown_level > 0
                 self._success_count += 1
                 self._chapter_read_count += 1
+                # 成功即清除风控连击/冷却状态
+                self._empty_read_streak = 0
+                self._fail_streak = 0
+                self._risk_cooldown_level = 0
+                self._risk_pause_until = 0.0
                 # 本地累加进度（按章节比例微调）
                 self._increment_local_progress(book_id, title, ch_title)
                 # 本地累加今日阅读秒数
@@ -462,10 +544,109 @@ class Scheduler(QThread):
                     f"✅ 阅读成功：{title} {ch_title}（第 {self._chapter_read_count} 次，"
                     f"今日 {today_sec // 60} 分钟）"
                 )
+                if recovered:
+                    self._emit_log("🛰️ read 接口恢复正常，风控状态解除")
             else:
                 self._fail_count += 1
-                self._emit_log(f"❌ 阅读失败：{title} {ch_title}")
+                if kind == "session_invalid":
+                    # 登录态问题走 Cookie 失效/扫码流程，不计入 read 风控连击
+                    self._fail_streak = 0
+                    self._empty_read_streak = 0
+                else:
+                    self._fail_streak += 1
+                    if kind == "empty_200":
+                        self._empty_read_streak += 1
+                    else:
+                        self._empty_read_streak = 0
+                self._emit_log(f"❌ 阅读失败：{title} {ch_title}（{kind}）")
+                empty_streak = self._empty_read_streak
+                fail_streak = self._fail_streak
+                cooldown_armed = time.time() < self._risk_pause_until
+
+        # 锁外做风控判定/冷却/推送，避免 IO 与网络占用状态锁
+        if not ok and kind != "session_invalid":
+            risk_event = self._classify_risk(kind, empty_streak, fail_streak)
+            if risk_event:
+                self._trigger_risk_cooldown(
+                    risk_event[0], risk_event[1], self._api.last_read_detail
+                )
+                cooldown_armed = True
         return ok
+
+    # ---------------- read 风控检测与冷却 ----------------
+    def _classify_risk(
+        self, kind: str, empty_streak: int, fail_streak: int
+    ) -> tuple[str, str] | None:
+        """按连续失败特征判定风控事件。
+
+        - soft_read：连续 N 次 HTTP 200 空 body（服务端静默丢弃，登录态正常）
+        - read_fail：连续 M 次任意失败（session_invalid 除外，它走 Cookie 失效流程）
+        """
+        risk_cfg = self._cfg.get("risk", {}) or {}
+        try:
+            empty_th = max(1, int(risk_cfg.get("empty_read_threshold", 3)))
+            fail_th = max(1, int(risk_cfg.get("fail_streak_threshold", 8)))
+        except (TypeError, ValueError):
+            empty_th, fail_th = 3, 8
+
+        if kind == "empty_200" and empty_streak >= empty_th:
+            return (
+                "soft_read",
+                f"read 接口连续 {empty_streak} 次返回空响应（HTTP 200 空 body），"
+                "登录态检查正常但阅读上报被服务端静默丢弃",
+            )
+        if kind != "session_invalid" and fail_streak >= fail_th:
+            return (
+                "read_fail",
+                f"read 接口连续 {fail_streak} 次失败（最近类型：{kind}）",
+            )
+        return None
+
+    def _trigger_risk_cooldown(
+        self, kind: str, summary: str, detail: str = ""
+    ) -> None:
+        """命中风控：指数退避冷却（停止一切上报）+ 持久化限频推送。"""
+        risk_cfg = self._cfg.get("risk", {}) or {}
+        try:
+            base_min = max(1, int(risk_cfg.get("soft_cooldown_min", 60)))
+            cap_min = max(base_min, int(risk_cfg.get("cooldown_max_min", 360)))
+        except (TypeError, ValueError):
+            base_min, cap_min = 60, 360
+
+        with self._state_lock:
+            self._risk_cooldown_level += 1
+            level = self._risk_cooldown_level
+        cooldown_min = min(cap_min, base_min * (2 ** (level - 1)))
+        with self._state_lock:
+            self._risk_pause_until = time.time() + cooldown_min * 60
+
+        self._emit_log(
+            f"🚨 疑似阅读风控：{summary}；自动停止上报冷却 {cooldown_min} 分钟"
+            f"（第 {level} 档，反复触发将逐档翻倍至 {cap_min} 分钟封顶），"
+            "冷却期间不再请求 read 接口"
+        )
+        try:
+            fired = self._notifier.notify_risk_control(kind, summary, detail)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("风控通知发送异常：%s", exc)
+            fired = False
+        if not fired:
+            self._emit_log(
+                "ℹ️ 风控推送未发送：推送开关关闭、未配置 SPT 或处于告警限频期"
+            )
+
+    def _tick_risk_cooldown(self) -> bool:
+        """风控冷却倒计时一帧（≤30s）。返回 False 表示收到停止信号。
+
+        冷却按绝对墙钟时间计算且本地暂停不顺延：风控针对的是服务端账号
+        状态，客户端暂停期间服务端冷却时间照样流逝。
+        """
+        remain = self._risk_pause_until - time.time()
+        if remain <= 0:
+            return True
+        remain_min = int(remain // 60) + 1
+        self._set_state(f"风控冷却中（剩余约 {remain_min} 分钟）")
+        return self._interruptible_sleep(min(30.0, remain))
 
     def _increment_local_progress(
         self, book_id: str, title: str, ch_title: str
@@ -558,17 +739,30 @@ class Scheduler(QThread):
             stats = self._skill.fetch_reading_stats()
             if stats:
                 # 适配 LocalDB 字段名
+                skill_today = int(stats.get("today_seconds") or 0)
                 local_stats = {
-                    "today_seconds": stats.get("today_seconds") or 0,
+                    "today_seconds": skill_today,
                     "weekly_seconds": stats.get("week_seconds") or 0,
                     "monthly_seconds": stats.get("month_seconds") or 0,
                     "total_seconds": stats.get("total_seconds") or 0,
                 }
+                before_today = self._db.get_today_seconds()
                 self._db.update_reading_stats(local_stats)
+                # 以 DB 校准后的真实值为准（Skill 今日为 0/缺失时保留本地值）
+                after_today = self._db.get_today_seconds()
                 self.reading_stats_updated.emit(local_stats)
                 self._emit_log(
-                    f"📊 Skill 统计刷新：今日 {local_stats['today_seconds'] // 60} 分钟"
+                    f"📊 Skill 统计刷新：今日 {after_today // 60} 分钟"
                 )
+                # 本地每次 +45s 是估算，与官方口径有偏差；校准超过 1 分钟时明示，
+                # 避免用户看到数字变小以为进度丢失
+                if skill_today > 0 and abs(after_today - before_today) >= 60:
+                    arrow = "下调" if after_today < before_today else "上调"
+                    self._emit_log(
+                        f"📊 今日时长已按微信读书官方数据校准{arrow}："
+                        f"{before_today // 60} → {after_today // 60} 分钟"
+                        "（本地估算口径偏大，随后继续实时累加）"
+                    )
         except Exception as exc:  # noqa: BLE001
             self._emit_log(f"⚠️ Skill 统计刷新失败：{exc}")
 

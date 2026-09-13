@@ -409,10 +409,12 @@ class SettingsPage(QWidget):
         self._chk_cookie_fail = QCheckBox("Cookie 失效通知")
         self._chk_daily_done = QCheckBox("任务完成发送")
         self._chk_login_success = QCheckBox("登录成功通知")
+        self._chk_risk_control = QCheckBox("阅读风控通知（空响应/连续失败时推送并自动冷却）")
         push_layout.addWidget(self._chk_daily_start)
         push_layout.addWidget(self._chk_cookie_fail)
         push_layout.addWidget(self._chk_daily_done)
         push_layout.addWidget(self._chk_login_success)
+        push_layout.addWidget(self._chk_risk_control)
 
         # Tip #4：推送时机 + 冷却（与失败冷却 Tip 同语义，移到这里简洁）
         tip = QLabel("💡 建议至少开启「Cookie 失效通知」，掉线后可第一时间处理。")
@@ -647,6 +649,7 @@ class SettingsPage(QWidget):
         self._chk_cookie_fail.setChecked(bool(self._cfg.get("push.notify_cookie_fail", True)))
         self._chk_daily_done.setChecked(bool(self._cfg.get("push.notify_daily_done", True)))
         self._chk_login_success.setChecked(bool(self._cfg.get("push.notify_login_success", False)))
+        self._chk_risk_control.setChecked(bool(self._cfg.get("push.notify_risk_control", True)))
 
         self._chk_autostart.setChecked(is_autostart_enabled())
         self._chk_minimize_tray.setChecked(bool(self._cfg.get("app.minimize_to_tray", True)))
@@ -843,6 +846,11 @@ class SettingsPage(QWidget):
             self._cfg.set(
                 "push.notify_login_success",
                 self._chk_login_success.isChecked(),
+                auto_save=False,
+            )
+            self._cfg.set(
+                "push.notify_risk_control",
+                self._chk_risk_control.isChecked(),
                 auto_save=False,
             )
             self._cfg.set(

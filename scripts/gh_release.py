@@ -5,14 +5,18 @@
            %TEMP%\\gh_token.txt     （UTF-8 / UTF-8 BOM 均支持）
        本脚本读完后立即删除该临时文件，避免泄露。
     2) 运行：
-           python scripts\\gh_release.py --version 2.2.6 [--previous 2.2.5] [--draft]
+           python scripts\\gh_release.py --version 2.3.1 --setup-only --prune-old
+
+参数：
+    --setup-only   只上传 setup.exe（不再分发 full.zip / sha1 / patch）
+    --prune-old    发布前删除其他所有 release 及其 tag（目标版本保留）
+    --draft        先存草稿
 
 逻辑：
     - repo = SomnusWei/WxRead；tag = v{VERSION}
     - 标题 = WxReadAssistant v{VERSION}
     - Body 来自 release/release_note-v{VERSION}.md
-    - 上传：full.zip + setup.exe + 两个 sha1.txt（若存在 patch 也上传）
-    - 自动探测本机代理（端口 7890 / 7897 / 1080），未发现则直连
+    - 自动探测本机代理（端口 7890 / 7897 / 1080 等），未发现则直连
 """
 from __future__ import annotations
 
@@ -146,6 +150,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--version", required=True, help="例如 2.2.6")
 ap.add_argument("--previous", default=None, help="例如 2.2.5（仅影响 patch 上传检测）")
 ap.add_argument("--draft", action="store_true", help="先存为草稿再手动发布")
+ap.add_argument("--setup-only", action="store_true",
+                help="只上传 setup.exe（忽略 full.zip / sha1 / patch）")
+ap.add_argument("--prune-old", action="store_true",
+                help="发布前删除仓库内其他所有 release 及其 tag（目标版本保留）")
 args = ap.parse_args()
 
 VER = args.version.strip()
@@ -174,25 +182,77 @@ else:
     body = note_path.read_text(encoding="utf-8")
 
 assets_to_upload: list[tuple[str, str]] = []  # (path, mime)
-for fn, mime in [
-    (f"WxReadAssistant-v{VER}-setup.exe", "application/vnd.microsoft.portable-executable"),
-    (f"WxReadAssistant-v{VER}-setup.sha1.txt", "text/plain"),
-    (f"WxReadAssistant-v{VER}-full.zip", "application/zip"),
-    (f"WxReadAssistant-v{VER}-full.sha1.txt", "text/plain"),
-]:
-    p = RELEASE_DIR / fn
-    if p.exists():
-        assets_to_upload.append((str(p), mime))
-    else:
-        print(f"[WARN] 缺失 {fn}，跳过上传")
-# patch（可选）
-if args.previous:
-    patch = RELEASE_DIR / f"patch-v{VER}-from-v{args.previous}.zip"
-    if patch.exists():
-        assets_to_upload.append((str(patch), "application/zip"))
+if args.setup_only:
+    setup = RELEASE_DIR / f"WxReadAssistant-v{VER}-setup.exe"
+    if not setup.exists():
+        print(f"[FAIL] 缺失 {setup.name}")
+        sys.exit(1)
+    assets_to_upload.append((str(setup), "application/vnd.microsoft.portable-executable"))
+else:
+    for fn, mime in [
+        (f"WxReadAssistant-v{VER}-setup.exe", "application/vnd.microsoft.portable-executable"),
+        (f"WxReadAssistant-v{VER}-setup.sha1.txt", "text/plain"),
+        (f"WxReadAssistant-v{VER}-full.zip", "application/zip"),
+        (f"WxReadAssistant-v{VER}-full.sha1.txt", "text/plain"),
+    ]:
+        p = RELEASE_DIR / fn
+        if p.exists():
+            assets_to_upload.append((str(p), mime))
+        else:
+            print(f"[WARN] 缺失 {fn}，跳过上传")
+    # patch（可选）
+    if args.previous:
+        patch = RELEASE_DIR / f"patch-v{VER}-from-v{args.previous}.zip"
+        if patch.exists():
+            assets_to_upload.append((str(patch), "application/zip"))
 
-print(f"[1/6] Release: tag={TAG} title={TITLE} draft={args.draft}")
-print(f"[2/6] 待上传资源: {len(assets_to_upload)} 个")
+print(f"[1/7] Release: tag={TAG} title={TITLE} draft={args.draft} setup_only={args.setup_only}")
+print(f"[2/7] 待上传资源: {len(assets_to_upload)} 个")
+
+# ---- 1.5 清理其他历史 release + tag ----
+if args.prune_old:
+    print("[2.5/7] 清理其他版本 release 与 tag …")
+    # 分页拉全量 release
+    import json as _json_list
+    old_releases: list[dict] = []
+    for page in range(1, 10):
+        st, rd, _ = api_call(PROXY, "api.github.com", "GET",
+                             f"/repos/{REPO}/releases?per_page=100&page={page}", AUTH)
+        if st not in (200, 201):
+            print(f"      [WARN] release 列表失败 HTTP {st}：{rd.decode(errors='replace')[:200]}")
+            break
+        batch = _json_list.loads(rd)
+        if not batch:
+            break
+        old_releases.extend(batch)
+        if len(batch) < 100:
+            break
+    for rel in old_releases:
+        if rel.get("tag_name") == TAG:
+            continue
+        rid_old = rel["id"]
+        tag_old = rel.get("tag_name") or ""
+        ds, dr, _ = api_call(PROXY, "api.github.com", "DELETE",
+                             f"/repos/{REPO}/releases/{rid_old}", AUTH)
+        print(f"      删除 release {tag_old or rid_old} → HTTP {ds}")
+        if ds not in (204, 404):
+            print(f"        {dr.decode(errors='replace')[:200]}")
+    # 删除残留 tag（含无 release 的 tag），目标 tag 保留
+    st, rd, _ = api_call(PROXY, "api.github.com", "GET",
+                         f"/repos/{REPO}/git/matching-refs/tags", AUTH)
+    if st in (200, 201):
+        import json as _json_tags
+        for ref in _json_tags.loads(rd):
+            ref_name = ref.get("ref", "")  # refs/tags/vX.Y.Z
+            tag_name = ref_name.rsplit("/", 1)[-1]
+            if tag_name == TAG:
+                continue
+            ds, dr, _ = api_call(PROXY, "api.github.com", "DELETE",
+                                 f"/repos/{REPO}/git/refs/tags/{urllib.request.quote(tag_name)}",
+                                 AUTH)
+            print(f"      删除 tag {tag_name} → HTTP {ds}")
+    else:
+        print(f"      [WARN] tag 列表失败 HTTP {st}：{rd.decode(errors='replace')[:200]}")
 
 # ---- 2. 查/创建 Release ----
 print("[3/6] 创建 Release …")

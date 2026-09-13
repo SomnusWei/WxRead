@@ -124,6 +124,58 @@ class WxPusherNotifier:
         )
         self.send_async(content, dedup_key=dedup, dedup_window_sec=3600)
 
+    def notify_risk_control(
+        self, kind: str, summary: str, detail: str = ""
+    ) -> bool:
+        """阅读风控通知（软风控/连续失败）。
+
+        与其他通知不同：限频时间戳持久化在 config.risk_alerts.<kind>，
+        程序重启后限频仍然生效，不会重复轰炸（冷却时长取
+        risk.alert_cooldown_min）。
+        返回 True 表示已实际派发发送。
+        """
+        if not self._cfg.get("push.notify_risk_control", False):
+            return False
+        # 未配置 SPT 时直接返回（不占限频名额），否则整个限频窗口内都会静默漏报
+        if not str(self._cfg.get("push.wxpusher_spt") or "").strip():
+            log.info("未配置 WxPusher SPT，风控告警跳过且不占用限频名额")
+            return False
+        try:
+            window = max(60, int(self._cfg.get("risk.alert_cooldown_min", 180))) * 60
+        except (TypeError, ValueError):
+            window = 180 * 60
+
+        dedup = f"risk_{kind}"
+        cfg_key = f"risk_alerts.{kind}"
+        now = time.time()
+        try:
+            last = float(self._cfg.get(cfg_key, 0) or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if now - last < window:
+            log.info("风控告警持久化限频命中：%s，跳过发送", dedup)
+            return False
+        # 先落盘时间戳再发送：发送线程崩溃/程序退出也不会击穿限频
+        self._cfg.set(cfg_key, now)
+
+        kind_label = {
+            "soft_read": "阅读接口软风控（空响应）",
+            "read_fail": "阅读接口连续失败",
+        }.get(kind, kind)
+        content = (
+            f"🚨 微信读书风控提醒\n"
+            f"类型：{kind_label}\n"
+            f"情况：{summary}"
+        )
+        if detail:
+            content += f"\n详情：{detail}"
+        content += (
+            "\n处置：已自动停止上报进入冷却，冷却结束后自动重试；"
+            "若反复触发，请暂停运行并用官方客户端正常阅读一段时间"
+        )
+        self.send_async(content, dedup_key=dedup, dedup_window_sec=window)
+        return True
+
     # ---------------- 内部 ----------------
     def _run_send(
         self,
