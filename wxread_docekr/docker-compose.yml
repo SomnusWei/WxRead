@@ -1,0 +1,61 @@
+# WxReadAssistant v2.4.0 容器编排（Docker Compose v2 规范，不使用已废弃的 version 字段）
+# 用法：docker compose up -d --build
+
+services:
+  wxread:
+    # 构建上下文为项目根目录，Dockerfile 位于 docker/ 子目录
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: wxreadassistant:2.4.0
+    container_name: wxreadassistant
+
+    # 【端口安全】"5911:5911" 发布到宿主机所有网卡：局域网内可通过 http://<NAS_IP>:5911 访问。
+    # 不可信网络环境请改为 "127.0.0.1:5911:5911"（仅本机/SSH 隧道/反代可达）。
+    # 公网暴露必须同时：① 设置下方 WXREAD_WEB_TOKEN 启用 Bearer 鉴权；
+    #                   ② 外层套 Nginx/Caddy 反向代理并启用 HTTPS。
+    ports:
+      - "5911:5911"
+
+    environment:
+      TZ: Asia/Shanghai
+      # Web 面板 Bearer Token：留空则不启用鉴权（信任内网时可留空）。
+      WXREAD_WEB_TOKEN: ""
+      # 启动时自动激活的注册码（可选；推荐留空，首次启动后在面板「授权」区激活）：
+      WXREAD_LICENSE_CODE: ""
+      # 面板显示「取消激活」入口（调试/授权转让时使用，默认关闭）：
+      # WXREAD_LICENSE_ADV: "1"
+      # 仅特殊网络（如旁路由挂梯子）才需配置代理，NAS 家宽直连无需设置：
+      # HTTPS_PROXY: http://host.docker.internal:7890
+
+    # 命名卷：配置、Cookie、本地数据库、日志、心跳均持久化于其中；删容器不丢数据
+    volumes:
+      - wxread_data:/data
+
+    # 异常退出/宿主机重启后自动拉起
+    restart: unless-stopped
+    # 大于调度器优雅停机等待（main_headless.py 内 sched.wait(25s) + uvicorn 30s）
+    stop_grace_period: 40s
+    # 允许容器内通过 host.docker.internal 访问宿主机（配代理/反代时可能用到）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 由 tini 作为 PID 1，正确回收僵尸进程并转发停止信号
+    init: true
+
+    # 【可选】飞牛 fnOS 桌面图标：安装 WatchCow 应用后，取消下方注释即可在
+    # 飞牛桌面/手机 App 自动生成「微信读书助手」图标（icon 路径改为你上传的图片路径）：
+    # labels:
+    #   watchcow.enable: "true"
+    #   watchcow.appname: "wxreadassistant"
+    #   watchcow.display_name: "微信读书助手"
+    #   watchcow.desc: "微信读书自动阅读管理面板"
+    #   watchcow.version: "2.4.0"
+    #   watchcow.service_port: "5911"
+    #   watchcow.protocol: "http"
+    #   watchcow.path: "/"
+    #   watchcow.ui_type: "iframe"
+    #   watchcow.icon: "file:///vol1/1000/wxreadassistant/icon.png"
+
+# 持久化命名卷声明（docker volume 方式管理，跟随 compose 项目生命周期）
+volumes:
+  wxread_data:

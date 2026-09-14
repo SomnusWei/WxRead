@@ -104,3 +104,20 @@ release/WxReadAssistant-*-setup.exe
 release/WxReadAssistant-*-setup.sha1.txt
 release/WxReadAssistant-*-iconfix-*.exe
 release/WxReadAssistant-*-iconfix-*.sha1.txt
+
+# ===== Docker 版（wxread_docekr）敏感/本地文件，绝对不能提交 =====
+# NAS SSH 凭据（devtools 运维工具的登录信息）
+测试nas部署ssh信息.txt
+*ssh信息*.txt
+# NAS 内网运维工具（含内网拓扑，仅本地使用）
+wxread_docekr/devtools/
+# 内部验收报告（含真实 Skill key / 内网 IP / 设备 ID）
+wxread_docekr/ACCEPTANCE.md
+# 运行时数据目录（含真实 Cookie / 授权码 / 配置）
+wxread_docekr/tests/_tmp*/
+wxread_docekr/tests/_shots/
+wxread_docekr/_probe*
+wxread_docekr/**/*.log
+wxread_docekr/.env
+# 容器构建产物
+wxread_docekr/**/__pycache__/

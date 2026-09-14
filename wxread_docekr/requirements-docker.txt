@@ -1,0 +1,9 @@
+# WxReadAssistant Docker v2.4.0 运行时依赖
+# 审计范围：app/、tools/、main_headless.py（tests/ 不进镜像，其 httpx/pytest 依赖不在此列）
+# 版本策略：只设兼容下限、不钉死小版本，NAS Python 3.14 下由 pip 解析到最新兼容版
+# 传递依赖（urllib3、starlette、pydantic、anyio 等）由下列包自动拉入，无需显式声明
+
+requests>=2.32              # HTTP 客户端：微信读书 API 上报（weread_api）、WxPusher 推送（notifier）、技能 API（skill_api）
+fastapi>=0.115              # Web 面板与 REST/SSE 路由（app/web/app.py、app/web/routes/*；顺带拉入 starlette/pydantic）
+uvicorn[standard]>=0.32     # ASGI 服务进程：main_headless.py 以 uvicorn.Server 启动 5911 端口
+playwright>=1.49            # headless chromium 扫码登录，函数内延迟导入（tools/playwright_login.py），浏览器二进制由 Dockerfile 另行安装

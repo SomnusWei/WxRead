@@ -1,9 +1,29 @@
 # 📖 WxReadAssistant
 
+> 微信读书自动阅读助手，提供两个独立发行版：
+>
+> - 🖥️ **Windows 桌面版（v2.3.1）**：PySide6 桌面应用，CDP 扫码登录，[前往 GitHub Releases 下载](https://github.com/SomnusWei/WxRead/releases/latest)
+> - 🐳 **Docker 版（v2.4.0）**：NAS / Linux 服务器 7×24 挂机，Web 管理面板，容器内无头扫码，支持 Cookie 失效自动推送二维码到微信
+>
+> 两版共享同一套阅读调度内核（进度驱动选书 / 8 类风控防线 / Skill 官方数据校准），代码各自独立维护、互不影响。
+
+## 版本选择
+
+| | 🖥️ Windows 桌面版 | 🐳 Docker 版 |
+|---|---|---|
+| 运行平台 | Windows 10/11（x64） | NAS（飞牛/群晖…）/ Linux 服务器（Docker 24+） |
+| 管理界面 | PySide6 桌面窗口 | 浏览器 Web 面板（`http://<IP>:5911`，4 Tab + ECharts 报告） |
+| 扫码登录 | 本机 Chrome CDP 扫码 | 容器内 Playwright 无头扫码；**Cookie 失效后自动推二维码到微信，长按即恢复** |
+| 运行形态 | 手动启动，关机即停 | 7×24 常驻、开机自启、异常自动拉起 |
+| 代码目录 | `app/` | [`wxread_docekr/`](wxread_docekr/)（独立副本，去 Qt 化） |
+| 部署难度 | 双击安装包 | `docker compose up -d --build` 一条命令 |
+
+---
+
+# 第一部分：🖥️ Windows 桌面版（v2.3.1）
+
 > 基于 PySide6 的微信读书自动阅读桌面助手（Windows 平台）
 > CDP 扫码登录 + Skill API 拉取书架/章节池 + 本地数据库驱动进度阅读
->
-> 🎯 **最新版本 v2.3.1**：[前往 GitHub Releases 下载](https://github.com/SomnusWei/WxRead/releases/latest)
 
 ## 功能特性
 
@@ -256,9 +276,122 @@ pyinstaller --onefile --windowed --name WxReadKeygen --paths . --icon assets\app
 - **授权安全（纯本地）**：注册码算法使用 HMAC-SHA256 截断 40-bit，本地恒时比对；首次启动时间戳在 `local_db.json` 与注册表双备份取最早值防删除重置；激活只存代码哈希，不存明文。
 - **日志双写**：APPDATA（14 天保留，便于长期追溯）+ 项目根（3 天保留，便于即时排查）。
 
+---
+
+# 第二部分：🐳 Docker 版（v2.4.0）
+
+> 面向 NAS / Linux 服务器的 7×24 挂机发行版。Web 管理面板替代桌面 UI，全部代码位于独立目录 [`wxread_docekr/`](wxread_docekr/)（去 Qt 化，与 Windows 版互不影响）。详细部署文档见 [`wxread_docekr/DEPLOY.md`](wxread_docekr/DEPLOY.md)。
+
+## 功能特性（相对 Windows 版的差异）
+
+| 能力 | 说明 |
+|------|------|
+| **Web 管理面板** | 总览（KPI/控制/扫码/书架）+ 配置（表单热生效）+ 报告（ECharts 14 图）+ 日志（实时 SSE）4 个 Tab，`http://<IP>:5911` 直接访问 |
+| **无头扫码登录** | 容器内 Playwright 驱动 Chromium 生成登录二维码，无需宿主机安装 Chrome |
+| **失效自动恢复** | Cookie 硬失效时自动唤起扫码会话，二维码图片经 WxPusher 推送到微信，手机**长按识别 → 确认登录**即自动写回登录态并恢复阅读，全程无需打开面板 |
+| **WxPusher 双通道** | 文本通道（SPT 极简推送）负责日常通知；图片通道（AppToken + UID 标准推送）负责登录二维码 |
+| **REST API** | 40+ 端点：调度器控制 / 配置读写 / 书架同步 / 报告 / 日志流 / 登录态管理，便于脚本化运维 |
+| **同源调度内核** | 与 Windows 版同一套 scheduler / weread_api / skill_api / 风控防线 / 本地授权，行为口径一致 |
+| **开箱镜像** | python:3.14-slim 两阶段构建，内置 Chromium 运行库与 Noto CJK 中文字体，HEALTHCHECK 心跳自检 |
+
+## 部署
+
+### 环境要求
+
+- Docker 24+ 与 Docker Compose v2（飞牛 fnOS、群晖、unraid、裸 Linux 均可）
+- 空闲内存 ≥ 1GB（无头 Chromium 实例）
+- 网络可达微信读书与 Skill 网关
+
+### 三步部署
+
+```bash
+git clone https://github.com/SomnusWei/WxRead.git
+cd WxRead/wxread_docekr
+docker compose up -d --build
+```
+
+- 首次构建约 5~15 分钟（拉取基础镜像 + Chromium 运行库），之后增量构建走缓存秒级完成
+- 国内网络构建慢可加速：
+
+```bash
+docker compose build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+- 查看启动日志：`docker logs -f wxreadassistant`
+
+### 首次使用
+
+1. 浏览器打开 `http://<NAS_IP>:5911`
+2. 「配置」Tab → Skill 区填入 **API Key** → 「验证 Skill」
+3. 「总览」Tab → 「扫码登录」，手机微信扫码（二维码 90 秒有效，可点「重新获取」）
+4. 登录成功后调度器**自动启动**开始阅读，无需手动点开始
+5. （可选）推送区配置 WxPusher 并点「测试推送」验证双通道（见下）
+6. （可选）「授权」区输入注册码激活（12 小时免费试用到期前）
+
+### 端口与安全
+
+- compose 默认发布 `"5911:5911"`，局域网内可直接访问；不可信环境改为 `"127.0.0.1:5911:5911"`（仅本机/SSH 隧道/反代可达）
+- 公网暴露必须：① 设置 `WXREAD_WEB_TOKEN` 启用 Bearer 鉴权；② 外层套 Nginx/Caddy 启用 HTTPS
+- 信任内网（家用局域网）可留空 Token，面板免输入直达
+
+## 配置
+
+### 环境变量（编辑 docker-compose.yml 的 environment 段）
+
+| 变量 | 说明 |
+|------|------|
+| `WXREAD_LICENSE_CODE` | 启动自动激活注册码；推荐留空，首次启动后在面板激活（激活状态持久化，只填一次） |
+| `WXREAD_WEB_TOKEN` | 面板 Bearer Token，留空不启用鉴权 |
+| `TZ` | 时区，默认 `Asia/Shanghai` |
+| `WXREAD_LICENSE_ADV` | 设为 `"1"` 时面板显示「取消激活」入口（调试用） |
+| `HTTPS_PROXY` | 容器出网代理，家宽直连无需设置 |
+
+### 数据持久化
+
+全部运行数据存于命名卷 `wxread_data`（挂载到容器 `/data`）：配置、Cookie、书架进度、章节池、日志、授权状态。**删除容器不丢数据**，重建/升级镜像自动继承。
+
+### WxPusher 推送（文本 + 图片双通道）
+
+- **文本通道**：配置区填 SPT（[wxpusher.zjiecode.com](https://wxpusher.zjiecode.com) 首页扫码获取），承担每日开始/完成、Cookie 失效、风控告警等文字通知
+- **图片通道**：[wxpusher.zjiecode.com/admin](https://wxpusher.zjiecode.com/admin) 创建应用获取 `AT_` appToken + 关注应用 + 「我的 UID」获取 `UID_`，用于 Cookie 失效自动推送登录二维码
+- 开启「失效后自动推扫码二维码」开关，并按需调整「自动扫码冷却(分钟)」（默认 30，防轰炸）
+
+### 飞牛 fnOS 桌面图标（可选）
+
+安装社区应用 WatchCow 后，取消 compose 文件中 `labels:` 段注释并上传一张图标，飞牛桌面/手机 App 自动出现「微信读书助手」图标，点击直达面板。
+
+## 升级
+
+```bash
+cd WxRead/wxread_docekr
+git pull
+docker compose up -d --build
+```
+
+数据在卷中，升级不丢登录态与进度。升级后建议看一眼 `docker logs --tail 50 wxreadassistant` 确认正常。
+
+## 卸载
+
+```bash
+cd WxRead/wxread_docekr
+docker compose down        # 停止并删除容器（数据卷保留，可随时重来）
+docker compose down -v     # ⚠️ 连数据卷一起删除：登录态/进度/配置/日志全部清除，不可恢复
+docker rmi wxreadassistant:2.4.0   # （可选）清理镜像
+```
+
 ## CHANGELOG
 
-### v2.3.1 — 2026-09-13
+### v2.4.0 — 2026-09-14（🐳 Docker 版首发）
+
+- 全新 Docker 发行版（独立目录 `wxread_docekr/`，与 Windows 版代码互不影响，去 Qt 化）。
+- FastAPI + Alpine.js + ECharts Web 管理面板：总览 / 配置 / 报告 / 日志 4 Tab，40+ REST 端点 + SSE 实时日志。
+- 容器内 Playwright 无头 Chromium 扫码登录；镜像内置 Chromium 运行库与 Noto CJK 中文字体（两阶段构建，HEALTHCHECK 心跳自检）。
+- **Cookie 失效自动恢复**：硬失效自动唤起扫码会话，二维码经 WxPusher 推送到微信，长按识别即自动写回登录态并恢复阅读（真机闭环验证通过）。
+- WxPusher 双通道：SPT 文本通知 + AppToken/UID 图片推送；未配图片通道自动降级文字提醒。
+- 与 Windows 版同源的调度内核：进度驱动选书、8 类风控防线、Skill 30 分钟校准、本地授权（12h 试用）。
+- 数据持久化于命名卷 `wxread_data`，删容器不丢数据；部署/配置/升级/卸载见上文 Docker 版章节。
+
+### v2.3.1 — 2026-09-13（🖥️ Windows 桌面版）
 
 #### 📊 今日阅读统计修复
 - 修复主界面统计卡片「目标 120 分钟」与阅读状态区「今日目标」不一致：卡片目标改为读取当日计划 `daily_plan.target_minutes`（与调度器同源，不再硬编码 120），周/月/年参考进度同步联动；当日计划未生成时显示「目标待生成」。

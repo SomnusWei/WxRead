@@ -1,0 +1,46 @@
+# ============================================================
+# Docker 构建上下文排除清单
+# 注意：requirements-docker.txt 与 docker/Dockerfile 必须保留，
+#       因此不能使用 /*.txt、docker/ 这类会误伤构建产物的规则
+# ============================================================
+
+# —— 运维脚本与敏感信息（含 NAS SSH 账号信息，严禁进入镜像/构建上下文）——
+devtools/
+/测试nas部署ssh信息.txt
+*ssh*.txt
+*密码*.txt
+*密钥*.txt
+
+# —— 测试代码与测试数据（tests 不进镜像；_tmp_* 为本机冒烟产生的临时数据目录）——
+tests/
+_tmp_*/
+**/_tmp_*/
+
+# —— Python 缓存与字节码 ——
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+*.pyo
+**/*.pyo
+.pytest_cache/
+
+# —— 版本控制 / IDE / 工具目录 ——
+.git/
+.gitignore
+.idea/
+.vscode/
+.trae/
+
+# —— 文档：设计文档/说明文档不进镜像（代码无任何 .md 运行时依赖，不会误伤）——
+*.md
+**/*.md
+
+# —— 日志与杂项临时文件 ——
+*.log
+**/*.log
+.DS_Store
+Thumbs.db
+
+# 说明：docker/Dockerfile 与 docker-compose.yml 显式保留（不被上述任何规则命中），
+#       requirements-docker.txt 为根目录构建输入，同样保留。

@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>WxReadAssistant 控制面板 · Docker v2.4.0</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body x-data="wxPanel()" x-cloak>
+
+  <!-- Toast 通知 -->
+  <div class="toasts">
+    <template x-for="t in toasts" :key="t.id">
+      <div class="toast" :class="t.type" x-text="t.msg"></div>
+    </template>
+  </div>
+
+  <!-- Token 输入遮罩 -->
+  <div class="mask" x-show="needToken" x-transition.opacity>
+    <div class="box">
+      <h3>请输入访问令牌</h3>
+      <p class="muted">面板启用了 Bearer Token 鉴权，请输入部署时设置的 WXREAD_WEB_TOKEN：</p>
+      <input type="password" x-model="tokenInput" placeholder="访问令牌" @keyup.enter="saveToken" autofocus>
+      <button class="btn primary" @click="saveToken">保存并刷新</button>
+    </div>
+  </div>
+
+  <!-- 顶部 -->
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="brand"><span class="logo">📖</span>WxReadAssistant 控制面板</div>
+      <span class="ver" x-text="'v' + (version || '2.4.0')"></span>
+    </div>
+    <nav class="tabs">
+      <button class="tab" :class="{ active: tab === 'overview' }" @click="tab = 'overview'">总览</button>
+      <button class="tab" :class="{ active: tab === 'config' }" @click="tab = 'config'">配置</button>
+      <button class="tab" :class="{ active: tab === 'logs' }" @click="tab = 'logs'">日志</button>
+      <button class="tab" :class="{ active: tab === 'report' }" @click="tab = 'report'">报告</button>
+    </nav>
+  </header>
+
+  <main class="wrap">
+
+    <!-- ============ 全局授权横幅 ============ -->
+    <template x-if="license.expired && !license.licensed">
+      <div class="license-bar expired">
+        <span>⚠️ 免费试用已结束（首次启动 <span x-text="license.first_run_iso || '-'"></span>），请输入注册码激活后才能使用调度器。</span>
+        <span class="spacer"></span>
+        <input type="text" x-model="licenseCode" placeholder="XXXX-XXXX-XXXX-XXXX" @keyup.enter="activateLicense()">
+        <button class="btn danger sm" :disabled="activating" @click="activateLicense()">
+          <span class="spin" x-show="activating"></span> 立即激活
+        </button>
+      </div>
+    </template>
+    <template x-if="license.licensed">
+      <div class="license-bar licensed">
+        <span>✅ 已激活：<b x-text="license.masked_code || '已授权'"></b></span>
+      </div>
+    </template>
+    <template x-if="!license.licensed && !license.expired">
+      <div class="license-bar trial">
+        <span>🕒 免费试用中，剩余 <b x-text="fmtTrialLeft()"></b>（首次启动 <span x-text="license.first_run_iso || '-'"></span>）</span>
+      </div>
+    </template>
+
+    <!-- ============ Tab 1：总览 ============ -->
+    <section x-show="tab === 'overview'">
+
+      <!-- KPI -->
+      <div class="grid kpi">
+        <div class="kpi-card">
+          <div class="name">今日阅读</div>
+          <div class="val" x-text="fmtDur(statSec('today_seconds'))"></div>
+          <div class="sub2">
+            <template x-if="status && status.target_minutes > 0">
+              <span>目标 <b x-text="status.target_minutes"></b> 分钟 · 已完成
+                <b x-text="status.today_minutes"></b> 分钟（<span x-text="status.progress_pct"></span>%）</span>
+            </template>
+            <template x-if="!status || status.target_minutes <= 0">
+              <span>目标待生成 · 启动阅读后自动设定</span>
+            </template>
+          </div>
+        </div>
+        <div class="kpi-card">
+          <div class="name">本周阅读</div>
+          <div class="val" x-text="fmtDur(statSec('week_seconds'))"></div>
+          <div class="sub2">近 7 天累计</div>
+        </div>
+        <div class="kpi-card">
+          <div class="name">本月阅读</div>
+          <div class="val" x-text="fmtDur(statSec('month_seconds'))"></div>
+          <div class="sub2">近 30 天累计</div>
+        </div>
+        <div class="kpi-card">
+          <div class="name">累计阅读</div>
+          <div class="val" x-text="fmtDur(statSec('total_seconds'))"></div>
+          <div class="sub2" x-text="status && status.stats && status.stats.updated_at ? '更新于 ' + status.stats.updated_at : ' '"></div>
+        </div>
+      </div>
+
+      <!-- 今日目标进度 -->
+      <div class="card" x-show="status && status.target_minutes > 0">
+        <div class="progress-row">
+          <span class="muted" style="min-width:96px">今日目标</span>
+          <div class="progress big" style="flex:1"><i :style="{ width: (status ? status.progress_pct : 0) + '%' }"></i></div>
+          <span class="pct" x-text="(status ? status.progress_pct : 0) + '%'"></span>
+        </div>
+      </div>
+
+      <!-- 当前阅读 -->
+      <div class="card">
+        <h3>📘 当前阅读
+          <span class="sub">运行状态：<b x-text="status ? status.state : '加载中…'"></b></span>
+          <span class="badge green" x-show="status && status.running && !status.paused && !status.auto_paused">运行中</span>
+          <span class="badge amber" x-show="status && status.paused && !status.auto_paused">已手动暂停</span>
+          <span class="badge red" x-show="status && status.auto_paused">连续失败 · 自动暂停</span>
+          <span class="badge gray" x-show="status && !status.running">已停止</span>
+        </h3>
+
+        <div class="alert-red" x-show="status && status.auto_paused">
+          ⛔ 调度器已自动暂停，不会自行恢复。连续失败
+          <b x-text="status && status.auto_paused ? status.auto_paused.fail_count : 0"></b>
+          次（类型：<span x-text="status && status.auto_paused ? status.auto_paused.last_kind : '-'"></span>，
+          时间：<span x-text="status && status.auto_paused ? status.auto_paused.ts : '-'"></span>）。
+          请查看日志排查原因后，点击右侧「恢复」按钮手动恢复。
+          <span class="btn-row" style="margin-top:8px">
+            <button class="btn primary sm" :disabled="licenseGated || !!acting.resume" @click="schedAction('resume')">▶️ 立即恢复</button>
+          </span>
+        </div>
+
+        <div class="grid two">
+          <div>
+            <div class="kv" style="margin-bottom:8px">
+              <span x-show="status && status.book">📗 <b x-text="status && status.book ? status.book.title : ''"></b>
+                （<span x-text="status && status.book ? status.book.progress : 0"></span>%）</span>
+              <span x-show="!(status && status.book)">暂无进行中的书籍</span>
+            </div>
+            <div class="kv" style="margin-bottom:8px">
+              <span x-show="status && status.chapter">章节：<b x-text="status && status.chapter ? status.chapter.title : ''"></b>
+                （本章已读 <span x-text="status && status.chapter ? status.chapter.read_count : 0"></span> 次）</span>
+            </div>
+            <div class="kv">
+              <span class="badge green">成功 <b x-text="status ? status.success_count : 0"></b></span>
+              <span class="badge red">失败 <b x-text="status ? status.fail_count : 0"></b></span>
+              <span>下次请求：<b class="mono" x-text="nextRunText()"></b></span>
+              <span class="muted" x-show="lastStatusAt">最后刷新：<span x-text="lastStatusAt"></span></span>
+            </div>
+          </div>
+          <div class="btn-row" style="align-content:flex-start">
+            <button class="btn primary" :disabled="licenseGated || !!acting.start" @click="schedAction('start')">
+              <span class="spin" x-show="acting.start"></span> ▶ 启动
+            </button>
+            <button class="btn" :disabled="licenseGated || !!acting.stop" @click="schedAction('stop')">
+              <span class="spin" x-show="acting.stop"></span> ⏹ 停止
+            </button>
+            <button class="btn" :disabled="licenseGated || !!acting.pause" @click="schedAction('pause')">
+              <span class="spin" x-show="acting.pause"></span> ⏸ 暂停
+            </button>
+            <button class="btn blue" :disabled="licenseGated || !!acting.resume" @click="schedAction('resume')">
+              <span class="spin" x-show="acting.resume"></span> ⏯ 恢复
+            </button>
+            <button class="btn ghost" :disabled="licenseGated || !!acting.regen" @click="regeneratePlan()">
+              <span class="spin" x-show="acting.regen"></span> 🎯 重新生成今日目标
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 扫码登录 -->
+      <div class="card">
+        <h3>🎯 扫码登录
+          <span class="badge green" x-show="login.logged_in"><span class="dot on"></span>已登录</span>
+          <span class="badge gray" x-show="!login.logged_in"><span class="dot off"></span>未登录</span>
+        </h3>
+
+        <div class="kv" style="margin-bottom:10px">
+          <span>wr_vid：<b class="mono" x-text="login.wr_vid || '-'"></b></span>
+          <span>wr_skey：<b class="mono" x-text="(login.wr_skey_prefix || '----') + '…（长度 ' + login.wr_skey_len + '）'"></b></span>
+          <button class="btn danger sm" x-show="login.logged_in" @click="logout()">登出</button>
+        </div>
+
+        <div class="grid two">
+          <div>
+            <div class="btn-row">
+              <button class="btn primary" :disabled="qr.busy" @click="startQR()">
+                <span class="spin" x-show="qr.busy"></span>
+                <span x-text="qr.ended ? '重新获取二维码' : '获取二维码'"></span>
+              </button>
+              <button class="btn ghost" x-show="qr.sid" @click="cancelQR()">取消</button>
+            </div>
+            <div class="qr-box">
+              <img x-show="qr.img" :src="qr.img" alt="微信登录二维码">
+              <span class="muted" x-show="!qr.img" x-text="qr.msg || '点击按钮获取二维码'"></span>
+            </div>
+            <p class="qr-tip">手机微信扫一扫：可长按图片保存到相册，再到微信「扫一扫 → 相册」选中二维码完成登录。</p>
+            <p class="muted" x-show="qr.msg" x-text="qr.msg"></p>
+          </div>
+
+          <div>
+            <details class="collapse" :open="injectOpen" @toggle="injectOpen = $event.target.open">
+              <summary>📋 手动粘贴 Cookie（兜底）</summary>
+              <p class="muted" style="margin:8px 0 6px">
+                粘贴完整 JSON（<span class="mono">{"cookies":{...},"cookies_raw":[...]}</span>），
+                或仅 Cookie 对象（<span class="mono">{"wr_vid":"...","wr_skey":"..."}</span>）：
+              </p>
+              <textarea x-model="injectText" placeholder='{"wr_vid":"...","wr_skey":"...", ...}'></textarea>
+              <div class="btn-row" style="margin-top:8px">
+                <button class="btn blue" :disabled="injectBusy" @click="submitInject()">
+                  <span class="spin" x-show="injectBusy"></span> 提交 Cookie
+                </button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <!-- 数据同步 -->
+      <div class="card">
+        <h3>🔄 数据同步</h3>
+        <div class="btn-row">
+          <button class="btn primary" :disabled="shelfSync.busy" @click="syncShelf()">
+            <span class="spin" x-show="shelfSync.busy"></span> 📚 同步书架
+          </button>
+          <button class="btn blue" :disabled="statsBusy" @click="syncStats()">
+            <span class="spin" x-show="statsBusy"></span> 📊 同步统计
+          </button>
+          <button class="btn" :disabled="progressBusy" @click="syncProgress()">
+            <span class="spin" x-show="progressBusy"></span> 🔁 同步当前进度
+          </button>
+        </div>
+        <template x-if="shelfSync.busy || shelfSync.logs.length">
+          <div>
+            <div class="progress-row" style="margin-top:10px" x-show="shelfSync.total > 0">
+              <span class="muted" style="min-width:80px">目录进度</span>
+              <div class="progress" style="flex:1"><i :style="{ width: shelfSyncPct() + '%' }"></i></div>
+              <span class="pct" x-text="shelfSync.idx + '/' + shelfSync.total"></span>
+            </div>
+            <div class="stream-log">
+              <template x-for="(l, i) in shelfSync.logs" :key="i">
+                <div :class="l.cls" x-text="l.text"></div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- 书架 -->
+      <div class="card">
+        <h3>📚 书架
+          <span class="sub">共 <b x-text="shelfTotal"></b> 本</span>
+        </h3>
+        <div class="filter-row">
+          <input class="search" type="text" x-model="shelfKw" placeholder="搜索书名 / 作者" @input="onShelfKw()">
+          <button class="chip" :class="{ active: shelfFilter === 'all' }" @click="setShelfFilter('all')">全部</button>
+          <button class="chip" :class="{ active: shelfFilter === 'reading' }" @click="setShelfFilter('reading')">在读</button>
+          <button class="chip" :class="{ active: shelfFilter === 'unread' }" @click="setShelfFilter('unread')">未读</button>
+          <button class="chip" :class="{ active: shelfFilter === 'finished' }" @click="setShelfFilter('finished')">读完</button>
+        </div>
+        <div class="table-wrap">
+          <table class="tbl">
+            <thead>
+              <tr><th>书名</th><th>作者</th><th style="min-width:150px">进度</th><th>章节数</th><th>标记</th></tr>
+            </thead>
+            <tbody>
+              <template x-for="b in shelfItems" :key="b.book_id + b.title">
+                <tr :class="{ 'row-black': b.blacklisted }">
+                  <td class="wrap-cell" x-text="b.title"></td>
+                  <td x-text="b.author || '-'"></td>
+                  <td>
+                    <div class="progress-row">
+                      <div class="progress" style="flex:1"><i :style="{ width: b.progress + '%' }"></i></div>
+                      <span class="pct" x-text="b.progress + '%'"></span>
+                    </div>
+                  </td>
+                  <td x-text="b.chapter_count + (b.has_chapters ? '' : '（未拉取）')"></td>
+                  <td><span class="badge dark" x-show="b.blacklisted" :title="b.blacklist_reason">🚫 <span x-text="b.blacklist_reason || '黑名单'"></span></span></td>
+                </tr>
+              </template>
+              <tr x-show="!shelfLoading && shelfItems.length === 0">
+                <td colspan="5" style="text-align:center;color:#64748b;padding:24px">暂无数据，请先「同步书架」</td>
+              </tr>
+              <tr x-show="shelfLoading">
+                <td colspan="5" style="text-align:center;color:#64748b;padding:18px">加载中…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pager" x-show="shelfTotal > shelfPageSize">
+          <button class="btn sm ghost" :disabled="shelfPage <= 1 || shelfLoading" @click="gotoShelfPage(shelfPage - 1)">上一页</button>
+          <span>第 <b x-text="shelfPage"></b> / <span x-text="shelfPages()"></span> 页</span>
+          <button class="btn sm ghost" :disabled="shelfPage >= shelfPages() || shelfLoading" @click="gotoShelfPage(shelfPage + 1)">下一页</button>
+        </div>
+
+        <details class="collapse" :open="blackOpen" @toggle="onBlackToggle($event.target.open)">
+          <summary>🚫 书架黑名单（<span x-text="blackItems.length"></span> 本，只读）</summary>
+          <div class="table-wrap" style="margin-top:10px">
+            <table class="tbl">
+              <thead><tr><th>书名</th><th>原因</th><th>拉黑时间</th></tr></thead>
+              <tbody>
+                <template x-for="it in blackItems" :key="it.book_id">
+                  <tr><td class="wrap-cell" x-text="it.title"></td><td x-text="it.reason || '-'"></td><td class="mono" x-text="it.marked_at || '-'"></td></tr>
+                </template>
+                <tr x-show="!blackLoading && blackItems.length === 0">
+                  <td colspan="3" style="text-align:center;color:#64748b;padding:18px">黑名单为空</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <!-- 数据维护 -->
+      <div class="card">
+        <h3>🧹 数据维护</h3>
+        <div class="btn-row">
+          <button class="btn danger" :disabled="maintBusy" @click="resetToday()">🔄 清零今日数据</button>
+          <button class="btn danger" :disabled="maintBusy" @click="logout()">📤 登出（清除 Cookie）</button>
+        </div>
+        <p class="muted" style="margin-top:8px">清零今日：重置本地今日计时（同步统计后以服务端为准）；登出：停止调度器并清除 Cookie，随后请重新扫码，无需重启容器。</p>
+      </div>
+    </section>
+
+    <!-- ============ Tab 2：配置 ============ -->
+    <section x-show="tab === 'config'">
+      <template x-if="cfg">
+        <div>
+          <!-- 自动暂停只读告警 -->
+          <div class="alert-red" x-show="status && status.auto_paused">
+            ⛔ 自动暂停中：连续失败 <b x-text="status && status.auto_paused ? status.auto_paused.fail_count : 0"></b>
+            次（类型 <span x-text="status && status.auto_paused ? status.auto_paused.last_kind : '-'"></span>，时间 <span x-text="status && status.auto_paused ? status.auto_paused.ts : '-'"></span>）
+            <div class="btn-row" style="margin-top:8px">
+              <button class="btn primary sm" @click="schedAction('resume')">▶️ 手动恢复</button>
+            </div>
+          </div>
+
+          <!-- 今日目标只读卡片 -->
+          <div class="card">
+            <h3>📅 今日目标（只读）</h3>
+            <div class="kv">
+              <span>日期：<b x-text="cfg.daily_plan.date || '未生成'"></b></span>
+              <span>当日随机目标：<b x-text="cfg.daily_plan.target_minutes || 0"></b> 分钟</span>
+              <span>当前进度：<b x-text="status ? status.progress_pct : 0"></b>%</span>
+              <button class="btn ghost sm" :disabled="licenseGated" @click="regeneratePlan()">🔄 重新生成今日目标</button>
+            </div>
+            <p class="muted" style="margin-top:8px">每日 00:00 在「每日最少/最多小时数」之间随机生成当日目标；重新生成在下一轮调度时生效。</p>
+          </div>
+
+          <!-- reading -->
+          <div class="card">
+            <h3>📖 阅读参数（reading）
+              <span class="badge amber" x-show="dirtySections().includes('reading')">已修改</span>
+            </h3>
+            <div class="form-grid">
+              <template x-for="f in fields('reading')" :key="f.key">
+                <div>
+                  <label class="fld" x-show="f.kind !== 'bool'">
+                    <span class="lab" x-text="f.label"></span>
+                    <input :type="f.password ? (showKey[f.key] ? 'text' : 'password') : (f.kind === 'number' ? 'number' : 'text')"
+                           :step="f.step" x-model="form.reading[f.key]">
+                    <span class="hint" x-text="f.hint"></span>
+                  </label>
+                  <div class="bool-row" x-show="f.kind === 'bool'">
+                    <label class="switch">
+                      <input type="checkbox" x-model="form.reading[f.key]">
+                      <span class="track"></span>
+                    </label>
+                    <div class="txt"><b x-text="f.label"></b><div class="hint" x-text="f.hint"></div></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- risk -->
+          <div class="card">
+            <h3>⚠️ 风控参数（risk）
+              <span class="badge amber" x-show="dirtySections().includes('risk')">已修改</span>
+            </h3>
+            <div class="form-grid">
+              <template x-for="f in fields('risk')" :key="f.key">
+                <div>
+                  <label class="fld" x-show="f.kind !== 'bool'">
+                    <span class="lab" x-text="f.label"></span>
+                    <input :type="f.kind === 'number' ? 'number' : 'text'" :step="f.step" x-model="form.risk[f.key]">
+                    <span class="hint" x-text="f.hint"></span>
+                  </label>
+                  <div class="bool-row" x-show="f.kind === 'bool'">
+                    <label class="switch">
+                      <input type="checkbox" x-model="form.risk[f.key]">
+                      <span class="track"></span>
+                    </label>
+                    <div class="txt"><b x-text="f.label"></b><div class="hint" x-text="f.hint"></div></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- skill -->
+          <div class="card">
+            <h3>🔑 微信 Skill（skill）
+              <span class="badge amber" x-show="dirtySections().includes('skill')">已修改</span>
+            </h3>
+            <div class="form-grid">
+              <template x-for="f in fields('skill')" :key="f.key">
+                <div>
+                  <label class="fld" x-show="f.kind !== 'bool'">
+                    <span class="lab" x-text="f.label"></span>
+                    <span class="pw-wrap" x-show="f.password">
+                      <input :type="showKey[f.key] ? 'text' : 'password'" x-model="form.skill[f.key]" placeholder="wrk- 前缀的 API Key">
+                      <button type="button" class="toggle" @click="showKey[f.key] = !showKey[f.key]" x-text="showKey[f.key] ? '隐藏' : '显示'"></button>
+                    </span>
+                    <input x-show="!f.password" :type="f.kind === 'number' ? 'number' : 'text'" :step="f.step" x-model="form.skill[f.key]">
+                    <span class="hint" x-text="f.hint"></span>
+                  </label>
+                  <div class="bool-row" x-show="f.kind === 'bool'">
+                    <label class="switch">
+                      <input type="checkbox" x-model="form.skill[f.key]">
+                      <span class="track"></span>
+                    </label>
+                    <div class="txt"><b x-text="f.label"></b><div class="hint" x-text="f.hint"></div></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <div class="btn-row" style="margin-top:6px">
+              <button class="btn blue" :disabled="testSkill.busy" @click="verifySkill()">
+                <span class="spin dark" x-show="testSkill.busy" style="border-top-color:#fff"></span> 🔑 测试 Skill 连接
+              </button>
+              <span class="badge" :class="testSkill.ok === true ? 'green' : (testSkill.ok === false ? 'red' : 'gray')"
+                    x-show="testSkill.msg" x-text="testSkill.msg"></span>
+            </div>
+          </div>
+
+          <!-- push -->
+          <div class="card">
+            <h3>📤 WxPusher 推送（push）
+              <span class="badge amber" x-show="dirtySections().includes('push')">已修改</span>
+            </h3>
+            <div class="form-grid">
+              <template x-for="f in fields('push')" :key="f.key">
+                <div>
+                  <label class="fld" x-show="f.kind !== 'bool'">
+                    <span class="lab" x-text="f.label"></span>
+                    <span class="pw-wrap" x-show="f.password">
+                      <input :type="showKey[f.key] ? 'text' : 'password'" x-model="form.push[f.key]" placeholder="WxPusher SPT / AppToken">
+                      <button type="button" class="toggle" @click="showKey[f.key] = !showKey[f.key]" x-text="showKey[f.key] ? '隐藏' : '显示'"></button>
+                    </span>
+                    <input x-show="!f.password" :type="f.kind === 'number' ? 'number' : 'text'" :step="f.step" x-model="form.push[f.key]">
+                    <span class="hint" x-text="f.hint"></span>
+                  </label>
+                  <div class="bool-row" x-show="f.kind === 'bool'">
+                    <label class="switch">
+                      <input type="checkbox" x-model="form.push[f.key]">
+                      <span class="track"></span>
+                    </label>
+                    <div class="txt"><b x-text="f.label"></b><div class="hint" x-text="f.hint"></div></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <div class="btn-row" style="margin-top:6px">
+              <button class="btn blue" :disabled="testPush.busy" @click="testPush()">
+                <span class="spin" x-show="testPush.busy"></span> 📤 发送测试推送
+              </button>
+              <span class="badge" :class="testPush.ok === true ? 'green' : (testPush.ok === false ? 'red' : 'gray')"
+                    x-show="testPush.msg" x-text="testPush.msg"></span>
+            </div>
+          </div>
+
+          <!-- app -->
+          <div class="card">
+            <h3>⚙️ 系统（app）
+              <span class="badge amber" x-show="dirtySections().includes('app')">已修改</span>
+            </h3>
+            <div class="form-grid">
+              <template x-for="f in fields('app')" :key="f.key">
+                <div>
+                  <label class="fld" x-show="f.kind !== 'bool'">
+                    <span class="lab" x-text="f.label"></span>
+                    <input :type="f.kind === 'number' ? 'number' : 'text'" :step="f.step" x-model="form.app[f.key]">
+                    <span class="hint" x-text="f.hint"></span>
+                  </label>
+                  <div class="bool-row" x-show="f.kind === 'bool'">
+                    <label class="switch">
+                      <input type="checkbox" x-model="form.app[f.key]">
+                      <span class="track"></span>
+                    </label>
+                    <div class="txt"><b x-text="f.label"></b><div class="hint" x-text="f.hint"></div></div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- risk_alerts 只读 -->
+          <div class="card">
+            <h3>🚨 风控告警记录（risk_alerts，只读）</h3>
+            <div class="kv">
+              <template x-for="(v, k) in (cfg.risk_alerts || {})" :key="k">
+                <span x-text="k + '：' + v"></span>
+              </template>
+              <span class="muted" x-show="Object.keys(cfg.risk_alerts || {}).length === 0">暂无告警记录（soft_read / read_fail 由推送模块自动维护时间戳）</span>
+            </div>
+          </div>
+
+          <!-- 保存条 -->
+          <div class="save-bar">
+            <span class="muted">已修改 <b x-text="dirtySections().length"></b> 个配置段；部分参数需重启调度器生效（表单项已标注）。</span>
+            <span class="spacer" style="flex:1"></span>
+            <button class="btn ghost" @click="reloadConfig()">↩️ 放弃修改</button>
+            <button class="btn primary" :disabled="savingCfg || dirtySections().length === 0" @click="saveConfig()">
+              <span class="spin" x-show="savingCfg"></span> 💾 保存全部修改
+            </button>
+          </div>
+        </div>
+      </template>
+      <div class="card" x-show="!cfg"><p class="muted">配置加载中…</p></div>
+    </section>
+
+    <!-- ============ Tab 3：日志 ============ -->
+    <section x-show="tab === 'logs'">
+      <div class="card">
+        <h3>🗂 日志查看（按天留存，只读）</h3>
+        <div class="log-bar">
+          <template x-for="f in logFiles" :key="f.date">
+            <button class="chip" :class="{ active: logDate === f.date }" @click="selectLogDate(f.date)"
+                    x-text="f.current ? '今天' : f.date.slice(5)"></button>
+          </template>
+          <span class="muted" x-show="logFiles.length === 0">暂无可查看的日志文件</span>
+        </div>
+        <div class="log-bar">
+          <select x-model="logLevel" @change="onLogLevelChange()" x-show="isLogToday()">
+            <option value="DEBUG">DEBUG 及以上</option>
+            <option value="INFO">INFO 及以上</option>
+            <option value="WARNING">WARNING 及以上</option>
+            <option value="ERROR">ERROR 及以上</option>
+          </select>
+          <label x-show="isLogToday()">
+            <input type="checkbox" x-model="follow"> 自动滚动到底部
+          </label>
+          <span class="spacer" style="flex:1"></span>
+          <a class="btn ghost sm" :href="logDownloadUrl()" x-show="logDate">⬇️ 下载当日日志</a>
+        </div>
+        <div class="console" id="logConsole" x-html="renderLogLines()"></div>
+        <div class="btn-row" style="margin-top:10px" x-show="!isLogToday() && !logEof">
+          <button class="btn ghost sm" :disabled="logLoading" @click="loadHistory(true)">
+            <span class="spin dark" x-show="logLoading"></span> 加载更多（<span x-text="fmtSize(logTotal - logOffset)"></span> 未读）
+          </button>
+        </div>
+        <p class="muted" style="margin-top:8px">历史日志分页加载；当日日志自动实时刷新。日志按保留天数自动清理，面板不提供删除功能。</p>
+      </div>
+    </section>
+
+    <!-- ============ Tab 4：报告 ============ -->
+    <section x-show="tab === 'report'">
+      <div class="report-head">
+        <h3 style="margin:0">📊 阅读报告</h3>
+        <span class="badge" :class="report && report._is_sample ? 'red' : 'green'"
+              x-show="report" x-text="report && report._is_sample ? '示例数据' : '真实数据'"></span>
+        <span class="badge gray" x-show="report" x-text="'数据源：' + (report ? report._data_source : '-')"></span>
+        <span class="spacer"></span>
+        <button class="btn primary" :disabled="reportLoading || reportRefreshing" @click="refreshReport()">
+          <span class="spin" x-show="reportRefreshing || reportLoading"></span> 🔄 刷新数据
+        </button>
+      </div>
+
+      <template x-if="reportLoading && !report">
+        <div class="card"><p style="text-align:center;color:#64748b;padding:60px 0">报告生成中（首次拉取 Skill 数据可能需要数十秒）…</p></div>
+      </template>
+
+      <template x-if="report">
+        <div>
+          <!-- KPI -->
+          <div class="r-kpi">
+            <div class="item"><div class="n" x-text="kpiText('total_seconds_fmt')"></div><div class="t">总时长</div></div>
+            <div class="item"><div class="n" x-text="(report.kpi && report.kpi.reading_days) || 0"></div><div class="t">阅读天数</div></div>
+            <div class="item"><div class="n" x-text="(report.kpi && report.kpi.book_count) || 0"></div><div class="t">藏书</div></div>
+            <div class="item"><div class="n" x-text="(report.kpi && report.kpi.finished_count) || 0"></div><div class="t">读完</div></div>
+            <div class="item"><div class="n" x-text="(report.kpi && report.kpi.avg_daily_minutes) || 0"></div><div class="t">日均(分钟)</div></div>
+            <div class="item"><div class="n" x-text="(report.kpi && report.kpi.note_count) || 0"></div><div class="t">笔记</div></div>
+            <div class="item"><div class="n" x-text="kpiText('read_longest_fmt')"></div><div class="t">单本最长</div></div>
+          </div>
+
+          <!-- 读者画像 -->
+          <div class="card portrait">
+            <h3>🧑‍🎓 读者画像</h3>
+            <div class="motto" x-text="report.reader_portrait ? report.reader_portrait.motto : ''"></div>
+            <blockquote x-text="report.reader_portrait ? report.reader_portrait.summary : ''"></blockquote>
+            <details>
+              <summary class="muted" style="cursor:pointer">精选划线（<span x-text="report.reader_portrait && report.reader_portrait.highlights ? report.reader_portrait.highlights.length : 0"></span> 条）</summary>
+              <div class="table-wrap" style="margin-top:8px">
+                <table class="tbl">
+                  <thead><tr><th>划线</th><th>书名</th><th>作者</th></tr></thead>
+                  <tbody>
+                    <template x-for="(h, i) in (report.reader_portrait ? report.reader_portrait.highlights : [])" :key="i">
+                      <tr><td class="wrap-cell" x-text="h.quote"></td><td x-text="h.book"></td><td x-text="h.author"></td></tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+
+          <!-- 图表 -->
+          <div class="chart-grid">
+            <div class="chart-box"><div class="chart-canvas" id="chart-monthly"></div></div>
+            <div class="chart-box"><div class="chart-canvas" id="chart-weekly"></div></div>
+            <div class="chart-box wide"><div class="chart-canvas" id="chart-daily"></div></div>
+            <div class="chart-box tall"><div class="chart-canvas" id="chart-longest"></div></div>
+            <div class="chart-box"><div class="chart-canvas" id="chart-categories"></div></div>
+            <div class="chart-box tall"><div class="chart-canvas" id="chart-authors"></div></div>
+            <div class="chart-box tall"><div class="chart-canvas" id="chart-publishers"></div></div>
+            <div class="chart-box"><div class="chart-canvas" id="chart-shelf-status"></div></div>
+            <div class="chart-box"><div class="chart-canvas" id="chart-shelf-visibility"></div></div>
+            <div class="chart-box"><div class="chart-canvas" id="chart-progress-hist"></div></div>
+            <div class="chart-box wide"><div class="chart-canvas" id="chart-progress-scatter"></div></div>
+            <div class="chart-box tall"><div class="chart-canvas" id="chart-notes-rank"></div></div>
+            <div class="chart-box wide"><div class="chart-canvas" id="chart-notes-timeline"></div></div>
+            <div class="chart-box tall wide"><div class="chart-canvas" id="chart-wordcloud" style="height:520px"></div></div>
+          </div>
+
+          <p class="foot-note">
+            数据源：<b x-text="report._data_source || '-'"></b>
+            <span x-show="report._is_sample">（当前为示例数据，登录并同步后将展示真实数据）</span>
+            · 生成时间：<span x-text="report._generated_at || '-'"></span>
+          </p>
+        </div>
+      </template>
+    </section>
+
+    <footer class="footer">
+      WxReadAssistant Docker v2.4.0 · runtime pure · 仅供个人学习使用 · 请勿公网裸暴露本面板
+    </footer>
+  </main>
+
+  <script src="report.js"></script>
+  <script src="app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</body>
+</html>
